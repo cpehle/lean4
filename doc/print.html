@@ -5206,6 +5206,12 @@ cd build/release
 cmake ../..
 make
 </code></pre>
+<p>Note: that if you have a CPU with lots of cores you will get a faster
+build if you specify the number of parallel jobs using the <code>-j n</code>
+option on make.</p>
+<p>For example, on an AMD Ryzen 9 <code>make</code> takes 00:04:55, whereas <code>make -j 10</code>
+takes 00:01:38.  Your results may vary depending on the speed of your hard
+drive.</p>
 <p>Setting up a basic debug build:</p>
 <pre><code class="language-bash">git clone https://github.com/leanprover/lean4
 cd lean4
@@ -5217,6 +5223,8 @@ make
 <p>This will compile the Lean library and binary into the <code>stage1</code> subfolder; see
 below for details. Add <code>-jN</code> for an appropriate <code>N</code> to <code>make</code> for a parallel
 build.</p>
+<p>To install the build see <a href="make/index.html#dev-setup-using-elan">Dev setup using
+elan</a> below.</p>
 <h2><a class="header" href="#useful-cmake-configuration-settings" id="useful-cmake-configuration-settings">Useful CMake Configuration Settings</a></h2>
 <p>Pass these along with the <code>cmake ../..</code> command.</p>
 <ul>
@@ -5398,7 +5406,7 @@ folder to gdb, or use <code>gdb $(elan which lean)</code>.</p>
 </ul>
 <h2><a class="header" href="#installing-lean-on-ubuntu-1604" id="installing-lean-on-ubuntu-1604">Installing Lean on Ubuntu 16.04</a></h2>
 <h3><a class="header" href="#basic-packages" id="basic-packages">Basic packages</a></h3>
-<pre><code>sudo apt-get install git libgmp-dev cmake ccache
+<pre><code class="language-bash">sudo apt-get install git libgmp-dev cmake ccache
 </code></pre>
 <h2><a class="header" href="#install-packages-on-os-x-109" id="install-packages-on-os-x-109">Install Packages on OS X 10.9</a></h2>
 <p>We assume that you are using <a href="http://brew.sh">homebrew</a> as a package manager.</p>
@@ -5438,25 +5446,27 @@ It is easy to install all dependencies, it produces native
 <h2><a class="header" href="#installing-dependencies" id="installing-dependencies">Installing dependencies</a></h2>
 <p><a href="http://msys2.github.io">The official webpage of MSYS2</a> provides one-click installers.
 Once installed, you should run the &quot;MSYS2 MinGW 64-bit shell&quot; from the start menu.
+(The one that runs <code>mingw64.exe</code>)
 Do not run &quot;MSYS2 MSYS&quot; instead!
 MSYS2 has a package management system, <a href="https://wiki.archlinux.org/index.php/pacman">pacman</a>, which is used in Arch Linux.</p>
 <p>Here are the commands to install all dependencies needed to compile Lean on your machine.</p>
-<pre><code class="language-bash">pacman -S make mingw-w64-x86_64-cmake mingw-w64-x86_64-ccache mingw-w64-x86_64-gcc git
-</code></pre>
-<p>Then make sure the following is included in your PATH:</p>
-<pre><code class="language-bash">export PATH=$PATH:/mingw64/bin
+<pre><code class="language-bash">pacman -S make mingw-w64-x86_64-cmake mingw-w64-x86_64-ccache mingw-w64-x86_64-gcc git unzip
 </code></pre>
 <p>You should now be able to run these commands:</p>
 <pre><code class="language-bash">gcc --version
 cmake --version
 </code></pre>
-<p>Then follow the <a href="make/index.html">generic build instructions</a> in the MSYS2 MinGW shell, using
-<code>cmake ../.. -G &quot;Unix Makefiles&quot;</code> instead of <code>cmake ../..</code>. This ensures that cmake will call <code>sh</code> instead
-of <code>cmd.exe</code> for script tasks.</p>
+<p>Then follow the <a href="make/index.html">generic build instructions</a> in the MSYS2
+MinGW shell, using <code>cmake ../.. -G &quot;Unix Makefiles&quot;</code> instead of <code>cmake ../..</code>. This ensures that cmake will call <code>sh</code> instead of <code>cmd.exe</code>
+for script tasks.</p>
 <h2><a class="header" href="#install-lean" id="install-lean">Install lean</a></h2>
-<p>You can use the <code>install</code> ninja/make target to install Lean into, by default,
-<code>./build/release/stage1/msys64/lean/</code>. To change this, add <code>-DCMAKE_INSTALL_PREFIX=path/you/want</code>
-to your initial cmake invocation.</p>
+<p>Follow the steps in <a href="make/index.html#dev-setup-using-elan">Dev setup using
+elan</a> regarding installation of the
+bits you just built.  Note that in an msys2 environment <code>elan-init.sh</code>
+reports you need to add <code>%USERPROFILE%\.elan\bin</code> to your path, but of
+course in msys2 that needs to be a valid linux style path, like this:</p>
+<pre><code class="language-bash">export PATH=&quot;$PATH:/c/users/$USERNAME/.elan/bin&quot;
+</code></pre>
 <h2><a class="header" href="#running" id="running">Running</a></h2>
 <p>You can run <code>lean --version</code> to see if your binaries work.</p>
 <p>If you want a version that can run independently of your MSYS install
@@ -5471,6 +5481,11 @@ they are installed in your MSYS setup:</p>
 <p>The following linux command will do that:</p>
 <pre><code class="language-bash">cp $(ldd lean.exe | cut -f3 -d' ' | grep mingw) .
 </code></pre>
+<h2><a class="header" href="#trouble-shooting" id="trouble-shooting">Trouble shooting</a></h2>
+<p><strong>-bash: gcc: command not found</strong></p>
+<p>Make sure <code>/mingw64/bin</code> is in your PATH environment.  If it is not then
+check you launched the MSYS2 MinGW 64-bit shell from the start menu.
+(The one that runs <code>mingw64.exe</code>).</p>
 <p>While <a href="https://nixos.org/nix/">Nix</a> can be used to quickly open a shell with all dependencies for the <a href="make/index.html">standard setup</a> installed, the user-facing <a href="make/../setup.html#nix-setup">Nix Setup</a> can also be used to work <em>on</em> Lean.</p>
 <h1><a class="header" href="#setup" id="setup">Setup</a></h1>
 <p>Follow the setup in the link above; to open the Lean shell inside a Lean checkout, you can also use</p>
