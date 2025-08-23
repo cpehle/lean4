@@ -12,6 +12,7 @@ public import Lean.Compiler.LCNF.CompilerM
 public import Lean.Compiler.LCNF.MonoTypes
 public import Lean.Compiler.LCNF.Types
 public import Lean.Compiler.StructAttr
+public import Lean.Structure
 
 public section
 
@@ -97,6 +98,12 @@ where fillCache : CoreM IRType := do
 partial def generateStructType (inductiveVal : InductiveVal) : CoreM IRType := do
   let env ← Lean.getEnv
   let mut fieldTypes : Array IRType := #[]
+  let mut allFieldNames : Array Name := #[]
+
+  -- Get field names from structure definition if available
+  if isStructure env inductiveVal.name then
+    let structFieldNames := getStructureFields env inductiveVal.name
+    allFieldNames := structFieldNames
 
   for ctorName in inductiveVal.ctors do
     let some (.ctorInfo ctorInfo) := env.find? ctorName | unreachable!
@@ -114,7 +121,7 @@ partial def generateStructType (inductiveVal : InductiveVal) : CoreM IRType := d
         return types
     fieldTypes := fieldTypes ++ ctorFieldTypes
 
-  return IRType.struct (some inductiveVal.name) fieldTypes
+  return IRType.struct (some inductiveVal.name) fieldTypes allFieldNames
 
 partial def toIRType (type : Lean.Expr) : CoreM IRType := do
   match type with
