@@ -6,35 +6,25 @@ Authors: Siddharth Bhat
 module
 
 prelude
+public import Lean.Runtime
 public import Lean.Compiler.NameMangling
+public import Lean.Compiler.ExportAttr
+public import Lean.Compiler.InitAttr
+public import Lean.Compiler.IR.CompilerM
 public import Lean.Compiler.IR.EmitUtil
 public import Lean.Compiler.IR.NormIds
 public import Lean.Compiler.IR.SimpCase
+public import Lean.Compiler.IR.Boxing
+public import Lean.Compiler.IR.ResetReuse
 public import Lean.Compiler.IR.LLVMBindings
-import Lean.Compiler.LCNF.Types
-import Lean.Compiler.ModPkgExt
-import Lean.Runtime
-import Lean.Compiler.ClosedTermCache
-import Init.Data.Range.Polymorphic.Iterators
+public import Lean.Compiler.StructAttr
 
 public section
 
-open Lean.Compiler.LCNF (isBoxedName)
+open Lean.IR.ExplicitBoxing (isBoxedName)
+open Lean.Compiler (hasPackedAttr)
 
 namespace Lean.IR
-/-
-TODO: At the time of writing this our CI for LLVM is dysfunctional so this code is not actually
-tested. When we get back to fixing it we need to account for changes made to the ABI in the mean
-time. These changes can likely be done similar to the ones in EmitC:
-- IO.RealWorld elimination:
-  - init functions don't take a real world parameter anymore
-  - parameters that are `void` are erased and do not appear in function signatures or call sites
-    anymore. This means in particular:
-    - function decls need to be fixed
-    - full applications need to be fixed
-    - tail calls need to be fixed
-- closed term static initializers
--/
 
 def leanMainFn := "_lean_main"
 
@@ -81,6 +71,7 @@ structure Context (llvmctx : LLVM.Context) where
 
 structure State (llvmctx : LLVM.Context) where
   var2val : Std.HashMap VarId (LLVM.LLVMType llvmctx × LLVM.Value llvmctx)
+  var2irtype : Std.HashMap VarId IRType  -- Track IRType for each variable
   jp2bb   : Std.HashMap JoinPointId (LLVM.BasicBlock llvmctx)
 
 abbrev Error := String
@@ -91,8 +82,11 @@ abbrev M (llvmctx : LLVM.Context) :=
 instance : Inhabited (M llvmctx α) where
   default := throw "Error: inhabitant"
 
-def addVarToState (x : VarId) (v : LLVM.Value llvmctx) (ty : LLVM.LLVMType llvmctx) : M llvmctx Unit := do
-  modify (fun s => { s with var2val := s.var2val.insert x (ty, v) }) -- add new variable
+def addVarToState (x : VarId) (v : LLVM.Value llvmctx) (ty : LLVM.LLVMType llvmctx) (irty : IRType) : M llvmctx Unit := do
+  modify (fun s => { s with
+    var2val := s.var2val.insert x (ty, v)
+    var2irtype := s.var2irtype.insert x irty
+  })
 
 def addJpToState (jp : JoinPointId) (bb : LLVM.BasicBlock llvmctx) : M llvmctx Unit :=
   modify (fun s => { s with jp2bb := s.jp2bb.insert jp bb })
@@ -327,7 +321,7 @@ def callLeanCtorSetTag (builder : LLVM.Builder llvmctx)
   let fnty ← LLVM.functionType retty argtys
   let _ ← LLVM.buildCall2 builder fnty fn  #[closure, i] retName
 
-def toLLVMType (t : IRType) : M llvmctx (LLVM.LLVMType llvmctx) := do
+partial def toLLVMType (t : IRType) : M llvmctx (LLVM.LLVMType llvmctx) := do
   match t with
   | IRType.float      => LLVM.doubleTypeInContext llvmctx
   | IRType.float32    => LLVM.floatTypeInContext llvmctx
@@ -341,26 +335,30 @@ def toLLVMType (t : IRType) : M llvmctx (LLVM.LLVMType llvmctx) := do
   | IRType.tagged     => do LLVM.pointerType (← LLVM.i8Type llvmctx)
   | IRType.tobject    => do LLVM.pointerType (← LLVM.i8Type llvmctx)
   | IRType.erased     => do LLVM.pointerType (← LLVM.i8Type llvmctx)
-  | IRType.void       => do LLVM.pointerType (← LLVM.i8Type llvmctx)
-  | IRType.struct _ _ => panic! "not implemented yet"
+  | IRType.struct leanTypeName types _ => do
+    let fieldTypes ← types.mapM toLLVMType
+    -- Check if the struct type has the packed attribute
+    let env ← getEnv
+    let isPacked := match leanTypeName with
+      | some name => Lean.Compiler.hasPackedAttr env name
+      | none => false
+    LLVM.structTypeInContext llvmctx fieldTypes (isPacked := isPacked)
   | IRType.union _ _  => panic! "not implemented yet"
 
 def throwInvalidExportName {α : Type} (n : Name) : M llvmctx α := do
   throw s!"invalid export name {n.toString}"
 
 def toCName (n : Name) : M llvmctx String := do
-  let env ← getEnv
-  match getExportNameFor? env n with
-  | some (.str .anonymous s) => return s
+  match getExportNameFor? (← getEnv) n with
+  | some (.str .anonymous s) => pure s
   | some _                   => throwInvalidExportName n
-  | none                     => return if n == `main then leanMainFn else getSymbolStem env n
+  | none                     => if n == `main then pure leanMainFn else pure n.mangle
 
 def toCInitName (n : Name) : M llvmctx String := do
-  let env ← getEnv
-  match getExportNameFor? env n with
+  match getExportNameFor? (← getEnv) n with
   | some (.str .anonymous s) => return "_init_" ++ s
   | some _                   => throwInvalidExportName n
-  | none                     => return "_init_" ++ getSymbolStem env n
+  | none                     => pure ("_init_" ++ n.mangle)
 
 /--
 ## LLVM Control flow Utilities
@@ -540,12 +538,14 @@ def emitFnDecls : M llvmctx Unit := do
   let env ← getEnv
   let decls := getDecls env
   let modDecls  : NameSet := decls.foldl (fun s d => s.insert d.name) {}
-  let usedDecls := collectUsedDecls env decls
-  usedDecls.forM fun n => do
-    let decl ← getDecl n;
+  let usedDecls : NameSet := decls.foldl (fun s d => collectUsedDecls env d (s.insert d.name)) {}
+  let usedDecls := usedDecls.toList
+  for n in usedDecls do
+    let decl ← getDecl n
     match getExternNameFor env `c decl.name with
     | some cName => emitExternDeclAux decl cName
     | none       => emitFnDecl decl (!modDecls.contains n)
+  return ()
 
 def emitLhsSlot_ (x : VarId) : M llvmctx (LLVM.LLVMType llvmctx × LLVM.Value llvmctx) := do
   let state ← get
@@ -587,6 +587,250 @@ def emitAllocCtor (builder : LLVM.Builder llvmctx)
   let scalarSize := hackSizeofVoidPtr * c.usize + c.ssize
   callLeanAllocCtor builder c.cidx c.size scalarSize "lean_alloc_ctor_out"
 
+-- Get the IRType of a variable if it's been declared
+def getVarIRType (x : VarId) : M llvmctx (Option IRType) := do
+  let state ← get
+  pure (state.var2irtype[x]?)
+
+def IRType.isStructBoxedFieldType : IRType → Bool
+  | IRType.object | IRType.tagged | IRType.tobject | IRType.struct .. => true
+  | _ => false
+
+def callStructFieldBoxHelper (builder : LLVM.Builder llvmctx)
+    (fieldType : IRType) (fieldVal : LLVM.Value llvmctx)
+    (retName : String := "") : M llvmctx (LLVM.Value llvmctx) := do
+  match fieldType with
+  | IRType.struct leanTypeName types _ => do
+    let fnName := s!"lean_box_{genStructTypeName leanTypeName types}"
+    let retty ← LLVM.voidPtrType llvmctx
+    let argTy ← toLLVMType fieldType
+    let argtys := #[argTy]
+    let fn ← getOrCreateFunctionPrototype (← getLLVMModule) retty fnName argtys
+    let fnty ← LLVM.functionType retty argtys
+    LLVM.buildCall2 builder fnty fn #[fieldVal] retName
+  | _ =>
+    pure fieldVal
+
+def callStructFieldUnboxHelper (builder : LLVM.Builder llvmctx)
+    (fieldType : IRType) (fieldVal : LLVM.Value llvmctx)
+    (retName : String := "") : M llvmctx (LLVM.Value llvmctx) := do
+  match fieldType with
+  | IRType.struct leanTypeName types _ => do
+    let fnName := s!"lean_unbox_{genStructTypeName leanTypeName types}"
+    let retty ← toLLVMType fieldType
+    let argtys := #[← LLVM.voidPtrType llvmctx]
+    let fn ← getOrCreateFunctionPrototype (← getLLVMModule) retty fnName argtys
+    let fnty ← LLVM.functionType retty argtys
+    LLVM.buildCall2 builder fnty fn #[fieldVal] retName
+  | _ =>
+    pure fieldVal
+
+def callStructSlotGet (builder : LLVM.Builder llvmctx)
+    (obj slot : LLVM.Value llvmctx)
+    (retName : String := "") : M llvmctx (LLVM.Value llvmctx) := do
+  let fnName := "lean_ctor_get"
+  let retty ← LLVM.voidPtrType llvmctx
+  let argtys := #[← LLVM.voidPtrType llvmctx, ← LLVM.i32Type llvmctx]
+  let fn ← getOrCreateFunctionPrototype (← getLLVMModule) retty fnName argtys
+  let fnty ← LLVM.functionType retty argtys
+  let slot ← LLVM.buildSextOrTrunc builder slot (← LLVM.i32Type llvmctx)
+  LLVM.buildCall2 builder fnty fn #[obj, slot] retName
+
+-- Emit struct constructor using LLVM struct operations
+def emitStructCtor (builder : LLVM.Builder llvmctx)
+    (z : VarId) (structType : IRType) (ys : Array Arg) : M llvmctx Unit := do
+  let llvmStructType ← toLLVMType structType
+  let (_zty, zslot) ← emitLhsSlot_ z
+  -- Create an undef struct value to start with
+  let mut structVal ← LLVM.getUndef llvmStructType
+  -- Insert each field value
+  for h : i in *...ys.size do
+    let (_yty, yval) ← emitArgVal builder ys[i] s!"field_{i}"
+    structVal ← LLVM.buildInsertValue builder structVal yval (UInt64.ofNat i) s!"struct_insert_{i}"
+  LLVM.buildStore builder structVal zslot
+
+-- Emit struct field projection using LLVM extract operations
+def emitStructProj (builder : LLVM.Builder llvmctx)
+    (z : VarId) (i : Nat) (x : VarId) : M llvmctx Unit := do
+  let xval ← emitLhsVal builder x
+  let fieldVal ← LLVM.buildExtractValue builder xval (UInt64.ofNat i) s!"field_{i}"
+  emitLhsSlotStore builder z fieldVal
+
+-- Generate struct boxing function: lean_object* lean_box_structname(structtype v)
+def generateStructBoxingFunction (mod : LLVM.Module llvmctx) (structType : IRType) : M llvmctx Unit := do
+  match structType with
+  | IRType.struct leanTypeName types _ => do
+    let typeName := genStructTypeName leanTypeName types
+    let fnName := s!"lean_box_{typeName}"
+    let llvmStructType ← toLLVMType structType
+    let numObjectFields := types.foldl (init := 0) fun n ty =>
+      if IRType.isStructBoxedFieldType ty then n + 1 else n
+    let retType ← LLVM.voidPtrType llvmctx
+    let fnType ← LLVM.functionType retType #[llvmStructType]
+
+    -- Check if function already exists
+    match ← LLVM.getNamedFunction mod fnName with
+    | some _ => pure () -- Already generated
+    | none => do
+      let fn ← LLVM.addFunction mod fnName fnType
+      let bb ← LLVM.appendBasicBlockInContext llvmctx fn "entry"
+      let builder ← LLVM.createBuilderInContext llvmctx
+      LLVM.positionBuilderAtEnd builder bb
+
+      -- Get the struct parameter
+      let structParam ← LLVM.getParam fn 0
+
+      -- Calculate struct size for allocation
+      let sizeofStruct ← LLVM.sizeOfTypeInBits llvmStructType (← getLLVMModule)
+      let sizeInBytes ← LLVM.buildUDiv builder sizeofStruct (← LLVM.constInt (← LLVM.i64Type llvmctx) 8) "struct_size"
+
+      -- Allocate lean object with object slots for ref-like fields.
+      let zero ← LLVM.constInt (← LLVM.i32Type llvmctx) 0
+      let numObjectFieldsVal ← LLVM.constInt (← LLVM.i32Type llvmctx) (UInt64.ofNat numObjectFields)
+      let argtys := #[← LLVM.i32Type llvmctx, ← LLVM.i32Type llvmctx, ← LLVM.i64Type llvmctx]
+      let allocFnType ← LLVM.functionType retType argtys
+      let allocFn ← LLVM.getOrAddFunction mod "lean_alloc_ctor" allocFnType
+      let obj ← LLVM.buildCall2 builder allocFnType allocFn #[zero, numObjectFieldsVal, sizeInBytes] "obj"
+
+      -- Get pointer to scalar data area: lean_ctor_scalar_cptr(obj)
+      let scalarPtrFnType ← LLVM.functionType (← LLVM.pointerType (← LLVM.i8Type llvmctx)) #[retType]
+      let scalarPtrFn ← LLVM.getOrAddFunction mod "lean_ctor_scalar_cptr" scalarPtrFnType
+      let scalarPtr ← LLVM.buildCall2 builder scalarPtrFnType scalarPtrFn #[obj] "scalar_ptr"
+
+      -- Cast to struct pointer and store
+      let structPtr ← LLVM.buildPointerCast builder scalarPtr (← LLVM.pointerType llvmStructType) "struct_ptr"
+      LLVM.buildStore builder structParam structPtr
+
+      -- Store boxed field views in object slots for RC/GC traversal.
+      let mut slotIdx := 0
+      for h : i in *...types.size do
+        let fieldType := types[i]
+        if IRType.isStructBoxedFieldType fieldType then
+          let fieldVal ← LLVM.buildExtractValue builder structParam (UInt64.ofNat i) s!"field_{i}"
+          let boxedFieldVal ← callStructFieldBoxHelper builder fieldType fieldVal s!"boxed_field_{i}"
+          callLeanCtorSet builder obj (← constIntUnsigned slotIdx) boxedFieldVal
+          slotIdx := slotIdx + 1
+        else
+          pure ()
+
+      -- Return the object
+      let _ ← LLVM.buildRet builder obj
+      pure ()
+
+  | _ => pure () -- Not a struct type
+
+-- Generate struct unboxing function: structtype lean_unbox_structname(lean_object* o)
+def generateStructUnboxingFunction (mod : LLVM.Module llvmctx) (structType : IRType) : M llvmctx Unit := do
+  match structType with
+  | IRType.struct leanTypeName types _ => do
+    let typeName := genStructTypeName leanTypeName types
+    let fnName := s!"lean_unbox_{typeName}"
+    let llvmStructType ← toLLVMType structType
+    let objType ← LLVM.voidPtrType llvmctx
+    let fnType ← LLVM.functionType llvmStructType #[objType]
+
+    -- Check if function already exists
+    match ← LLVM.getNamedFunction mod fnName with
+    | some _ => pure () -- Already generated
+    | none => do
+      let fn ← LLVM.addFunction mod fnName fnType
+      let bb ← LLVM.appendBasicBlockInContext llvmctx fn "entry"
+      let builder ← LLVM.createBuilderInContext llvmctx
+      LLVM.positionBuilderAtEnd builder bb
+
+      -- Get the object parameter
+      let objParam ← LLVM.getParam fn 0
+
+      -- Get pointer to scalar data: lean_ctor_scalar_cptr(o)
+      let scalarPtrFnType ← LLVM.functionType (← LLVM.pointerType (← LLVM.i8Type llvmctx)) #[objType]
+      let scalarPtrFn ← LLVM.getOrAddFunction mod "lean_ctor_scalar_cptr" scalarPtrFnType
+      let scalarPtr ← LLVM.buildCall2 builder scalarPtrFnType scalarPtrFn #[objParam] "scalar_ptr"
+
+      -- Cast to struct pointer and load
+      let structPtr ← LLVM.buildPointerCast builder scalarPtr (← LLVM.pointerType llvmStructType) "struct_ptr"
+      let mut structVal ← LLVM.buildLoad2 builder llvmStructType structPtr "struct_val"
+
+      -- Restore boxed fields from object slots.
+      let mut slotIdx := 0
+      for h : i in *...types.size do
+        let fieldType := types[i]
+        if IRType.isStructBoxedFieldType fieldType then
+          let slotVal ← callStructSlotGet builder objParam (← constIntUnsigned slotIdx) s!"slot_{slotIdx}"
+          let fieldVal ← callStructFieldUnboxHelper builder fieldType slotVal s!"unboxed_field_{i}"
+          structVal ← LLVM.buildInsertValue builder structVal fieldVal (UInt64.ofNat i) s!"struct_insert_{i}"
+          match fieldType with
+          | IRType.object | IRType.tagged | IRType.tobject =>
+            callLeanRefcountFn builder .inc (checkRef? := true) fieldVal
+          | _ =>
+            pure ()
+          slotIdx := slotIdx + 1
+        else
+          pure ()
+
+      -- Return the struct value
+      let _ ← LLVM.buildRet builder structVal
+      pure ()
+
+  | _ => pure () -- Not a struct type
+
+-- Collect struct types from IR expressions and function bodies (similar to C backend)
+def collectStructTypesFromArg (_ : Arg) : List IRType :=
+  [] -- Args don't contain type info directly
+
+partial def collectStructTypesFromExpr (e : Expr) : List IRType :=
+  match e with
+  | Expr.ctor _ ys => ys.toList.foldl (fun acc y => acc ++ collectStructTypesFromArg y) []
+  | _ => []
+
+partial def collectStructTypesFromBody (b : FnBody) : List IRType :=
+  match b with
+  | FnBody.vdecl _ t e b =>
+    let eTypes := collectStructTypesFromExpr e
+    let bTypes := collectStructTypesFromBody b
+    let tTypes := match t with
+      | st@(IRType.struct ..) => [st]
+      | _ => []
+    eTypes ++ bTypes ++ tTypes
+  | FnBody.jdecl _ xs v b =>
+    let vTypes := collectStructTypesFromBody v
+    let bTypes := collectStructTypesFromBody b
+    let paramTypes := xs.toList.foldl (fun acc p =>
+      match p.ty with
+      | st@(IRType.struct ..) => st :: acc
+      | _ => acc) []
+    vTypes ++ bTypes ++ paramTypes
+  | FnBody.set _ _ _ b | FnBody.uset _ _ _ b | FnBody.setTag _ _ b
+  | FnBody.sset _ _ _ _ _ b | FnBody.inc _ _ _ _ b | FnBody.dec _ _ _ _ b
+  | FnBody.del _ b => collectStructTypesFromBody b
+  | FnBody.case _ _ _ alts =>
+    alts.toList.foldl (fun acc alt => acc ++ collectStructTypesFromBody alt.body) []
+  | _ => []
+
+def collectStructTypesFromDecl (d : Decl) : List IRType :=
+  match d with
+  | Decl.fdecl _ xs t body _ =>
+    let bodyTypes := collectStructTypesFromBody body
+    let paramTypes := xs.toList.foldl (fun acc p =>
+      match p.ty with
+      | st@(IRType.struct ..) => st :: acc
+      | _ => acc) []
+    let retTypes := match t with
+      | st@(IRType.struct ..) => [st]
+      | _ => []
+    bodyTypes ++ paramTypes ++ retTypes
+  | _ => []
+
+-- Generate boxing and unboxing functions for all struct types
+def generateStructBoxingFunctions (mod : LLVM.Module llvmctx) : M llvmctx Unit := do
+  let env ← getEnv
+  let decls := getDecls env
+  let allStructTypes := decls.foldl (fun acc d => acc ++ collectStructTypesFromDecl d) []
+  let uniqueStructTypes := allStructTypes.eraseDups
+
+  for structType in uniqueStructTypes do
+    generateStructBoxingFunction mod structType
+    generateStructUnboxingFunction mod structType
+
 def emitCtorSetArgs (builder : LLVM.Builder llvmctx)
     (z : VarId) (ys : Array Arg) : M llvmctx Unit := do
   ys.size.forM fun i _ => do
@@ -598,31 +842,47 @@ def emitCtorSetArgs (builder : LLVM.Builder llvmctx)
     pure ()
 
 def emitCtor (builder : LLVM.Builder llvmctx)
-    (z : VarId) (c : CtorInfo) (ys : Array Arg) : M llvmctx Unit := do
-  let (_llvmty, slot) ← emitLhsSlot_ z
-  if c.size == 0 && c.usize == 0 && c.ssize == 0 then do
-    let v ← callLeanBox builder (← constIntSizeT c.cidx) "lean_box_outv"
-    let _ ← LLVM.buildStore builder v slot
-  else do
-    let v ← emitAllocCtor builder c
-    let _ ← LLVM.buildStore builder v slot
-    emitCtorSetArgs builder z ys
+    (z : VarId) (t : IRType) (c : CtorInfo) (ys : Array Arg) : M llvmctx Unit := do
+  match t with
+  | IRType.struct _ _ _ =>
+    -- Handle struct constructors
+    emitStructCtor builder z t ys
+  | _ =>
+    -- Handle regular object constructors
+    let (_llvmty, slot) ← emitLhsSlot_ z
+    if c.size == 0 && c.usize == 0 && c.ssize == 0 then do
+      let v ← callLeanBox builder (← constIntSizeT c.cidx) "lean_box_outv"
+      let _ ← LLVM.buildStore builder v slot
+    else do
+      let v ← emitAllocCtor builder c
+      let _ ← LLVM.buildStore builder v slot
+      emitCtorSetArgs builder z ys
 
 def emitInc (builder : LLVM.Builder llvmctx)
     (x : VarId) (n : Nat) (checkRef? : Bool) : M llvmctx Unit := do
-  let xv ← emitLhsVal builder x
-  if n != 1
-  then do
-     let nv ← constIntSizeT n
-     callLeanRefcountFn builder (kind := RefcountKind.inc) (checkRef? := checkRef?) (delta := nv) xv
-  else callLeanRefcountFn builder (kind := RefcountKind.inc) (checkRef? := checkRef?) xv
+  -- Skip lean_inc for struct types since they're stack-allocated values
+  let varType ← getVarIRType x
+  match varType with
+  | some (IRType.struct _ _ _) => pure ()  -- No-op for struct types
+  | _ => do
+    let xv ← emitLhsVal builder x
+    if n != 1
+    then do
+       let nv ← constIntSizeT n
+       callLeanRefcountFn builder (kind := RefcountKind.inc) (checkRef? := checkRef?) (delta := nv) xv
+    else callLeanRefcountFn builder (kind := RefcountKind.inc) (checkRef? := checkRef?) xv
 
 def emitDec (builder : LLVM.Builder llvmctx)
     (x : VarId) (n : Nat) (checkRef? : Bool) : M llvmctx Unit := do
-  let xv ← emitLhsVal builder x
-  if n != 1
-  then throw "expected n = 1 for emitDec"
-  else callLeanRefcountFn builder (kind := RefcountKind.dec) (checkRef? := checkRef?) xv
+  -- Skip lean_dec for struct types since they're stack-allocated values
+  let varType ← getVarIRType x
+  match varType with
+  | some (IRType.struct _ _ _) => pure ()  -- No-op for struct types
+  | _ => do
+    let xv ← emitLhsVal builder x
+    if n != 1
+    then throw "expected n = 1 for emitDec"
+    else callLeanRefcountFn builder (kind := RefcountKind.dec) (checkRef? := checkRef?) xv
 
 def emitNumLit (builder : LLVM.Builder llvmctx)
     (t : IRType) (v : Nat) : M llvmctx (LLVM.Value llvmctx) := do
@@ -683,7 +943,7 @@ def emitExternCall (builder : LLVM.Builder llvmctx)
   | some (ExternEntry.standard _ extFn) => emitSimpleExternalCall builder extFn ps ys retty name
   | some (ExternEntry.inline `llvm _pat) => throw "Unimplemented codegen of inline LLVM"
   | some (ExternEntry.inline _ pat) => throw s!"Cannot codegen non-LLVM inline code '{pat}'."
-  | some ExternEntry.opaque => unreachable!
+  | some (ExternEntry.opaque _)  => unreachable!
   | _ => throw s!"Failed to emit extern application '{f}'."
 
 def getFunIdTy (f : FunId) : M llvmctx (LLVM.LLVMType llvmctx) := do
@@ -758,7 +1018,7 @@ def emitFullApp (builder : LLVM.Builder llvmctx)
   let (__zty, zslot) ← emitLhsSlot_ z
   let decl ← getDecl f
   match decl with
-  | .fdecl .. | .extern _ _ _ { entries := [.opaque] } =>
+  | .fdecl .. | .extern _ _ _ { entries := [.opaque _] } =>
     if ys.size > 0 then
         let fv ← getOrAddFunIdValue builder f
         let ys ←  ys.mapM (fun y => do
@@ -779,7 +1039,7 @@ def emitLit (builder : LLVM.Builder llvmctx)
     (z : VarId) (t : IRType) (v : LitVal) : M llvmctx (LLVM.Value llvmctx) := do
   let llvmty ← toLLVMType t
   let zslot ← buildPrologueAlloca builder llvmty
-  addVarToState z zslot llvmty
+  addVarToState z zslot llvmty t
   let zv ← match v with
             | LitVal.num v => emitNumLit builder t v
             | LitVal.str v =>
@@ -806,9 +1066,16 @@ def callLeanCtorGet (builder : LLVM.Builder llvmctx)
   LLVM.buildCall2 builder fnty fn  #[x, i] retName
 
 def emitProj (builder : LLVM.Builder llvmctx) (z : VarId) (i : Nat) (x : VarId) : M llvmctx Unit := do
-  let xval ← emitLhsVal builder x
-  let zval ← callLeanCtorGet builder xval (← constIntUnsigned i) ""
-  emitLhsSlotStore builder z zval
+  let xType? ← getVarIRType x
+  match xType? with
+  | some (IRType.struct _ _ _) =>
+    -- Handle struct projection using extract operations
+    emitStructProj builder z i x
+  | _ =>
+    -- Handle regular object projection
+    let xval ← emitLhsVal builder x
+    let zval ← callLeanCtorGet builder xval (← constIntUnsigned i) ""
+    emitLhsSlotStore builder z zval
 
 def callLeanCtorGetUsize (builder : LLVM.Builder llvmctx)
     (x i : LLVM.Value llvmctx) (retName : String) : M llvmctx (LLVM.Value llvmctx) := do
@@ -820,9 +1087,18 @@ def callLeanCtorGetUsize (builder : LLVM.Builder llvmctx)
   LLVM.buildCall2 builder fnty fn  #[x, i] retName
 
 def emitUProj (builder : LLVM.Builder llvmctx) (z : VarId) (i : Nat) (x : VarId) : M llvmctx Unit := do
-  let xval ← emitLhsVal builder x
-  let zval ← callLeanCtorGetUsize builder xval (← constIntUnsigned i) ""
-  emitLhsSlotStore builder z zval
+  let xType? ← getVarIRType x
+  match xType? with
+  | some (IRType.struct _ _ _) => do
+    -- Struct types: direct field access using extractvalue
+    let xval ← emitLhsVal builder x
+    let fieldVal ← LLVM.buildExtractValue builder xval (UInt64.ofNat i) s!"field_{i}"
+    emitLhsSlotStore builder z fieldVal
+  | _ => do
+    -- Object types: use lean_ctor_get_usize function
+    let xval ← emitLhsVal builder x
+    let zval ← callLeanCtorGetUsize builder xval (← constIntUnsigned i) ""
+    emitLhsSlotStore builder z zval
 
 def emitOffset (builder : LLVM.Builder llvmctx)
     (n : Nat) (offset : Nat) : M llvmctx (LLVM.Value llvmctx) := do
@@ -833,22 +1109,31 @@ def emitOffset (builder : LLVM.Builder llvmctx)
 
 def emitSProj (builder : LLVM.Builder llvmctx)
     (z : VarId) (t : IRType) (n offset : Nat) (x : VarId) : M llvmctx Unit := do
-  let (fnName, retty) ←
-    match t with
-    | IRType.float   => pure ("lean_ctor_get_float", ← LLVM.doubleTypeInContext llvmctx)
-    | IRType.float32 => pure ("lean_ctor_get_float32", ← LLVM.floatTypeInContext llvmctx)
-    | IRType.uint8   => pure ("lean_ctor_get_uint8", ← LLVM.i8Type llvmctx)
-    | IRType.uint16  => pure ("lean_ctor_get_uint16", ←  LLVM.i16Type llvmctx)
-    | IRType.uint32  => pure ("lean_ctor_get_uint32", ← LLVM.i32Type llvmctx)
-    | IRType.uint64  => pure ("lean_ctor_get_uint64", ← LLVM.i64Type llvmctx)
-    | _              => throw s!"Invalid type for lean_ctor_get: '{t}'"
-  let argtys := #[ ← LLVM.voidPtrType llvmctx, ← LLVM.unsignedType llvmctx]
-  let fn ← getOrCreateFunctionPrototype (← getLLVMModule) retty fnName argtys
-  let xval ← emitLhsVal builder x
-  let offset ← emitOffset builder n offset
-  let fnty ← LLVM.functionType retty argtys
-  let zval ← LLVM.buildCall2 builder fnty fn  #[xval, offset]
-  emitLhsSlotStore builder z zval
+  let xType? ← getVarIRType x
+  match xType? with
+  | some (IRType.struct _ _ _) => do
+    -- Struct types: offset directly corresponds to field index, use extractvalue
+    let xval ← emitLhsVal builder x
+    let fieldVal ← LLVM.buildExtractValue builder xval (UInt64.ofNat offset) s!"field_{offset}"
+    emitLhsSlotStore builder z fieldVal
+  | _ => do
+    -- Object types: use lean_ctor_get_* functions
+    let (fnName, retty) ←
+      match t with
+      | IRType.float   => pure ("lean_ctor_get_float", ← LLVM.doubleTypeInContext llvmctx)
+      | IRType.float32 => pure ("lean_ctor_get_float32", ← LLVM.floatTypeInContext llvmctx)
+      | IRType.uint8   => pure ("lean_ctor_get_uint8", ← LLVM.i8Type llvmctx)
+      | IRType.uint16  => pure ("lean_ctor_get_uint16", ←  LLVM.i16Type llvmctx)
+      | IRType.uint32  => pure ("lean_ctor_get_uint32", ← LLVM.i32Type llvmctx)
+      | IRType.uint64  => pure ("lean_ctor_get_uint64", ← LLVM.i64Type llvmctx)
+      | _              => throw s!"Invalid type for lean_ctor_get: '{t}'"
+    let argtys := #[ ← LLVM.voidPtrType llvmctx, ← LLVM.unsignedType llvmctx]
+    let fn ← getOrCreateFunctionPrototype (← getLLVMModule) retty fnName argtys
+    let xval ← emitLhsVal builder x
+    let offset ← emitOffset builder n offset
+    let fnty ← LLVM.functionType retty argtys
+    let zval ← LLVM.buildCall2 builder fnty fn  #[xval, offset]
+    emitLhsSlotStore builder z zval
 
 def callLeanIsExclusive (builder : LLVM.Builder llvmctx)
     (closure : LLVM.Value llvmctx) (retName : String := "") : M llvmctx (LLVM.Value llvmctx) := do
@@ -886,6 +1171,11 @@ def emitBox (builder : LLVM.Builder llvmctx) (z : VarId) (x : VarId) (xType : IR
     | IRType.uint64  => pure ("lean_box_uint64", ← LLVM.size_tType llvmctx, xv)
     | IRType.float   => pure ("lean_box_float", ← LLVM.doubleTypeInContext llvmctx, xv)
     | IRType.float32 => pure ("lean_box_float32", ← LLVM.floatTypeInContext llvmctx, xv)
+    | IRType.struct leanTypeName types _ => do
+         -- For struct types, we need to create a boxing function call
+         let structType ← toLLVMType xType
+         let fnName := s!"lean_box_{genStructTypeName leanTypeName types}"
+         pure (fnName, structType, xv)
     | _              =>
          -- sign extend smaller values into i64
          let xv ← LLVM.buildSext builder xv (← LLVM.size_tType llvmctx)
@@ -917,6 +1207,10 @@ def callUnboxForType (builder : LLVM.Builder llvmctx)
      | IRType.uint64  => pure ("lean_unbox_uint64", ← toLLVMType t)
      | IRType.float   => pure ("lean_unbox_float", ← toLLVMType t)
      | IRType.float32 => pure ("lean_unbox_float32", ← toLLVMType t)
+     | IRType.struct leanTypeName types _ => do
+         let structType ← toLLVMType t
+         let fnName := s!"lean_unbox_{genStructTypeName leanTypeName types}"
+         pure (fnName, structType)
      | _              => pure ("lean_unbox", ← LLVM.size_tType llvmctx)
   let argtys := #[← LLVM.voidPtrType llvmctx ]
   let fn ← getOrCreateFunctionPrototype (← getLLVMModule) retty fnName argtys
@@ -933,7 +1227,7 @@ def emitUnbox (builder : LLVM.Builder llvmctx)
   let zval ←
     if IRType.isIntegerType t
     then LLVM.buildSextOrTrunc builder zval (← toLLVMType t)
-    else pure zval
+    else pure zval  -- structs and other types don't need truncation
   emitLhsSlotStore builder z zval
 
 def emitReset (builder : LLVM.Builder llvmctx) (z : VarId) (n : Nat) (x : VarId) : M llvmctx Unit := do
@@ -979,7 +1273,7 @@ def emitReuse (builder : LLVM.Builder llvmctx)
 
 def emitVDecl (builder : LLVM.Builder llvmctx) (z : VarId) (t : IRType) (v : Expr) : M llvmctx Unit := do
   match v with
-  | Expr.ctor c ys      => emitCtor builder z c ys
+  | Expr.ctor c ys      => emitCtor builder z t c ys
   | Expr.reset n x      => emitReset builder z n x
   | Expr.reuse x c u ys => emitReuse builder z x c u ys
   | Expr.proj i x       => emitProj builder z i x
@@ -996,7 +1290,7 @@ def emitVDecl (builder : LLVM.Builder llvmctx) (z : VarId) (t : IRType) (v : Exp
 def declareVar (builder : LLVM.Builder llvmctx) (x : VarId) (t : IRType) : M llvmctx Unit := do
   let llvmty ← toLLVMType t
   let alloca ← buildPrologueAlloca builder llvmty "varx"
-  addVarToState x alloca llvmty
+  addVarToState x alloca llvmty t
 
 partial def declareVars (builder : LLVM.Builder llvmctx) (f : FnBody) : M llvmctx Unit := do
   match f with
@@ -1203,7 +1497,7 @@ def emitFnArgs (builder : LLVM.Builder llvmctx)
           -- slot for arg[i] which is always void* ?
           let alloca ← buildPrologueAlloca builder llvmty s!"arg_{i}"
           LLVM.buildStore builder pv alloca
-          addVarToState param.x alloca llvmty
+          addVarToState param.x alloca llvmty param.ty
   else
       let n ← LLVM.countParams llvmfn
       for i in *...n.toNat do
@@ -1212,7 +1506,7 @@ def emitFnArgs (builder : LLVM.Builder llvmctx)
         let alloca ← buildPrologueAlloca builder  llvmty s!"arg_{i}"
         let arg ← LLVM.getParam llvmfn (UInt64.ofNat i)
         let _ ← LLVM.buildStore builder arg alloca
-        addVarToState param.x alloca llvmty
+        addVarToState param.x alloca llvmty param.ty
 
 def emitDeclAux (mod : LLVM.Module llvmctx) (builder : LLVM.Builder llvmctx) (d : Decl) : M llvmctx Unit := do
   let env ← getEnv
@@ -1242,7 +1536,7 @@ def emitDeclAux (mod : LLVM.Module llvmctx) (builder : LLVM.Builder llvmctx) (d 
       else
         LLVM.setDLLStorageClass llvmfn LLVM.DLLStorageClass.export  -- LEAN_EXPORT: make symbol visible to the interpreter
       withReader (fun llvmctx => { llvmctx with mainFn := f, mainParams := xs }) do
-        set { var2val := default, jp2bb := default : EmitLLVM.State llvmctx } -- flush variable map
+        set { var2val := default, var2irtype := default, jp2bb := default : EmitLLVM.State llvmctx } -- flush variable map
         let bb ← LLVM.appendBasicBlockInContext llvmctx llvmfn "entry"
         LLVM.positionBuilderAtEnd builder bb
         emitFnArgs builder needsPackedArgs? llvmfn xs
@@ -1324,7 +1618,8 @@ def emitDeclInit (builder : LLVM.Builder llvmctx)
       else
          let dval ← callLeanIOResultGetValue builder resv s!"{d.name}_res"
          LLVM.buildStore builder dval dslot
-         callLeanMarkPersistentFn builder dval
+         if d.resultType.isObj && !d.resultType.isStruct then
+           callLeanMarkPersistentFn builder dval
       let _ ← LLVM.buildBr builder restBB
       LLVM.positionBuilderAtEnd builder restBB
     | none => do
@@ -1333,13 +1628,12 @@ def emitDeclInit (builder : LLVM.Builder llvmctx)
       LLVM.setInitializer dslot (← LLVM.getUndef llvmty)
       let dval ← callPureDeclInitFn builder (← toCInitName d.name) (← toLLVMType d.resultType)
       LLVM.buildStore builder dval dslot
-      if d.resultType.isObj then
+      if d.resultType.isObj && !d.resultType.isStruct then
          callLeanMarkPersistentFn builder dval
 
 def callModInitFn (builder : LLVM.Builder llvmctx)
-    (modName : Name) (pkg? : Option PkgId)
-    (input world : LLVM.Value llvmctx) (retName : String) : M llvmctx (LLVM.Value llvmctx) := do
-  let fnName := mkModuleInitializationFunctionName modName pkg?
+    (modName : Name) (input world : LLVM.Value llvmctx) (retName : String): M llvmctx (LLVM.Value llvmctx) := do
+  let fnName := mkModuleInitializationFunctionName modName
   let retty ← LLVM.voidPtrType llvmctx
   let argtys := #[ (← LLVM.i8Type llvmctx), (← LLVM.voidPtrType llvmctx)]
   let fn ← getOrCreateFunctionPrototype (← getLLVMModule) retty fnName argtys
@@ -1349,9 +1643,9 @@ def callModInitFn (builder : LLVM.Builder llvmctx)
 def emitInitFn (mod : LLVM.Module llvmctx) (builder : LLVM.Builder llvmctx) : M llvmctx Unit := do
   let env ← getEnv
   let modName ← getModName
-  let pkg? := env.getModulePackage?
+
   let initFnTy ← LLVM.functionType (← LLVM.voidPtrType llvmctx) #[ (← LLVM.i8Type llvmctx), (← LLVM.voidPtrType llvmctx)] (isVarArg := false)
-  let initFn ← LLVM.getOrAddFunction mod (mkModuleInitializationFunctionName modName pkg?) initFnTy
+  let initFn ← LLVM.getOrAddFunction mod (mkModuleInitializationFunctionName modName) initFnTy
   LLVM.setDLLStorageClass initFn LLVM.DLLStorageClass.export  -- LEAN_EXPORT
   let entryBB ← LLVM.appendBasicBlockInContext llvmctx initFn "entry"
   LLVM.positionBuilderAtEnd builder entryBB
@@ -1371,10 +1665,7 @@ def emitInitFn (mod : LLVM.Module llvmctx) (builder : LLVM.Builder llvmctx) : M 
   env.imports.forM fun import_ => do
     let builtin ← LLVM.getParam initFn 0
     let world ← callLeanIOMkWorld builder
-    let some idx := env.getModuleIdx? import_.module
-      | throw "(internal) import without module index" -- should be unreachable
-    let pkg? := env.getModulePackageByIdx? idx
-    let res ← callModInitFn builder import_.module pkg? builtin world ("res_" ++ import_.module.mangle)
+    let res ← callModInitFn builder import_.module builtin world ("res_" ++ import_.module.mangle)
     let err? ← callLeanIOResultIsError builder res ("res_is_error_"  ++ import_.module.mangle)
     buildIfThen_ builder ("IsError" ++ import_.module.mangle) err?
       (fun builder => do
@@ -1520,8 +1811,7 @@ def emitMainFn (mod : LLVM.Module llvmctx) (builder : LLVM.Builder llvmctx) : M 
         See issue #534. We can remove this workaround after we implement issue #467. -/
   callLeanSetPanicMessages builder (← LLVM.constFalse llvmctx)
   let world ← callLeanIOMkWorld builder
-  let resv ← callModInitFn builder (← getModName) env.getModulePackage?
-    (← constInt8 1) world ((← getModName).toString ++ "_init_out")
+  let resv ← callModInitFn builder (← getModName) (← constInt8 1) world ((← getModName).toString ++ "_init_out")
   let _ ← LLVM.buildStore builder resv res
 
   callLeanSetPanicMessages builder (← LLVM.constTrue llvmctx)
@@ -1610,6 +1900,8 @@ def emitMainFnIfNeeded (mod : LLVM.Module llvmctx) (builder : LLVM.Builder llvmc
   if (← hasMainFn) then emitMainFn mod builder
 
 def main : M llvmctx Unit := do
+  -- Generate struct boxing/unboxing functions first
+  generateStructBoxingFunctions (← getLLVMModule)
   emitFnDecls
   let builder ← LLVM.createBuilderInContext llvmctx
   emitFns (← getLLVMModule) builder
@@ -1643,7 +1935,7 @@ def emitLLVM (env : Environment) (modName : Name) (filepath : String) : IO Unit 
   let llvmctx ← LLVM.createContext
   let module ← LLVM.createModule llvmctx modName.toString
   let emitLLVMCtx : EmitLLVM.Context llvmctx := {env := env, modName := modName, llvmmodule := module}
-  let initState := { var2val := default, jp2bb := default : EmitLLVM.State llvmctx}
+  let initState := { var2val := default, var2irtype := default, jp2bb := default : EmitLLVM.State llvmctx}
   let out? ← ((EmitLLVM.main (llvmctx := llvmctx)).run initState).run emitLLVMCtx
   match out? with
   | .ok _ => do
