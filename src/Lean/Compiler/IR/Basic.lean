@@ -99,7 +99,12 @@ def isObj : IRType → Bool
   | object  => true
   | tagged  => true
   | tobject => true
+  | struct .. => true  -- struct types are also considered objects for IR checking
   | _       => false
+
+def isStruct : IRType → Bool
+  | struct .. => true
+  | _         => false
 
 def isPossibleRef : IRType → Bool
   | object | tobject => true
@@ -116,6 +121,7 @@ def isErased : IRType → Bool
 def boxed : IRType → IRType
   | object | float | float32 => object
   | tagged | uint8 | uint16 => tagged
+  | struct .. => object  -- struct types become objects when boxed
   | _ => tobject
 
 end IRType
@@ -545,6 +551,12 @@ def mkIf (x : VarId) (t e : FnBody) : FnBody :=
     Alt.ctor {name := ``Bool.true, cidx := 1, size := 0, usize := 0, ssize := 0} t
   ]
 
+-- Generate a deterministic hash-based name for struct types
+def genStructTypeName (types : Array IRType) : String :=
+  let typeStr := toString (types.map (fun ty => repr ty))
+  let hash := typeStr.hash
+  s!"lean_struct_{hash}"
+
 def getUnboxOpName (t : IRType) : String :=
   match t with
   | IRType.usize    => "lean_unbox_usize"
@@ -552,6 +564,7 @@ def getUnboxOpName (t : IRType) : String :=
   | IRType.uint64   => "lean_unbox_uint64"
   | IRType.float    => "lean_unbox_float"
   | IRType.float32  => "lean_unbox_float32"
+  | IRType.struct _ types => s!"lean_unbox_{genStructTypeName types}"
   | _               => "lean_unbox"
 
 end Lean.IR

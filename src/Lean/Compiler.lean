@@ -17,6 +17,7 @@ public import Lean.Compiler.CSimpAttr
 public import Lean.Compiler.FFI
 public import Lean.Compiler.MetaAttr
 public import Lean.Compiler.NoncomputableAttr
+public import Lean.Compiler.StructAttr
 public import Lean.Compiler.Main
 public import Lean.Compiler.Old -- TODO: delete after we port code generator to Lean
 

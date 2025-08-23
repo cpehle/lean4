@@ -42,7 +42,7 @@ private def N.mkFresh : N VarId :=
 
 def requiresBoxedVersion (env : Environment) (decl : Decl) : Bool :=
   let ps := decl.params
-  (ps.size > 0 && (decl.resultType.isScalar || ps.any (fun p => p.ty.isScalar || p.borrow) || isExtern env decl.name))
+  (ps.size > 0 && (decl.resultType.isScalar || decl.resultType.isStruct || ps.any (fun p => p.ty.isScalar || p.ty.isStruct || p.borrow) || isExtern env decl.name))
   || ps.size > closureMaxArgs
 
 def mkBoxedVersionAux (decl : Decl) : N Decl := do
@@ -51,15 +51,15 @@ def mkBoxedVersionAux (decl : Decl) : N Decl := do
   let (newVDecls, xs) ← qs.size.foldM (init := (#[], #[])) fun i _ (newVDecls, xs) => do
     let p := ps[i]!
     let q := qs[i]
-    if !p.ty.isScalar then
+    if !p.ty.isScalar && !p.ty.isStruct then
       pure (newVDecls, xs.push (.var q.x))
     else
       let x ← N.mkFresh
       pure (newVDecls.push (.vdecl x p.ty (.unbox q.x) default), xs.push (.var x))
   let r ← N.mkFresh
-  let newVDecls := newVDecls.push (.vdecl r decl.resultType (.fap decl.name xs) default)
-  let body ← if !decl.resultType.isScalar then
-    pure <| reshape newVDecls (.ret (.var r))
+  let newVDecls := newVDecls.push (FnBody.vdecl r decl.resultType (Expr.fap decl.name xs) default)
+  let body ← if !decl.resultType.isScalar && !decl.resultType.isStruct then
+    pure <| reshape newVDecls (FnBody.ret (.var r))
   else
     let newR ← N.mkFresh
     let newVDecls := newVDecls.push (.vdecl newR .tobject (.box decl.resultType r) default)
@@ -256,7 +256,10 @@ def visitVDeclExpr (x : VarId) (ty : IRType) (e : Expr) (b : FnBody) : M FnBody 
   match e with
   | .ctor c ys =>
     if c.isScalar && ty.isScalar then
-      return .vdecl x ty (.lit (.num c.cidx)) b
+      return FnBody.vdecl x ty (Expr.lit (LitVal.num c.cidx)) b
+    else if ty.isStruct then
+      -- For struct constructors, don't box arguments - use them as-is
+      return FnBody.vdecl x ty (Expr.ctor c ys) b
     else
       boxArgsIfNeeded ys fun ys => return .vdecl x ty (.ctor c ys) b
   | .reuse w c u ys =>
