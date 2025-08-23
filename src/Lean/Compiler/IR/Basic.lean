@@ -77,7 +77,7 @@ inductive IRType where
   | float | uint8 | uint16 | uint32 | uint64 | usize
   | erased | object | tobject
   | float32
-  | struct (leanTypeName : Option Name) (types : Array IRType) : IRType
+  | struct (leanTypeName : Option Name) (types : Array IRType) (fieldNames : Array Name := #[]) : IRType
   | union (leanTypeName : Name) (types : Array IRType) : IRType
   -- TODO: Move this upwards after a stage0 update.
   | tagged
@@ -564,7 +564,7 @@ def getUnboxOpName (t : IRType) : String :=
   | IRType.uint64   => "lean_unbox_uint64"
   | IRType.float    => "lean_unbox_float"
   | IRType.float32  => "lean_unbox_float32"
-  | IRType.struct _ types => s!"lean_unbox_{genStructTypeName types}"
+  | IRType.struct _ types _ => s!"lean_unbox_{genStructTypeName types}"
   | _               => "lean_unbox"
 
 end Lean.IR

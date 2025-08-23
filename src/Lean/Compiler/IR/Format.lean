@@ -69,7 +69,7 @@ private partial def formatIRType : IRType → Format
   | IRType.object       => "obj"
   | IRType.tagged       => "tagged"
   | IRType.tobject      => "tobj"
-  | IRType.struct _ tys =>
+  | IRType.struct _ tys _ =>
     let _ : ToFormat IRType := ⟨formatIRType⟩
     "struct " ++ Format.bracket "{" (Format.joinSep tys.toList ", ") "}"
   | IRType.union _ tys  =>

@@ -163,7 +163,7 @@ def checkExpr (ty : IRType) (e : Expr) : M Unit := do
     match xType with
     | .object | .tobject =>
       checkObjType ty
-    | .struct _ tys | .union _ tys =>
+    | .struct _ tys _ | .union _ tys =>
       if h : i < tys.size then
         checkEqTypes (tys[i]) ty
       else
