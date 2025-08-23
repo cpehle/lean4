@@ -60,21 +60,21 @@ def emitArg (x : Arg) : M Unit :=
 
 
 -- Collect struct types from IR expressions and function bodies
-def collectStructTypesFromArg (_ : Arg) : List (Array IRType) :=
+def collectStructTypesFromArg (_ : Arg) : List IRType :=
   [] -- Args don't contain type info directly
 
-partial def collectStructTypesFromExpr (e : Expr) : List (Array IRType) :=
+partial def collectStructTypesFromExpr (e : Expr) : List IRType :=
   match e with
   | Expr.ctor _ ys => ys.toList.foldl (fun acc y => acc ++ collectStructTypesFromArg y) []
   | _ => []
 
-partial def collectStructTypesFromBody (b : FnBody) : List (Array IRType) :=
+partial def collectStructTypesFromBody (b : FnBody) : List IRType :=
   match b with
   | FnBody.vdecl _ t e b => 
     let eTypes := collectStructTypesFromExpr e
     let bTypes := collectStructTypesFromBody b
     let tTypes := match t with
-      | IRType.struct _ types => [types]
+      | st@(IRType.struct ..) => [st]
       | _ => []
     eTypes ++ bTypes ++ tTypes
   | FnBody.jdecl _ xs v b =>
@@ -82,7 +82,7 @@ partial def collectStructTypesFromBody (b : FnBody) : List (Array IRType) :=
     let bTypes := collectStructTypesFromBody b
     let paramTypes := xs.toList.foldl (fun acc p =>
       match p.ty with
-      | IRType.struct _ types => types :: acc
+      | st@(IRType.struct ..) => st :: acc
       | _ => acc) []
     vTypes ++ bTypes ++ paramTypes
   | FnBody.set _ _ _ b | FnBody.uset _ _ _ b | FnBody.setTag _ _ b 
@@ -92,16 +92,16 @@ partial def collectStructTypesFromBody (b : FnBody) : List (Array IRType) :=
     alts.toList.foldl (fun acc alt => acc ++ collectStructTypesFromBody alt.body) []
   | _ => []
 
-def collectStructTypesFromDecl (d : Decl) : List (Array IRType) :=
+def collectStructTypesFromDecl (d : Decl) : List IRType :=
   match d with
   | Decl.fdecl _ xs t body _ =>
     let bodyTypes := collectStructTypesFromBody body
     let paramTypes := xs.toList.foldl (fun acc p =>
       match p.ty with
-      | IRType.struct _ types => types :: acc
+      | st@(IRType.struct ..) => st :: acc
       | _ => acc) []
     let retTypes := match t with
-      | IRType.struct _ types => [types]
+      | st@(IRType.struct ..) => [st]
       | _ => []
     bodyTypes ++ paramTypes ++ retTypes
   | _ => []
@@ -118,54 +118,75 @@ def toCType : IRType → String
   | IRType.tagged     => "lean_object*"
   | IRType.tobject    => "lean_object*"
   | IRType.erased     => "lean_object*"
-  | IRType.struct _ types => genStructTypeName types
+  | IRType.struct _ types _ => genStructTypeName types
   | IRType.union _ _  => panic! "not implemented yet"
 
 -- Emit struct type declaration
-def emitStructTypeDecl (types : Array IRType) : M Unit := do
-  let typeName := genStructTypeName types
-  emit s!"typedef struct {typeName} "
-  emitLn "{"
-  types.size.forM fun i _ => do
-    emit "  "
-    emit (toCType types[i]!)
-    emit " field_"
-    emit i
+def emitStructTypeDecl (structType : IRType) : M Unit := do
+  match structType with
+  | IRType.struct _ types fieldNames => do
+    let typeName := genStructTypeName types
+    emit s!"typedef struct {typeName} "
+    emitLn "{"
+    types.size.forM fun i _ => do
+      emit "  "
+      emit (toCType types[i]!)
+      emit " "
+      if i < fieldNames.size then
+        emit (toString fieldNames[i]!)
+      else
+        emit s!"field_{i}"
+      emitLn ";"
+    emit "} "
+    emit typeName
     emitLn ";"
-  emit "} "
-  emit typeName
-  emitLn ";"
+  | _ => pure () -- Not a struct type
 
-def emitStructBoxingFunctions (types : Array IRType) : M Unit := do
-  let typeName := genStructTypeName types
-  -- Emit boxing function
-  emit s!"static inline lean_object* lean_box_{typeName}({typeName} v) "
-  emitLn "{"
-  emit s!"    lean_object* r = lean_alloc_ctor(0, 0, sizeof({typeName}));"
-  emitLn ""
-  emit s!"    *({typeName}*)lean_ctor_scalar_cptr(r) = v;"
-  emitLn ""
-  emitLn "    return r;"
-  emitLn "}"
-  emitLn ""
-  -- Emit unboxing function  
-  emit s!"static inline {typeName} lean_unbox_{typeName}(lean_object* o) "
-  emitLn "{"
-  emit s!"    return *({typeName}*)lean_ctor_scalar_cptr(o);"
-  emitLn ""
-  emitLn "}"
-  emitLn ""
+def emitStructBoxingFunctions (structType : IRType) : M Unit := do
+  match structType with
+  | IRType.struct _ types _ => do
+    let typeName := genStructTypeName types
+    -- Emit boxing function
+    emit s!"static inline lean_object* lean_box_{typeName}({typeName} v) "
+    emitLn "{"
+    emit s!"    lean_object* r = lean_alloc_ctor(0, 0, sizeof({typeName}));"
+    emitLn ""
+    emit s!"    *({typeName}*)lean_ctor_scalar_cptr(r) = v;"
+    emitLn ""
+    emitLn "    return r;"
+    emitLn "}"
+    emitLn ""
+    -- Emit unboxing function  
+    emit s!"static inline {typeName} lean_unbox_{typeName}(lean_object* o) "
+    emitLn "{"
+    emit s!"    return *({typeName}*)lean_ctor_scalar_cptr(o);"
+    emitLn ""
+    emitLn "}"
+  | _ => pure () -- Not a struct type
+
+-- Get field name for struct type and field index
+def getFieldName (structType : IRType) (fieldIdx : Nat) : String :=
+  match structType with
+  | IRType.struct _ _ fieldNames =>
+    if fieldIdx < fieldNames.size then
+      toString fieldNames[fieldIdx]!
+    else
+      s!"field_{fieldIdx}"
+  | _ => s!"field_{fieldIdx}"
 
 -- Get struct dependencies (only direct struct field types)
-def getStructDependencies (types : Array IRType) : List (Array IRType) :=
-  types.toList.foldl (fun acc ty =>
-    match ty with
-    | IRType.struct _ innerTypes => innerTypes :: acc
-    | _ => acc) []
+def getStructDependencies (structType : IRType) : List IRType :=
+  match structType with
+  | IRType.struct _ types _ => 
+    types.toList.foldl (fun acc ty =>
+      match ty with
+      | st@(IRType.struct _ _ _) => st :: acc
+      | _ => acc) []
+  | _ => []
 
 -- Sort struct types so dependencies come first (simple topological sort)
-partial def sortStructTypesByDependency (allTypes : List (Array IRType)) : List (Array IRType) :=
-  let rec sortImpl (remaining : List (Array IRType)) (result : List (Array IRType)) : List (Array IRType) :=
+partial def sortStructTypesByDependency (allTypes : List IRType) : List IRType :=
+  let rec sortImpl (remaining : List IRType) (result : List IRType) : List IRType :=
     match remaining with
     | [] => result.reverse
     | _ =>
@@ -412,7 +433,7 @@ def emitInc (x : VarId) (n : Nat) (checkRef : Bool) : M Unit := do
   -- Skip lean_inc for struct types since they're stack-allocated values
   let varType ← getVarType x
   match varType with
-  | some (IRType.struct _ _) => pure ()  -- No-op for struct types
+  | some (IRType.struct _ _ _) => pure ()  -- No-op for struct types
   | _ => do
     emit $
       if checkRef then (if n == 1 then "lean_inc" else "lean_inc_n")
@@ -425,7 +446,7 @@ def emitDec (x : VarId) (n : Nat) (checkRef : Bool) : M Unit := do
   -- Skip lean_dec for struct types since they're stack-allocated values
   let varType ← getVarType x
   match varType with
-  | some (IRType.struct _ _) => pure ()  -- No-op for struct types
+  | some (IRType.struct _ _ _) => pure ()  -- No-op for struct types
   | _ => do
     emit (if checkRef then "lean_dec" else "lean_dec_ref");
     emit "("; emit x;
@@ -507,7 +528,7 @@ def emitStructCtor (z : VarId) (types : Array IRType) (ys : Array Arg) : M Unit 
 
 def emitCtor (z : VarId) (t : IRType) (c : CtorInfo) (ys : Array Arg) : M Unit := do
   match t with
-  | IRType.struct _ types => emitStructCtor z types ys
+  | IRType.struct _ types _ => emitStructCtor z types ys
   | _ => do
     emitLhs z;
     if c.size == 0 && c.usize == 0 && c.ssize == 0 then do
@@ -536,20 +557,28 @@ def emitReuse (z : VarId) (x : VarId) (c : CtorInfo) (updtHeader : Bool) (ys : A
 
 -- Emit struct field projection
 def emitStructProj (z : VarId) (i : Nat) (x : VarId) : M Unit := do
-  emitLhs z; emit x; emit ".field_"; emit i; emitLn ";"
+  let xType ← getVarType x
+  match xType with
+  | some structType@(IRType.struct _ _ _) => do
+    let fieldName := getFieldName structType i
+    emitLhs z; emit x; emit "."; emit fieldName; emitLn ";"
+  | _ => 
+    -- Fallback to field_ naming
+    emitLhs z; emit x; emit ".field_"; emit i; emitLn ";"
 
 def emitProj (z : VarId) (i : Nat) (x : VarId) (srcType : IRType) : M Unit := do
   match srcType with
-  | IRType.struct _ _ => emitStructProj z i x
+  | IRType.struct _ _ _ => emitStructProj z i x
   | _ => 
     emitLhs z; emit "lean_ctor_get("; emit x; emit ", "; emit i; emitLn ");"
 
 def emitUProj (z : VarId) (i : Nat) (x : VarId) : M Unit := do
   let xType ← getVarType x
   match xType with
-  | some (IRType.struct _ _) => do
+  | some structType@(IRType.struct _ _ _) => do
     -- Struct types: direct field access
-    emitLhs z; emit x; emit ".field_"; emit i; emitLn ";"
+    let fieldName := getFieldName structType i
+    emitLhs z; emit x; emit "."; emit fieldName; emitLn ";"
   | _ => do
     -- Object types: use lean_ctor_get_usize function
     emitLhs z; emit "lean_ctor_get_usize("; emit x; emit ", "; emit i; emitLn ");"
@@ -557,9 +586,10 @@ def emitUProj (z : VarId) (i : Nat) (x : VarId) : M Unit := do
 def emitSProj (z : VarId) (t : IRType) (n offset : Nat) (x : VarId) : M Unit := do
   let xType ← getVarType x
   match xType with
-  | some (IRType.struct _ _) => do
+  | some structType@(IRType.struct _ _ _) => do
     -- Struct types: offset directly corresponds to field index
-    emitLhs z; emit x; emit ".field_"; emit offset; emitLn ";"
+    let fieldName := getFieldName structType offset
+    emitLhs z; emit x; emit "."; emit fieldName; emitLn ";"
   | _ => do
     -- Object types: use lean_ctor_get_* functions
     emitLhs z;
@@ -629,7 +659,7 @@ def emitBoxFn (xType : IRType) : M Unit :=
   | IRType.uint64  => emit "lean_box_uint64"
   | IRType.float   => emit "lean_box_float"
   | IRType.float32 => emit "lean_box_float32"
-  | IRType.struct _ types => do
+  | IRType.struct _ types _ => do
     let typeName := genStructTypeName types
     emit s!"lean_box_{typeName}"
   | _              => emit "lean_box"
