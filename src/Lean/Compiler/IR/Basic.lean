@@ -6,8 +6,10 @@ Authors: Leonardo de Moura
 module
 
 prelude
+public import Lean.Data.KVMap
+public import Lean.Data.Name
+public import Lean.Data.Format
 public import Lean.Compiler.ExternAttr
-import Init.Data.Range.Polymorphic.Iterators
 
 public section
 /-!
@@ -52,9 +54,6 @@ instance : ToString JoinPointId := ⟨fun a => "block_" ++ toString a.idx⟩
 
    - `tobject` an `object` or a `tagged` pointer
 
-   - `void` is used to identify uses of the state token from `BaseIO` which do no longer need
-     to be passed around etc. at this point in the pipeline.
-
    - `struct` and `union` are used to return small values (e.g., `Option`, `Prod`, `Except`)
       on the stack.
 
@@ -78,11 +77,10 @@ inductive IRType where
   | float | uint8 | uint16 | uint32 | uint64 | usize
   | erased | object | tobject
   | float32
-  | struct (leanTypeName : Option Name) (types : Array IRType) : IRType
+  | struct (leanTypeName : Option Name) (types : Array IRType) (fieldNames : Array Name := #[]) : IRType
   | union (leanTypeName : Name) (types : Array IRType) : IRType
   -- TODO: Move this upwards after a stage0 update.
   | tagged
-  | void
   deriving Inhabited, BEq, Repr
 
 namespace IRType
@@ -101,8 +99,12 @@ def isObj : IRType → Bool
   | object  => true
   | tagged  => true
   | tobject => true
-  | void    => true
+  | struct .. => true  -- struct types are also considered objects for IR checking
   | _       => false
+
+def isStruct : IRType → Bool
+  | struct .. => true
+  | _         => false
 
 def isPossibleRef : IRType → Bool
   | object | tobject => true
@@ -116,13 +118,10 @@ def isErased : IRType → Bool
   | erased => true
   | _ => false
 
-def isVoid : IRType → Bool
-  | void => true
-  | _ => false
-
 def boxed : IRType → IRType
   | object | float | float32 => object
-  | void | tagged | uint8 | uint16 => tagged
+  | tagged | uint8 | uint16 => tagged
+  | struct .. => object  -- struct types become objects when boxed
   | _ => tobject
 
 end IRType
@@ -394,7 +393,7 @@ def mkIndexSet (idx : Index) : IndexSet :=
   Std.TreeSet.empty.insert idx
 
 inductive LocalContextEntry where
-  | param     : IRType → LocalContextEntry
+  | param     : IRType → Bool → LocalContextEntry  -- Added Bool for borrow flag
   | localVar  : IRType → Expr → LocalContextEntry
   | joinPoint : Array Param → FnBody → LocalContextEntry
 
@@ -407,7 +406,7 @@ def LocalContext.addJP (ctx : LocalContext) (j : JoinPointId) (xs : Array Param)
   ctx.insert j.idx (LocalContextEntry.joinPoint xs b)
 
 def LocalContext.addParam (ctx : LocalContext) (p : Param) : LocalContext :=
-  ctx.insert p.x.idx (LocalContextEntry.param p.ty)
+  ctx.insert p.x.idx (LocalContextEntry.param p.ty p.borrow)
 
 def LocalContext.addParams (ctx : LocalContext) (ps : Array Param) : LocalContext :=
   ps.foldl LocalContext.addParam ctx
@@ -429,7 +428,7 @@ def LocalContext.getJPParams (ctx : LocalContext) (j : JoinPointId) : Option (Ar
 
 def LocalContext.isParam (ctx : LocalContext) (idx : Index) : Bool :=
   match ctx.get? idx with
-  | some (LocalContextEntry.param _) => true
+  | some (LocalContextEntry.param _ _) => true
   | _     => false
 
 def LocalContext.isLocalVar (ctx : LocalContext) (idx : Index) : Bool :=
@@ -445,9 +444,14 @@ def LocalContext.eraseJoinPointDecl (ctx : LocalContext) (j : JoinPointId) : Loc
 
 def LocalContext.getType (ctx : LocalContext) (x : VarId) : Option IRType :=
   match ctx.get? x.idx with
-  | some (LocalContextEntry.param t) => some t
+  | some (LocalContextEntry.param t _) => some t
   | some (LocalContextEntry.localVar t _) => some t
   | _     => none
+
+def LocalContext.isBorrowedParam (ctx : LocalContext) (x : VarId) : Bool :=
+  match ctx.get? x.idx with
+  | some (LocalContextEntry.param _ true) => true
+  | _ => false
 
 def LocalContext.getValue (ctx : LocalContext) (x : VarId) : Option Expr :=
   match ctx.get? x.idx with
@@ -552,6 +556,16 @@ def mkIf (x : VarId) (t e : FnBody) : FnBody :=
     Alt.ctor {name := ``Bool.true, cidx := 1, size := 0, usize := 0, ssize := 0} t
   ]
 
+-- Generate a deterministic hash-based name for struct types
+def genStructTypeName (leanTypeName : Option Name) (types : Array IRType) : String :=
+  let typeStr := toString (types.map (fun ty => repr ty))
+  let nameStr := match leanTypeName with
+    | some name => name.toString
+    | none => ""
+  let combinedStr := nameStr ++ typeStr
+  let hash := combinedStr.hash
+  s!"lean_struct_{hash}"
+
 def getUnboxOpName (t : IRType) : String :=
   match t with
   | IRType.usize    => "lean_unbox_usize"
@@ -559,6 +573,7 @@ def getUnboxOpName (t : IRType) : String :=
   | IRType.uint64   => "lean_unbox_uint64"
   | IRType.float    => "lean_unbox_float"
   | IRType.float32  => "lean_unbox_float32"
+  | IRType.struct leanTypeName types _ => s!"lean_unbox_{genStructTypeName leanTypeName types}"
   | _               => "lean_unbox"
 
 end Lean.IR

@@ -1,0 +1,8 @@
+UInt32 Point: (10, 20)
+UInt32 Area: 5000
+UInt8 Color: RGB(255, 128, 64)
+UInt8 Brightness: 149
+USize Buffer: data=4096, size=100, capacity=200
+USize Remaining: 100
+UInt64 Counter: value=1000000000000, increment=7
+UInt64 Next: 1000000000007

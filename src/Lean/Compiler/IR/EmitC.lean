@@ -6,23 +6,20 @@ Authors: Leonardo de Moura
 module
 
 prelude
+public import Lean.Runtime
 public import Lean.Compiler.NameMangling
+public import Lean.Compiler.ExportAttr
+public import Lean.Compiler.InitAttr
+public import Lean.Compiler.IR.CompilerM
 public import Lean.Compiler.IR.EmitUtil
 public import Lean.Compiler.IR.NormIds
 public import Lean.Compiler.IR.SimpCase
-public import Lean.Compiler.ModPkgExt
-import Lean.Compiler.LCNF.Types
-import Lean.Compiler.ClosedTermCache
-import Lean.Compiler.IR.SimpleGroundExpr
-import Init.Omega
-import Init.While
-import Init.Data.Range.Polymorphic.Iterators
-import Lean.Runtime
+public import Lean.Compiler.IR.Boxing
 
 public section
 
 namespace Lean.IR.EmitC
-open Lean.Compiler.LCNF (isBoxedName)
+open ExplicitBoxing (requiresBoxedVersion mkBoxedName isBoxedName)
 
 def leanMainFn := "_lean_main"
 
@@ -32,22 +29,100 @@ structure Context where
   jpMap      : JPParamsMap := {}
   mainFn     : FunId := default
   mainParams : Array Param := #[]
+  localCtx   : LocalContext := {}
+  borrowedVars : Std.HashSet VarId := {}  -- Variables that will be used as borrowed arguments
 
 abbrev M := ReaderT Context (EStateM String String)
 
-@[inline] def getEnv : M Environment := Context.env <$> read
-
-@[inline] def getModName : M Name := Context.modName <$> read
-
-@[inline] def getModInitFn : M String := do
-  let pkg? := (← getEnv).getModulePackage?
-  return mkModuleInitializationFunctionName (← getModName) pkg?
-
+def getEnv : M Environment := Context.env <$> read
+def getModName : M Name := Context.modName <$> read
 def getDecl (n : Name) : M Decl := do
   let env ← getEnv
   match findEnvDecl env n with
   | some d => pure d
   | none   => throw s!"unknown declaration '{n}'"
+
+-- Variable usage information
+structure VarUsage where
+  borrowedUses : Std.HashSet VarId := {}  -- Variables used as borrowed arguments
+  ownedUses : Std.HashSet VarId := {}      -- Variables used as owned arguments or in other contexts
+
+-- Analyze function body to find how variables are used
+partial def collectVarUsage : FnBody → M VarUsage
+  | FnBody.vdecl _ _ (Expr.fap f ys) b => do
+    let decl ← getDecl f
+    let mut usage : VarUsage := {}
+    -- Check which arguments are passed to borrowed vs owned parameters
+    for i in [:ys.size] do
+      match ys[i]! with
+      | Arg.var v =>
+        if i < decl.params.size && decl.params[i]!.borrow then
+          usage := { usage with borrowedUses := usage.borrowedUses.insert v }
+        else
+          usage := { usage with ownedUses := usage.ownedUses.insert v }
+      | _ => pure ()
+    let restUsage ← collectVarUsage b
+    -- Merge the usage information
+    pure {
+      borrowedUses := restUsage.borrowedUses.fold (init := usage.borrowedUses) fun acc v => acc.insert v
+      ownedUses := restUsage.ownedUses.fold (init := usage.ownedUses) fun acc v => acc.insert v
+    }
+  | FnBody.vdecl _ _ (Expr.pap f ys) b => do
+    let decl ← getDecl f
+    let mut usage : VarUsage := {}
+    -- Check which captured arguments are for borrowed vs owned parameters
+    for i in [:ys.size] do
+      match ys[i]! with
+      | Arg.var v =>
+        if i < decl.params.size && decl.params[i]!.borrow then
+          usage := { usage with borrowedUses := usage.borrowedUses.insert v }
+        else
+          usage := { usage with ownedUses := usage.ownedUses.insert v }
+      | _ => pure ()
+    let restUsage ← collectVarUsage b
+    pure {
+      borrowedUses := restUsage.borrowedUses.fold (init := usage.borrowedUses) fun acc v => acc.insert v
+      ownedUses := restUsage.ownedUses.fold (init := usage.ownedUses) fun acc v => acc.insert v
+    }
+  | FnBody.vdecl _ _ (Expr.ap x ys) b => do
+    -- For general applications, conservatively mark all as owned
+    let mut usage : VarUsage := {}
+    -- The function being called is used in owned context
+    usage := { usage with ownedUses := usage.ownedUses.insert x }
+    -- Arguments are also owned (conservative)
+    for y in ys do
+      match y with
+      | Arg.var v => usage := { usage with ownedUses := usage.ownedUses.insert v }
+      | _ => pure ()
+    let restUsage ← collectVarUsage b
+    pure {
+      borrowedUses := restUsage.borrowedUses.fold (init := usage.borrowedUses) fun acc v => acc.insert v
+      ownedUses := restUsage.ownedUses.fold (init := usage.ownedUses) fun acc v => acc.insert v
+    }
+  | FnBody.vdecl _ _ _ b => collectVarUsage b
+  | FnBody.jdecl _ _ v b => do
+    let vUsage ← collectVarUsage v
+    let bUsage ← collectVarUsage b
+    pure {
+      borrowedUses := bUsage.borrowedUses.fold (init := vUsage.borrowedUses) fun acc v => acc.insert v
+      ownedUses := bUsage.ownedUses.fold (init := vUsage.ownedUses) fun acc v => acc.insert v
+    }
+  | FnBody.case _ x _ alts => do
+    let mut usage : VarUsage := {}
+    -- The scrutinee is used in owned context
+    usage := { usage with ownedUses := usage.ownedUses.insert x }
+    for alt in alts do
+      let altUsage ← collectVarUsage alt.body
+      usage := {
+        borrowedUses := altUsage.borrowedUses.fold (init := usage.borrowedUses) fun acc v => acc.insert v
+        ownedUses := altUsage.ownedUses.fold (init := usage.ownedUses) fun acc v => acc.insert v
+      }
+    pure usage
+  | FnBody.inc _ _ _ _ b | FnBody.dec _ _ _ _ b | FnBody.del _ b
+  | FnBody.set _ _ _ b | FnBody.setTag _ _ b 
+  | FnBody.uset _ _ _ b | FnBody.sset _ _ _ _ _ b => collectVarUsage b
+  | FnBody.ret (Arg.var v) => pure { ownedUses := ({} : Std.HashSet VarId).insert v }
+  | FnBody.ret _ | FnBody.jmp _ _ | FnBody.unreachable => pure {}
 
 @[inline] def emit {α : Type} [ToString α] (a : α) : M Unit :=
   modify fun out => out ++ toString a
@@ -66,6 +141,54 @@ def argToCString (x : Arg) : String :=
 def emitArg (x : Arg) : M Unit :=
   emit (argToCString x)
 
+
+-- Collect struct types from IR expressions and function bodies
+def collectStructTypesFromArg (_ : Arg) : List IRType :=
+  [] -- Args don't contain type info directly
+
+partial def collectStructTypesFromExpr (e : Expr) : List IRType :=
+  match e with
+  | Expr.ctor _ ys => ys.toList.foldl (fun acc y => acc ++ collectStructTypesFromArg y) []
+  | _ => []
+
+partial def collectStructTypesFromBody (b : FnBody) : List IRType :=
+  match b with
+  | FnBody.vdecl _ t e b => 
+    let eTypes := collectStructTypesFromExpr e
+    let bTypes := collectStructTypesFromBody b
+    let tTypes := match t with
+      | st@(IRType.struct ..) => [st]
+      | _ => []
+    eTypes ++ bTypes ++ tTypes
+  | FnBody.jdecl _ xs v b =>
+    let vTypes := collectStructTypesFromBody v
+    let bTypes := collectStructTypesFromBody b
+    let paramTypes := xs.toList.foldl (fun acc p =>
+      match p.ty with
+      | st@(IRType.struct ..) => st :: acc
+      | _ => acc) []
+    vTypes ++ bTypes ++ paramTypes
+  | FnBody.set _ _ _ b | FnBody.uset _ _ _ b | FnBody.setTag _ _ b 
+  | FnBody.sset _ _ _ _ _ b | FnBody.inc _ _ _ _ b | FnBody.dec _ _ _ _ b 
+  | FnBody.del _ b => collectStructTypesFromBody b
+  | FnBody.case _ _ _ alts => 
+    alts.toList.foldl (fun acc alt => acc ++ collectStructTypesFromBody alt.body) []
+  | _ => []
+
+def collectStructTypesFromDecl (d : Decl) : List IRType :=
+  match d with
+  | Decl.fdecl _ xs t body _ =>
+    let bodyTypes := collectStructTypesFromBody body
+    let paramTypes := xs.toList.foldl (fun acc p =>
+      match p.ty with
+      | st@(IRType.struct ..) => st :: acc
+      | _ => acc) []
+    let retTypes := match t with
+      | st@(IRType.struct ..) => [st]
+      | _ => []
+    bodyTypes ++ paramTypes ++ retTypes
+  | _ => []
+
 def toCType : IRType → String
   | IRType.float      => "double"
   | IRType.float32    => "float"
@@ -78,29 +201,154 @@ def toCType : IRType → String
   | IRType.tagged     => "lean_object*"
   | IRType.tobject    => "lean_object*"
   | IRType.erased     => "lean_object*"
-  | IRType.void       => "lean_object*"
-  | IRType.struct _ _ => panic! "not implemented yet"
+  | IRType.struct leanTypeName types _ => genStructTypeName leanTypeName types
   | IRType.union _ _  => panic! "not implemented yet"
 
-def toHexDigit (c : Nat) : String :=
-  String.singleton c.digitChar
+-- Generate C type with borrow information
+def toCTypeBorrow (ty : IRType) (borrow : Bool) : String :=
+  match ty with
+  | IRType.object | IRType.tagged | IRType.tobject =>
+    if borrow then "b_lean_obj_arg" else "lean_obj_arg"
+  | _ => toCType ty
 
-def quoteString (s : String) : String :=
-  let q := "\"";
-  let q := s.foldl
-    (fun q c => q ++
-      if c == '\n' then "\\n"
-      else if c == '\r' then "\\r"
-      else if c == '\t' then "\\t"
-      else if c == '\\' then "\\\\"
-      else if c == '\"' then "\\\""
-      else if c == '?' then "\\?" -- avoid trigraphs
-      else if c.toNat <= 31 then
-        "\\x" ++ toHexDigit (c.toNat / 16) ++ toHexDigit (c.toNat % 16)
-      -- TODO(Leo): we should use `\unnnn` for escaping unicode characters.
-      else String.singleton c)
-    q;
-  q ++ "\""
+def mkStructFieldName (fieldNames : Array Name) (fieldIdx : Nat) : String :=
+  if fieldIdx < fieldNames.size then
+    s!"field_{fieldIdx}_{String.mangle (toString fieldNames[fieldIdx]!)}"
+  else
+    s!"field_{fieldIdx}"
+
+def isStructBoxedFieldType : IRType → Bool
+  | IRType.object | IRType.tagged | IRType.tobject | IRType.struct .. => true
+  | _ => false
+
+def emitStructFieldBoxArg (fieldType : IRType) (fieldName : String) : M Unit := do
+  match fieldType with
+  | IRType.struct leanTypeName types _ =>
+    let typeName := genStructTypeName leanTypeName types
+    emit s!"lean_box_{typeName}(v.{fieldName})"
+  | _ =>
+    emit s!"v.{fieldName}"
+
+def emitStructFieldUnboxExpr (fieldType : IRType) (objExpr : String) : M Unit := do
+  match fieldType with
+  | IRType.struct leanTypeName types _ =>
+    let typeName := genStructTypeName leanTypeName types
+    emit s!"lean_unbox_{typeName}({objExpr})"
+  | _ =>
+    emit objExpr
+
+-- Emit struct type declaration
+def emitStructTypeDecl (structType : IRType) : M Unit := do
+  match structType with
+  | IRType.struct leanTypeName types fieldNames => do
+    let typeName := genStructTypeName leanTypeName types
+    emit s!"typedef struct {typeName} "
+    emitLn "{"
+    types.size.forM fun i _ => do
+      emit "  "
+      emit (toCType types[i]!)
+      emit " "
+      emit (mkStructFieldName fieldNames i)
+      emitLn ";"
+    emit "} "
+    emit typeName
+    emitLn ";"
+  | _ => pure () -- Not a struct type
+
+def emitStructBoxingFunctions (structType : IRType) : M Unit := do
+  match structType with
+  | IRType.struct leanTypeName types fieldNames => do
+    let typeName := genStructTypeName leanTypeName types
+    let numObjectFields := types.foldl (init := 0) fun n ty =>
+      if isStructBoxedFieldType ty then n + 1 else n
+    -- Emit boxing function
+    emit s!"static inline lean_object* lean_box_{typeName}({typeName} v) "
+    emitLn "{"
+    emit s!"    lean_object* r = lean_alloc_ctor(0, {numObjectFields}, sizeof({typeName}));"
+    emitLn ""
+    emit s!"    *({typeName}*)lean_ctor_scalar_cptr(r) = v;"
+    emitLn ""
+    let mut slotIdx := 0
+    for h : i in *...types.size do
+      let fieldType := types[i]
+      if isStructBoxedFieldType fieldType then
+        let fieldName := mkStructFieldName fieldNames i
+        emit s!"    lean_ctor_set(r, {slotIdx}, "
+        emitStructFieldBoxArg fieldType fieldName
+        emitLn ");"
+        slotIdx := slotIdx + 1
+      else
+        pure ()
+    emitLn "    return r;"
+    emitLn "}"
+    emitLn ""
+    -- Emit unboxing function.
+    emit s!"static inline {typeName} lean_unbox_{typeName}(lean_object* o) "
+    emitLn "{"
+    emit s!"    {typeName} r = *({typeName}*)lean_ctor_scalar_cptr(o);"
+    emitLn ""
+    let mut unboxSlotIdx := 0
+    for h : i in *...types.size do
+      let fieldType := types[i]
+      if isStructBoxedFieldType fieldType then
+        let fieldName := mkStructFieldName fieldNames i
+        emit s!"    r.{fieldName} = "
+        emitStructFieldUnboxExpr fieldType s!"lean_ctor_get(o, {unboxSlotIdx})"
+        emitLn ";"
+        match fieldType with
+        | IRType.object | IRType.tagged | IRType.tobject =>
+          emit s!"    lean_inc(r.{fieldName});"
+          emitLn ""
+        | _ =>
+          pure ()
+        unboxSlotIdx := unboxSlotIdx + 1
+      else
+        pure ()
+    emitLn "    return r;"
+    emitLn "}"
+  | _ => pure () -- Not a struct type
+
+-- Get field name for struct type and field index
+def getFieldName (structType : IRType) (fieldIdx : Nat) : String :=
+  match structType with
+  | IRType.struct _ _ fieldNames =>
+    mkStructFieldName fieldNames fieldIdx
+  | _ => s!"field_{fieldIdx}"
+
+-- Get struct dependencies (only direct struct field types)
+def getStructDependencies (structType : IRType) : List IRType :=
+  match structType with
+  | IRType.struct _ types _ => 
+    types.toList.foldl (fun acc ty =>
+      match ty with
+      | st@(IRType.struct _ _ _) => st :: acc
+      | _ => acc) []
+  | _ => []
+
+-- Sort struct types so dependencies come first (simple topological sort)
+partial def sortStructTypesByDependency (allTypes : List IRType) : List IRType :=
+  let rec sortImpl (remaining : List IRType) (result : List IRType) : List IRType :=
+    match remaining with
+    | [] => result.reverse
+    | _ =>
+      -- Find types with no dependencies in remaining set
+      let (noDeps, withDeps) := remaining.partition (fun ty =>
+        let deps := getStructDependencies ty
+        not (deps.any (fun dep => remaining.contains dep)))
+      match noDeps with
+      | [] => result.reverse ++ remaining  -- Circular dependency fallback
+      | _ => sortImpl withDeps (noDeps.reverse ++ result)
+  sortImpl allTypes []
+
+def emitStructTypeDecls : M Unit := do
+  let env ← getEnv
+  let decls := getDecls env
+  let allStructTypes := decls.foldl (fun acc d => acc ++ collectStructTypesFromDecl d) []
+  let uniqueStructTypes := allStructTypes.eraseDups
+  let sortedStructTypes := sortStructTypesByDependency uniqueStructTypes
+  -- Emit full struct definitions in dependency order
+  sortedStructTypes.forM emitStructTypeDecl
+  sortedStructTypes.forM emitStructBoxingFunctions
 
 def throwInvalidExportName {α : Type} (n : Name) : M α :=
   throw s!"invalid export name '{n}'"
@@ -109,9 +357,9 @@ def toCName (n : Name) : M String := do
   let env ← getEnv;
   -- TODO: we should support simple export names only
   match getExportNameFor? env n with
-  | some (.str .anonymous s) => return s
+  | some (.str .anonymous s) => pure s
   | some _                   => throwInvalidExportName n
-  | none                     => return if n == `main then leanMainFn else getSymbolStem env n
+  | none                     => if n == `main then pure leanMainFn else pure n.mangle
 
 def emitCName (n : Name) : M Unit :=
   toCName n >>= emit
@@ -122,165 +370,33 @@ def toCInitName (n : Name) : M String := do
   match getExportNameFor? env n with
   | some (.str .anonymous s) => return "_init_" ++ s
   | some _                   => throwInvalidExportName n
-  | none                     => return "_init_" ++ getSymbolStem env n
+  | none                     => pure ("_init_" ++ n.mangle)
 
 def emitCInitName (n : Name) : M Unit :=
   toCInitName n >>= emit
 
-def ctorScalarSizeStr (usize : Nat) (ssize : Nat) : String :=
-  if usize == 0 then toString ssize
-  else if ssize == 0 then s!"sizeof(size_t)*{usize}"
-  else s!"sizeof(size_t)*{usize} + {ssize}"
-
-structure GroundState where
-  auxCounter : Nat := 0
-
-abbrev GroundM := StateT GroundState M
-
-partial def emitGroundDecl (decl : Decl) (cppBaseName : String) : M Unit := do
-  let some ground := getSimpleGroundExpr (← getEnv) decl.name | unreachable!
-  discard <| compileGround ground |>.run {}
-where
-  compileGround (e : SimpleGroundExpr) : GroundM Unit := do
-    let valueName ← compileGroundToValue e
-    let declPrefix := if isClosedTermName (← getEnv) decl.name then "static" else "LEAN_EXPORT"
-    emitLn <| s!"{declPrefix} const lean_object* {cppBaseName} = (const lean_object*)&{valueName};"
-
-  compileGroundToValue (e : SimpleGroundExpr) : GroundM String := do
-    match e with
-    | .ctor cidx objArgs usizeArgs scalarArgs =>
-      let val ← compileCtor cidx objArgs usizeArgs scalarArgs
-      mkValueCLit "lean_ctor_object" val
-    | .string data =>
-      let leanStringTag := 249
-      let header := mkHeader 0 0 leanStringTag
-      let size := data.utf8ByteSize + 1 -- null byte
-      let length := data.length
-      let data : String := quoteString data
-      mkValueCLit
-        "lean_string_object"
-        s!"\{.m_header = {header}, .m_size = {size}, .m_capacity = {size}, .m_length = {length}, .m_data = {data}}"
-    | .pap func args =>
-      let numFixed := args.size
-      let leanClosureTag := 245
-      let header := mkHeader s!"sizeof(lean_closure_object) + sizeof(void*)*{numFixed}" 0 leanClosureTag
-      let funPtr := s!"(void*){← toCName func}"
-      let arity := (← getDecl func).params.size
-      let args ← args.mapM groundArgToCLit
-      let argArray := String.intercalate "," args.toList
-      mkValueCLit
-        "lean_closure_object"
-        s!"\{.m_header = {header}, .m_fun = {funPtr}, .m_arity = {arity}, .m_num_fixed = {numFixed}, .m_objs = \{{argArray}} }"
-    | .nameMkStr args =>
-      let obj ← groundNameMkStrToCLit args
-      mkValueCLit "lean_ctor_object" obj
-    | .reference refDecl => findValueDecl refDecl
-
-  mkValueName (name : String) : String :=
-    name ++ "_value"
-
-  mkAuxValueName (name : String) (idx : Nat) : String :=
-    mkValueName name ++ s!"_aux_{idx}"
-
-  mkAuxDecl (type value : String) : GroundM String := do
-    let idx ← modifyGet fun s => (s.auxCounter, { s with auxCounter := s.auxCounter + 1 })
-    let name := mkAuxValueName cppBaseName idx
-    emitLn <| s!"static const {type} {name} = {value};"
-    return name
-
-  mkValueCLit (type value : String) : GroundM String := do
-    let valueName := mkValueName cppBaseName
-    emitLn <| s!"static const {type} {valueName} = {value};"
-    return valueName
-
-  groundNameMkStrToCLit (args : Array (Name × UInt64)) : GroundM String := do
-    assert! args.size > 0
-    if args.size == 1 then
-      let (ref, hash) := args[0]!
-      let hash := uint64ToByteArrayLE hash
-      compileCtor 1 #[.tagged 0, .reference ref] #[] hash
-    else
-      let (ref, hash) := args.back!
-      let args := args.pop
-      let lit ← groundNameMkStrToCLit args
-      let auxName ← mkAuxDecl "lean_ctor_object" lit
-      let hash := uint64ToByteArrayLE hash
-      compileCtor 1 #[.rawReference auxName, .reference ref] #[] hash
-
-  groundArgToCLit (a : SimpleGroundArg) : GroundM String := do
-    match a with
-    | .tagged val => return s!"((lean_object*)(((size_t)({val}) << 1) | 1))"
-    | .reference decl =>  return s!"((lean_object*)&{← findValueDecl decl})"
-    | .rawReference decl => return s!"((lean_object*)&{decl})"
-
-  findValueDecl (decl : Name) : GroundM String := do
-    let mut decl := decl
-    while true do
-      if let some (.reference ref) := getSimpleGroundExpr (← getEnv) decl then
-        decl := ref
-      else
-        break
-    return mkValueName (← toCName decl)
-
-  compileCtor (cidx : Nat) (objArgs : Array SimpleGroundArg) (usizeArgs : Array USize)
-      (scalarArgs : Array UInt8) : GroundM String := do
-    let header := mkCtorHeader objArgs.size usizeArgs.size scalarArgs.size cidx
-    let objArgs ← objArgs.mapM groundArgToCLit
-    let usizeArgs : Array String := usizeArgs.map fun val => s!"(lean_object*)(size_t)({val}ULL)"
-    assert! scalarArgs.size % 8 == 0
-    let scalarArgs : Array String := Id.run do
-      let chunks := scalarArgs.size / 8
-      let mut packed := Array.emptyWithCapacity chunks
-      for idx in 0...chunks do
-        let b1 := scalarArgs[idx * 8]!
-        let b2 := scalarArgs[idx * 8 + 1]!
-        let b3 := scalarArgs[idx * 8 + 2]!
-        let b4 := scalarArgs[idx * 8 + 3]!
-        let b5 := scalarArgs[idx * 8 + 4]!
-        let b6 := scalarArgs[idx * 8 + 5]!
-        let b7 := scalarArgs[idx * 8 + 6]!
-        let b8 := scalarArgs[idx * 8 + 7]!
-        let lit := s!"LEAN_SCALAR_PTR_LITERAL({b1}, {b2}, {b3}, {b4}, {b5}, {b6}, {b7}, {b8})"
-        packed := packed.push lit
-      return packed
-    let argArray := String.intercalate "," (objArgs ++ usizeArgs ++ scalarArgs).toList
-    return s!"\{.m_header = {header}, .m_objs = \{{argArray}}}"
-
-  mkCtorHeader (numObjs : Nat) (usize : Nat) (ssize : Nat) (tag : Nat) : String :=
-    let size := s!"sizeof(lean_ctor_object) + sizeof(void*)*{numObjs} + {ctorScalarSizeStr usize ssize}"
-    mkHeader size numObjs tag
-
-  mkHeader {α : Type} [ToString α] (csSz : α) (other : Nat) (tag : Nat) : String :=
-    s!"\{.m_rc = 0, .m_cs_sz = {csSz}, .m_other = {other}, .m_tag = {tag}}"
-
 def emitFnDeclAux (decl : Decl) (cppBaseName : String) (isExternal : Bool) : M Unit := do
   let ps := decl.params
   let env ← getEnv
-
-  if isSimpleGroundDecl env decl.name then
-    emitGroundDecl decl cppBaseName
+  if ps.isEmpty then
+    if isExternal then emit "extern "
+    else if isClosedTermName env decl.name then emit "static "
+    else emit "LEAN_EXPORT "
   else
-    if ps.isEmpty then
-      if isExternal then emit "extern "
-      else if isClosedTermName env decl.name then emit "static "
-      else emit "LEAN_EXPORT "
+    if !isExternal then emit "LEAN_EXPORT "
+  emit (toCType decl.resultType ++ " " ++ cppBaseName)
+  unless ps.isEmpty do
+    emit "("
+    -- We omit erased parameters for extern constants
+    let ps := if isExternC env decl.name then ps.filter (fun p => !p.ty.isErased) else ps
+    if ps.size > closureMaxArgs && isBoxedName decl.name then
+      emit "lean_object**"
     else
-      if !isExternal then emit "LEAN_EXPORT "
-    emit (toCType decl.resultType ++ " " ++ cppBaseName)
-    unless ps.isEmpty do
-      emit "("
-      -- We omit void parameters, note that they are guaranteed not to occur in boxed functions
-      let ps := ps.filter (fun p => !p.ty.isVoid)
-      -- We omit erased parameters for extern constants
-      let ps := if isExternC env decl.name then ps.filter (fun p => !p.ty.isErased) else ps
-      if ps.size > closureMaxArgs && isBoxedName decl.name then
-        emit "lean_object**"
-      else
-        ps.size.forM fun i _ => do
-          if i > 0 then emit ", "
-          emit (toCType ps[i].ty)
-      emit ")"
-    emitLn ";"
+      ps.size.forM fun i _ => do
+        if i > 0 then emit ", "
+        emit (toCTypeBorrow ps[i].ty ps[i].borrow)
+    emit ")"
+  emitLn ";"
 
 def emitFnDecl (decl : Decl) (isExternal : Bool) : M Unit := do
   let cppBaseName ← toCName decl.name
@@ -293,9 +409,10 @@ def emitExternDeclAux (decl : Decl) (cNameStr : String) : M Unit := do
 
 def emitFnDecls : M Unit := do
   let env ← getEnv
-  let decls := getDecls env |>.reverse
+  let decls := getDecls env
   let modDecls  : NameSet := decls.foldl (fun s d => s.insert d.name) {}
-  let usedDecls := collectUsedDecls env decls
+  let usedDecls : NameSet := decls.foldl (fun s d => collectUsedDecls env d (s.insert d.name)) {}
+  let usedDecls := usedDecls.toList
   usedDecls.forM fun n => do
     let decl ← getDecl n;
     match getExternNameFor env `c decl.name with
@@ -330,10 +447,11 @@ def emitMainFn : M Unit := do
       emitLn "lean_initialize();"
     else
       emitLn "lean_initialize_runtime_module();"
+    let modName ← getModName
     /- We disable panic messages because they do not mesh well with extracted closed terms.
        See issue #534. We can remove this workaround after we implement issue #467. -/
     emitLn "lean_set_panic_messages(false);"
-    emitLn s!"res = {← getModInitFn}(1 /* builtin */);"
+    emitLn ("res = " ++ mkModuleInitializationFunctionName modName ++ "(1 /* builtin */, lean_io_mk_world());")
     emitLn "lean_set_panic_messages(true);"
     emitLns ["lean_io_mark_end_initialization();",
              "if (lean_io_result_is_ok(res)) {",
@@ -348,9 +466,9 @@ def emitMainFn : M Unit := do
                " n = lean_alloc_ctor(1,2,0); lean_ctor_set(n, 0, lean_mk_string(argv[i])); lean_ctor_set(n, 1, in);",
                " in = n;",
               "}"]
-      emitLn ("res = " ++ leanMainFn ++ "(in);")
+      emitLn ("res = " ++ leanMainFn ++ "(in, lean_io_mk_world());")
     else
-      emitLn ("res = " ++ leanMainFn ++ "();")
+      emitLn ("res = " ++ leanMainFn ++ "(lean_io_mk_world());")
     emitLn "}"
     -- `IO _`
     let retTy := env.find? `main |>.get! |>.type |>.getForallBody
@@ -417,6 +535,13 @@ def getJPParams (j : JoinPointId) : M (Array Param) := do
   | some ps => pure ps
   | none    => throw "unknown join point"
 
+def getVarType (x : VarId) : M (Option IRType) := do
+  let ctx ← read
+  pure (ctx.localCtx.getType x)
+
+def withLocalVar {α : Type} (x : VarId) (t : IRType) (m : M α) : M α := do
+  withReader (fun ctx => { ctx with localCtx := ctx.localCtx.insert x.idx (LocalContextEntry.param t false) }) m
+
 def declareVar (x : VarId) (t : IRType) : M Unit := do
   emit (toCType t); emit " "; emit x; emit "; "
 
@@ -446,21 +571,40 @@ def isIf (alts : Array Alt) : Option (Nat × FnBody × FnBody) :=
     | _            => none
 
 def emitInc (x : VarId) (n : Nat) (checkRef : Bool) : M Unit := do
-  emit $
-    if checkRef then (if n == 1 then "lean_inc" else "lean_inc_n")
-    else (if n == 1 then "lean_inc_ref" else "lean_inc_ref_n")
-  emit "("; emit x
-  if n != 1 then emit ", "; emit n
-  emitLn ");"
+  -- Skip lean_inc for struct types
+  let varType ← getVarType x
+  match varType with
+  | some (IRType.struct _ _ _) => pure ()  -- No-op for struct types
+  | _ => do
+    emit $
+      if checkRef then (if n == 1 then "lean_inc" else "lean_inc_n")
+      else (if n == 1 then "lean_inc_ref" else "lean_inc_ref_n")
+    emit "("; emit x
+    if n != 1 then emit ", "; emit n
+    emitLn ");"
 
 def emitDec (x : VarId) (n : Nat) (checkRef : Bool) : M Unit := do
-  emit (if checkRef then "lean_dec" else "lean_dec_ref");
-  emit "("; emit x;
-  if n != 1 then emit ", "; emit n
-  emitLn ");"
+  -- Skip lean_dec for borrowed parameters and struct types
+  let ctx ← read
+  if ctx.localCtx.isBorrowedParam x then
+    pure ()  -- No-op for borrowed parameters
+  else
+    let varType ← getVarType x
+    match varType with
+    | some (IRType.struct _ _ _) => pure ()  -- No-op for struct types
+    | _ => do
+      emit (if checkRef then "lean_dec" else "lean_dec_ref");
+      emit "("; emit x;
+      if n != 1 then emit ", "; emit n
+      emitLn ");"
 
 def emitDel (x : VarId) : M Unit := do
-  emit "lean_free_object("; emit x; emitLn ");"
+  -- Skip deletion for borrowed parameters
+  let ctx ← read
+  if ctx.localCtx.isBorrowedParam x then
+    pure ()  -- No-op for borrowed parameters
+  else
+    emit "lean_free_object("; emit x; emitLn ");"
 
 def emitSetTag (x : VarId) (i : Nat) : M Unit := do
   emit "lean_ctor_set_tag("; emit x; emit ", "; emit i; emitLn ");"
@@ -508,8 +652,10 @@ def emitArgs (ys : Array Arg) : M Unit :=
     if i > 0 then emit ", "
     emitArg ys[i]
 
-def emitCtorScalarSize (usize : Nat) (ssize : Nat) : M Unit :=
-  emit <| ctorScalarSizeStr usize ssize
+def emitCtorScalarSize (usize : Nat) (ssize : Nat) : M Unit := do
+  if usize == 0 then emit ssize
+  else if ssize == 0 then emit "sizeof(size_t)*"; emit usize
+  else emit "sizeof(size_t)*"; emit usize; emit " + "; emit ssize
 
 def emitAllocCtor (c : CtorInfo) : M Unit := do
   emit "lean_alloc_ctor("; emit c.cidx; emit ", "; emit c.size; emit ", "
@@ -519,12 +665,26 @@ def emitCtorSetArgs (z : VarId) (ys : Array Arg) : M Unit :=
   ys.size.forM fun i _ => do
     emit "lean_ctor_set("; emit z; emit ", "; emit i; emit ", "; emitArg ys[i]; emitLn ");"
 
-def emitCtor (z : VarId) (c : CtorInfo) (ys : Array Arg) : M Unit := do
-  emitLhs z;
-  if c.size == 0 && c.usize == 0 && c.ssize == 0 then do
-    emit "lean_box("; emit c.cidx; emitLn ");"
-  else do
-    emitAllocCtor c; emitCtorSetArgs z ys
+-- Emit struct constructor using compound literal syntax
+def emitStructCtor (z : VarId) (leanTypeName : Option Name) (types : Array IRType) (ys : Array Arg) : M Unit := do
+  emitLhs z
+  let typeName := genStructTypeName leanTypeName types
+  emit s!"({typeName})"
+  emit "{"
+  ys.size.forM fun i _ => do
+    if i > 0 then emit ", "
+    emitArg ys[i]!
+  emitLn "};"
+
+def emitCtor (z : VarId) (t : IRType) (c : CtorInfo) (ys : Array Arg) : M Unit := do
+  match t with
+  | IRType.struct leanTypeName types _ => emitStructCtor z leanTypeName types ys
+  | _ => do
+    emitLhs z;
+    if c.size == 0 && c.usize == 0 && c.ssize == 0 then do
+      emit "lean_box("; emit c.cidx; emitLn ");"
+    else do
+      emitAllocCtor c; emitCtorSetArgs z ys
 
 def emitReset (z : VarId) (n : Nat) (x : VarId) : M Unit := do
   emit "if (lean_is_exclusive("; emit x; emitLn ")) {";
@@ -545,23 +705,60 @@ def emitReuse (z : VarId) (x : VarId) (c : CtorInfo) (updtHeader : Bool) (ys : A
   emitLn "}";
   emitCtorSetArgs z ys
 
-def emitProj (z : VarId) (i : Nat) (x : VarId) : M Unit := do
-  emitLhs z; emit "lean_ctor_get("; emit x; emit ", "; emit i; emitLn ");"
+-- Emit struct field projection
+def emitStructProj (z : VarId) (i : Nat) (x : VarId) : M Unit := do
+  let xType ← getVarType x
+  match xType with
+  | some structType@(IRType.struct _ _ _) => do
+    let fieldName := getFieldName structType i
+    emitLhs z; emit x; emit "."; emit fieldName; emitLn ";"
+  | _ => 
+    -- Fallback to field_ naming
+    emitLhs z; emit x; emit ".field_"; emit i; emitLn ";"
+
+def emitProj (z : VarId) (i : Nat) (x : VarId) (srcType : IRType) : M Unit := do
+  match srcType with
+  | IRType.struct _ _ _ => emitStructProj z i x
+  | _ => do
+    let ctx ← read
+    emitLhs z
+    -- Use borrowed variant if this variable will be used as a borrowed argument
+    if ctx.borrowedVars.contains z then
+      emit "lean_ctor_get_borrowed("
+    else
+      emit "lean_ctor_get("
+    emit x; emit ", "; emit i; emitLn ");"
 
 def emitUProj (z : VarId) (i : Nat) (x : VarId) : M Unit := do
-  emitLhs z; emit "lean_ctor_get_usize("; emit x; emit ", "; emit i; emitLn ");"
+  let xType ← getVarType x
+  match xType with
+  | some structType@(IRType.struct _ _ _) => do
+    -- Struct types: direct field access
+    let fieldName := getFieldName structType i
+    emitLhs z; emit x; emit "."; emit fieldName; emitLn ";"
+  | _ => do
+    -- Object types: use lean_ctor_get_usize function
+    emitLhs z; emit "lean_ctor_get_usize("; emit x; emit ", "; emit i; emitLn ");"
 
 def emitSProj (z : VarId) (t : IRType) (n offset : Nat) (x : VarId) : M Unit := do
-  emitLhs z;
-  match t with
-  | IRType.float    => emit "lean_ctor_get_float"
-  | IRType.float32  => emit "lean_ctor_get_float32"
-  | IRType.uint8    => emit "lean_ctor_get_uint8"
-  | IRType.uint16   => emit "lean_ctor_get_uint16"
-  | IRType.uint32   => emit "lean_ctor_get_uint32"
-  | IRType.uint64   => emit "lean_ctor_get_uint64"
-  | _               => throw "invalid instruction"
-  emit "("; emit x; emit ", "; emitOffset n offset; emitLn ");"
+  let xType ← getVarType x
+  match xType with
+  | some structType@(IRType.struct _ _ _) => do
+    -- Struct types: offset directly corresponds to field index
+    let fieldName := getFieldName structType offset
+    emitLhs z; emit x; emit "."; emit fieldName; emitLn ";"
+  | _ => do
+    -- Object types: use lean_ctor_get_* functions
+    emitLhs z;
+    match t with
+    | IRType.float    => emit "lean_ctor_get_float"
+    | IRType.float32  => emit "lean_ctor_get_float32"
+    | IRType.uint8    => emit "lean_ctor_get_uint8"
+    | IRType.uint16   => emit "lean_ctor_get_uint16"
+    | IRType.uint32   => emit "lean_ctor_get_uint32"
+    | IRType.uint64   => emit "lean_ctor_get_uint64"
+    | _               => throw "invalid instruction"
+    emit "("; emit x; emit ", "; emitOffset n offset; emitLn ");"
 
 def toStringArgs (ys : Array Arg) : List String :=
   ys.toList.map argToCString
@@ -571,8 +768,7 @@ def emitSimpleExternalCall (f : String) (ps : Array Param) (ys : Array Arg) : M 
   -- We must remove erased arguments to extern calls.
   discard <| ys.size.foldM
     (fun i _ (first : Bool) =>
-      let ty := ps[i]!.ty
-      if ty.isErased || ty.isVoid then
+      if ps[i]!.ty.isErased then
         pure first
       else do
         unless first do emit ", "
@@ -588,21 +784,13 @@ def emitExternCall (f : FunId) (ps : Array Param) (extData : ExternAttrData) (ys
   | some (ExternEntry.inline _ pat)     => do emit (expandExternPattern pat (toStringArgs ys)); emitLn ";"
   | _ => throw s!"failed to emit extern application '{f}'"
 
-def emitLeanFunReference (f : FunId) : M Unit := do
-  if isSimpleGroundDecl (← getEnv) f then
-    emit s!"((lean_object*)({← toCName f}))"
-  else
-    emitCName f
-
 def emitFullApp (z : VarId) (f : FunId) (ys : Array Arg) : M Unit := do
   emitLhs z
   let decl ← getDecl f
   match decl with
-  | .fdecl (xs := ps) .. | .extern (xs := ps) (ext := { entries := [.opaque], .. }) .. =>
-    emitLeanFunReference f
-    if ys.size > 0 then
-      let (ys, _) := ys.zip ps |>.filter (fun (_, p) => !p.ty.isVoid) |>.unzip
-      emit "("; emitArgs ys; emit ")"
+  | .fdecl .. | .extern _ _ _ { entries := [.opaque _], .. } =>
+    emitCName f
+    if ys.size > 0 then emit "("; emitArgs ys; emit ")"
     emitLn ";"
   | Decl.extern _ ps _ extData => emitExternCall f ps extData ys
 
@@ -612,7 +800,19 @@ def emitPartialApp (z : VarId) (f : FunId) (ys : Array Arg) : M Unit := do
   emitLhs z; emit "lean_alloc_closure((void*)("; emitCName f; emit "), "; emit arity; emit ", "; emit ys.size; emitLn ");";
   ys.size.forM fun i _ => do
     let y := ys[i]
-    emit "lean_closure_set("; emit z; emit ", "; emit i; emit ", "; emitArg y; emitLn ");"
+    -- Check if this parameter position is borrowed in the target function
+    let isBorrowed := i < decl.params.size && decl.params[i]!.borrow
+    -- Check if the argument is a borrowed variable
+    let ctx ← read
+    let argIsBorrowed := match y with
+      | Arg.var v => ctx.borrowedVars.contains v
+      | _ => false
+    -- Use borrowed variant if both the parameter is borrowed and the arg is borrowed
+    if isBorrowed && argIsBorrowed then
+      emit "lean_closure_set_borrowed("
+    else
+      emit "lean_closure_set("
+    emit z; emit ", "; emit i; emit ", "; emitArg y; emitLn ");"
 
 def emitApp (z : VarId) (f : VarId) (ys : Array Arg) : M Unit :=
   if ys.size > closureMaxArgs then do
@@ -628,6 +828,9 @@ def emitBoxFn (xType : IRType) : M Unit :=
   | IRType.uint64  => emit "lean_box_uint64"
   | IRType.float   => emit "lean_box_float"
   | IRType.float32 => emit "lean_box_float32"
+  | IRType.struct leanTypeName types _ => do
+    let typeName := genStructTypeName leanTypeName types
+    emit s!"lean_box_{typeName}"
   | _              => emit "lean_box"
 
 def emitBox (z : VarId) (x : VarId) (xType : IRType) : M Unit := do
@@ -640,6 +843,26 @@ def emitUnbox (z : VarId) (t : IRType) (x : VarId) : M Unit := do
 
 def emitIsShared (z : VarId) (x : VarId) : M Unit := do
   emitLhs z; emit "!lean_is_exclusive("; emit x; emitLn ");"
+
+def toHexDigit (c : Nat) : String :=
+  String.singleton c.digitChar
+
+def quoteString (s : String) : String :=
+  let q := "\"";
+  let q := s.foldl
+    (fun q c => q ++
+      if c == '\n' then "\\n"
+      else if c == '\r' then "\\r"
+      else if c == '\t' then "\\t"
+      else if c == '\\' then "\\\\"
+      else if c == '\"' then "\\\""
+      else if c == '?' then "\\?" -- avoid trigraphs
+      else if c.toNat <= 31 then
+        "\\x" ++ toHexDigit (c.toNat / 16) ++ toHexDigit (c.toNat % 16)
+      -- TODO(Leo): we should use `\unnnn` for escaping unicode characters.
+      else String.singleton c)
+    q;
+  q ++ "\""
 
 def emitNumLit (t : IRType) (v : Nat) : M Unit := do
   if t.isObj then
@@ -670,10 +893,14 @@ def emitLit (z : VarId) (t : IRType) (v : LitVal) : M Unit := do
 
 def emitVDecl (z : VarId) (t : IRType) (v : Expr) : M Unit :=
   match v with
-  | Expr.ctor c ys      => emitCtor z c ys
+  | Expr.ctor c ys      => emitCtor z t c ys
   | Expr.reset n x      => emitReset z n x
   | Expr.reuse x c u ys => emitReuse z x c u ys
-  | Expr.proj i x       => emitProj z i x
+  | Expr.proj i x       => do
+    let xType ← getVarType x
+    match xType with
+    | some srcType => emitProj z i x srcType
+    | none => throw s!"unknown variable type for {x}"
   | Expr.uproj i x      => emitUProj z i x
   | Expr.sproj n o x    => emitSProj z t n o x
   | Expr.fap c ys       => emitFullApp z c ys
@@ -722,23 +949,22 @@ def emitTailCall (v : Expr) : M Unit :=
     let ctx ← read
     let ps := ctx.mainParams
     if h : ps.size = ys.size then
-      let (ps, ys) := ps.zip ys |>.filter (fun (p, _) => !p.ty.isVoid) |>.unzip
       if overwriteParam ps ys then
         emitLn "{"
         ps.size.forM fun i _ => do
           let p := ps[i]
-          let y := ys[i]!
+          let y := ys[i]
           unless paramEqArg p y do
             emit (toCType p.ty); emit " _tmp_"; emit i; emit " = "; emitArg y; emitLn ";"
         ps.size.forM fun i _ => do
           let p := ps[i]
-          let y := ys[i]!
+          let y := ys[i]
           unless paramEqArg p y do emit p.x; emit " = _tmp_"; emit i; emitLn ";"
         emitLn "}"
       else
-        ps.size.forM fun i _ => do
+        ys.size.forM fun i _ => do
           let p := ps[i]
-          let y := ys[i]!
+          let y := ys[i]
           unless paramEqArg p y do emit p.x; emit " = "; emitArg y; emitLn ";"
       emitLn "goto _start;"
     else
@@ -774,7 +1000,7 @@ partial def emitBlock (b : FnBody) : M Unit := do
       emitTailCall v
     else
       emitVDecl x t v
-      emitBlock b
+      withLocalVar x t (emitBlock b)
   | FnBody.inc x n c p b       =>
     unless p do emitInc x n c
     emitBlock b
@@ -807,9 +1033,15 @@ end
 
 def emitDeclAux (d : Decl) : M Unit := do
   let env ← getEnv
-  let (_, jpMap) := mkVarJPMaps d
-  withReader (fun ctx => { ctx with jpMap := jpMap }) do
-  unless hasInitAttr env d.name || isSimpleGroundDecl env d.name do
+  let (varMap, jpMap) := mkVarJPMaps d
+  -- Collect variable usage for this function
+  let borrowedVars ← match d with
+    | .fdecl (body := b) .. => do
+      let usage ← collectVarUsage b
+      pure usage.borrowedUses
+    | _ => pure {}
+  withReader (fun ctx => { ctx with jpMap := jpMap, borrowedVars := borrowedVars }) do
+  unless hasInitAttr env d.name do
     match d with
     | .fdecl (f := f) (xs := xs) (type := t) (body := b) .. =>
       let baseName ← toCName f;
@@ -819,7 +1051,6 @@ def emitDeclAux (d : Decl) : M Unit := do
         emit "LEAN_EXPORT "  -- make symbol visible to the interpreter
       emit (toCType t); emit " ";
       if xs.size > 0 then
-        let xs := xs.filter (fun p => !p.ty.isVoid)
         emit baseName;
         emit "(";
         if xs.size > closureMaxArgs && isBoxedName d.name then
@@ -828,7 +1059,7 @@ def emitDeclAux (d : Decl) : M Unit := do
           xs.size.forM fun i _ => do
             if i > 0 then emit ", "
             let x := xs[i]
-            emit (toCType x.ty); emit " "; emit x.x
+            emit (toCTypeBorrow x.ty x.borrow); emit " "; emit x.x
         emit ")"
       else
         emit ("_init_" ++ baseName ++ "()")
@@ -838,7 +1069,16 @@ def emitDeclAux (d : Decl) : M Unit := do
           let x := xs[i]!
           emit "lean_object* "; emit x.x; emit " = _args["; emit i; emitLn "];"
       emitLn "_start:";
-      withReader (fun ctx => { ctx with mainFn := f, mainParams := xs }) (emitFnBody b);
+      let localCtx := xs.foldl (fun ctx p => ctx.addParam p) {}
+      -- Add non-parameter variables from varMap to the local context
+      -- without clobbering parameter borrow metadata from `addParam`.
+      let localCtx := varMap.fold (fun ctx (x : VarId) ty =>
+        if ctx.isParam x.idx then
+          ctx
+        else
+          ctx.insert x.idx (LocalContextEntry.param ty false)
+      ) localCtx
+      withReader (fun ctx => { ctx with mainFn := f, mainParams := xs, localCtx := localCtx }) (emitFnBody b);
       emitLn "}"
     | _ => pure ()
 
@@ -855,7 +1095,8 @@ def emitFns : M Unit := do
   decls.reverse.forM emitDecl
 
 def emitMarkPersistent (d : Decl) (n : Name) : M Unit := do
-  if d.resultType.isObj then
+  -- Only mark heap objects as persistent, not struct types
+  if d.resultType.isObj && !d.resultType.isStruct then
     emit "lean_mark_persistent("
     emitCName n
     emitLn ");"
@@ -866,7 +1107,7 @@ def emitDeclInit (d : Decl) : M Unit := do
   if isIOUnitInitFn env n then
     if isIOUnitBuiltinInitFn env n then
       emit "if (builtin) {"
-    emit "res = "; emitCName n; emitLn "();"
+    emit "res = "; emitCName n; emitLn "(lean_io_mk_world());"
     emitLn "if (lean_io_result_is_error(res)) return res;"
     emitLn "lean_dec_ref(res);"
     if isIOUnitBuiltinInitFn env n then
@@ -876,7 +1117,7 @@ def emitDeclInit (d : Decl) : M Unit := do
     | some initFn =>
       if getBuiltinInitFnNameFor? env d.name |>.isSome then
         emit "if (builtin) {"
-      emit "res = "; emitCName initFn; emitLn "();"
+      emit "res = "; emitCName initFn; emitLn "(lean_io_mk_world());"
       emitLn "if (lean_io_result_is_error(res)) return res;"
       emitCName n
       if d.resultType.isScalar then
@@ -888,27 +1129,21 @@ def emitDeclInit (d : Decl) : M Unit := do
       if getBuiltinInitFnNameFor? env d.name |>.isSome then
         emit "}"
     | _ =>
-      if !isSimpleGroundDecl env d.name then
-        emitCName n; emit " = "; emitCInitName n; emitLn "();"; emitMarkPersistent d n
+      emitCName n; emit " = "; emitCInitName n; emitLn "();"; emitMarkPersistent d n
 
 def emitInitFn : M Unit := do
   let env ← getEnv
-  let impInitFns ← env.imports.mapM fun imp => do
-    let some idx := env.getModuleIdx? imp.module
-      | throw "(internal) import without module index" -- should be unreachable
-    let pkg? := env.getModulePackageByIdx? idx
-    let fn := mkModuleInitializationFunctionName imp.module pkg?
-    emitLn s!"lean_object* {fn}(uint8_t builtin);"
-    return fn
+  let modName ← getModName
+  env.imports.forM fun imp => emitLn ("lean_object* " ++ mkModuleInitializationFunctionName imp.module ++ "(uint8_t builtin, lean_object*);")
   emitLns [
     "static bool _G_initialized = false;",
-    s!"LEAN_EXPORT lean_object* {← getModInitFn}(uint8_t builtin) \{",
+    "LEAN_EXPORT lean_object* " ++ mkModuleInitializationFunctionName modName ++ "(uint8_t builtin, lean_object* w) {",
     "lean_object * res;",
     "if (_G_initialized) return lean_io_result_mk_ok(lean_box(0));",
     "_G_initialized = true;"
   ]
-  impInitFns.forM fun fn => emitLns [
-    s!"res = {fn}(builtin);",
+  env.imports.forM fun imp => emitLns [
+    "res = " ++ mkModuleInitializationFunctionName imp.module ++ "(builtin, lean_io_mk_world());",
     "if (lean_io_result_is_error(res)) return res;",
     "lean_dec_ref(res);"]
   let decls := getDecls env
@@ -917,6 +1152,7 @@ def emitInitFn : M Unit := do
 
 def main : M Unit := do
   emitFileHeader
+  emitStructTypeDecls
   emitFnDecls
   emitFns
   emitInitFn
@@ -925,8 +1161,9 @@ def main : M Unit := do
 
 end EmitC
 
+@[export lean_ir_emit_c]
 def emitC (env : Environment) (modName : Name) : Except String String :=
-  match EmitC.main { env, modName } |>.run "" with
+  match (EmitC.main { env := env, modName := modName }).run "" with
   | EStateM.Result.ok    _   s => Except.ok s
   | EStateM.Result.error err _ => Except.error err
 
