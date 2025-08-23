@@ -29,6 +29,7 @@ structure Context where
   jpMap      : JPParamsMap := {}
   mainFn     : FunId := default
   mainParams : Array Param := #[]
+  localCtx   : LocalContext := {}
 
 abbrev M := ReaderT Context (EStateM String String)
 
@@ -57,6 +58,54 @@ def argToCString (x : Arg) : String :=
 def emitArg (x : Arg) : M Unit :=
   emit (argToCString x)
 
+
+-- Collect struct types from IR expressions and function bodies
+def collectStructTypesFromArg (_ : Arg) : List (Array IRType) :=
+  [] -- Args don't contain type info directly
+
+partial def collectStructTypesFromExpr (e : Expr) : List (Array IRType) :=
+  match e with
+  | Expr.ctor _ ys => ys.toList.foldl (fun acc y => acc ++ collectStructTypesFromArg y) []
+  | _ => []
+
+partial def collectStructTypesFromBody (b : FnBody) : List (Array IRType) :=
+  match b with
+  | FnBody.vdecl _ t e b => 
+    let eTypes := collectStructTypesFromExpr e
+    let bTypes := collectStructTypesFromBody b
+    let tTypes := match t with
+      | IRType.struct _ types => [types]
+      | _ => []
+    eTypes ++ bTypes ++ tTypes
+  | FnBody.jdecl _ xs v b =>
+    let vTypes := collectStructTypesFromBody v
+    let bTypes := collectStructTypesFromBody b
+    let paramTypes := xs.toList.foldl (fun acc p =>
+      match p.ty with
+      | IRType.struct _ types => types :: acc
+      | _ => acc) []
+    vTypes ++ bTypes ++ paramTypes
+  | FnBody.set _ _ _ b | FnBody.uset _ _ _ b | FnBody.setTag _ _ b 
+  | FnBody.sset _ _ _ _ _ b | FnBody.inc _ _ _ _ b | FnBody.dec _ _ _ _ b 
+  | FnBody.del _ b => collectStructTypesFromBody b
+  | FnBody.case _ _ _ alts => 
+    alts.toList.foldl (fun acc alt => acc ++ collectStructTypesFromBody alt.body) []
+  | _ => []
+
+def collectStructTypesFromDecl (d : Decl) : List (Array IRType) :=
+  match d with
+  | Decl.fdecl _ xs t body _ =>
+    let bodyTypes := collectStructTypesFromBody body
+    let paramTypes := xs.toList.foldl (fun acc p =>
+      match p.ty with
+      | IRType.struct _ types => types :: acc
+      | _ => acc) []
+    let retTypes := match t with
+      | IRType.struct _ types => [types]
+      | _ => []
+    bodyTypes ++ paramTypes ++ retTypes
+  | _ => []
+
 def toCType : IRType → String
   | IRType.float      => "double"
   | IRType.float32    => "float"
@@ -69,8 +118,75 @@ def toCType : IRType → String
   | IRType.tagged     => "lean_object*"
   | IRType.tobject    => "lean_object*"
   | IRType.erased     => "lean_object*"
-  | IRType.struct _ _ => panic! "not implemented yet"
+  | IRType.struct _ types => genStructTypeName types
   | IRType.union _ _  => panic! "not implemented yet"
+
+-- Emit struct type declaration
+def emitStructTypeDecl (types : Array IRType) : M Unit := do
+  let typeName := genStructTypeName types
+  emit s!"typedef struct {typeName} "
+  emitLn "{"
+  types.size.forM fun i _ => do
+    emit "  "
+    emit (toCType types[i]!)
+    emit " field_"
+    emit i
+    emitLn ";"
+  emit "} "
+  emit typeName
+  emitLn ";"
+
+def emitStructBoxingFunctions (types : Array IRType) : M Unit := do
+  let typeName := genStructTypeName types
+  -- Emit boxing function
+  emit s!"static inline lean_object* lean_box_{typeName}({typeName} v) "
+  emitLn "{"
+  emit s!"    lean_object* r = lean_alloc_ctor(0, 0, sizeof({typeName}));"
+  emitLn ""
+  emit s!"    *({typeName}*)lean_ctor_scalar_cptr(r) = v;"
+  emitLn ""
+  emitLn "    return r;"
+  emitLn "}"
+  emitLn ""
+  -- Emit unboxing function  
+  emit s!"static inline {typeName} lean_unbox_{typeName}(lean_object* o) "
+  emitLn "{"
+  emit s!"    return *({typeName}*)lean_ctor_scalar_cptr(o);"
+  emitLn ""
+  emitLn "}"
+  emitLn ""
+
+-- Get struct dependencies (only direct struct field types)
+def getStructDependencies (types : Array IRType) : List (Array IRType) :=
+  types.toList.foldl (fun acc ty =>
+    match ty with
+    | IRType.struct _ innerTypes => innerTypes :: acc
+    | _ => acc) []
+
+-- Sort struct types so dependencies come first (simple topological sort)
+partial def sortStructTypesByDependency (allTypes : List (Array IRType)) : List (Array IRType) :=
+  let rec sortImpl (remaining : List (Array IRType)) (result : List (Array IRType)) : List (Array IRType) :=
+    match remaining with
+    | [] => result.reverse
+    | _ =>
+      -- Find types with no dependencies in remaining set
+      let (noDeps, withDeps) := remaining.partition (fun ty =>
+        let deps := getStructDependencies ty
+        not (deps.any (fun dep => remaining.contains dep)))
+      match noDeps with
+      | [] => result.reverse ++ remaining  -- Circular dependency fallback
+      | _ => sortImpl withDeps (noDeps.reverse ++ result)
+  sortImpl allTypes []
+
+def emitStructTypeDecls : M Unit := do
+  let env ← getEnv
+  let decls := getDecls env
+  let allStructTypes := decls.foldl (fun acc d => acc ++ collectStructTypesFromDecl d) []
+  let uniqueStructTypes := allStructTypes.eraseDups
+  let sortedStructTypes := sortStructTypesByDependency uniqueStructTypes
+  -- Emit full struct definitions in dependency order
+  sortedStructTypes.forM emitStructTypeDecl
+  sortedStructTypes.forM emitStructBoxingFunctions
 
 def throwInvalidExportName {α : Type} (n : Name) : M α :=
   throw s!"invalid export name '{n}'"
@@ -257,6 +373,13 @@ def getJPParams (j : JoinPointId) : M (Array Param) := do
   | some ps => pure ps
   | none    => throw "unknown join point"
 
+def getVarType (x : VarId) : M (Option IRType) := do
+  let ctx ← read
+  pure (ctx.localCtx.getType x)
+
+def withLocalVar {α : Type} (x : VarId) (t : IRType) (m : M α) : M α := do
+  withReader (fun ctx => { ctx with localCtx := ctx.localCtx.insert x.idx (LocalContextEntry.param t) }) m
+
 def declareVar (x : VarId) (t : IRType) : M Unit := do
   emit (toCType t); emit " "; emit x; emit "; "
 
@@ -286,18 +409,28 @@ def isIf (alts : Array Alt) : Option (Nat × FnBody × FnBody) :=
     | _            => none
 
 def emitInc (x : VarId) (n : Nat) (checkRef : Bool) : M Unit := do
-  emit $
-    if checkRef then (if n == 1 then "lean_inc" else "lean_inc_n")
-    else (if n == 1 then "lean_inc_ref" else "lean_inc_ref_n")
-  emit "("; emit x
-  if n != 1 then emit ", "; emit n
-  emitLn ");"
+  -- Skip lean_inc for struct types since they're stack-allocated values
+  let varType ← getVarType x
+  match varType with
+  | some (IRType.struct _ _) => pure ()  -- No-op for struct types
+  | _ => do
+    emit $
+      if checkRef then (if n == 1 then "lean_inc" else "lean_inc_n")
+      else (if n == 1 then "lean_inc_ref" else "lean_inc_ref_n")
+    emit "("; emit x
+    if n != 1 then emit ", "; emit n
+    emitLn ");"
 
 def emitDec (x : VarId) (n : Nat) (checkRef : Bool) : M Unit := do
-  emit (if checkRef then "lean_dec" else "lean_dec_ref");
-  emit "("; emit x;
-  if n != 1 then emit ", "; emit n
-  emitLn ");"
+  -- Skip lean_dec for struct types since they're stack-allocated values
+  let varType ← getVarType x
+  match varType with
+  | some (IRType.struct _ _) => pure ()  -- No-op for struct types
+  | _ => do
+    emit (if checkRef then "lean_dec" else "lean_dec_ref");
+    emit "("; emit x;
+    if n != 1 then emit ", "; emit n
+    emitLn ");"
 
 def emitDel (x : VarId) : M Unit := do
   emit "lean_free_object("; emit x; emitLn ");"
@@ -361,12 +494,26 @@ def emitCtorSetArgs (z : VarId) (ys : Array Arg) : M Unit :=
   ys.size.forM fun i _ => do
     emit "lean_ctor_set("; emit z; emit ", "; emit i; emit ", "; emitArg ys[i]; emitLn ");"
 
-def emitCtor (z : VarId) (c : CtorInfo) (ys : Array Arg) : M Unit := do
-  emitLhs z;
-  if c.size == 0 && c.usize == 0 && c.ssize == 0 then do
-    emit "lean_box("; emit c.cidx; emitLn ");"
-  else do
-    emitAllocCtor c; emitCtorSetArgs z ys
+-- Emit struct constructor using compound literal syntax
+def emitStructCtor (z : VarId) (types : Array IRType) (ys : Array Arg) : M Unit := do
+  emitLhs z
+  let typeName := genStructTypeName types
+  emit s!"({typeName})"
+  emit "{"
+  ys.size.forM fun i _ => do
+    if i > 0 then emit ", "
+    emitArg ys[i]!
+  emitLn "};"
+
+def emitCtor (z : VarId) (t : IRType) (c : CtorInfo) (ys : Array Arg) : M Unit := do
+  match t with
+  | IRType.struct _ types => emitStructCtor z types ys
+  | _ => do
+    emitLhs z;
+    if c.size == 0 && c.usize == 0 && c.ssize == 0 then do
+      emit "lean_box("; emit c.cidx; emitLn ");"
+    else do
+      emitAllocCtor c; emitCtorSetArgs z ys
 
 def emitReset (z : VarId) (n : Nat) (x : VarId) : M Unit := do
   emit "if (lean_is_exclusive("; emit x; emitLn ")) {";
@@ -387,23 +534,44 @@ def emitReuse (z : VarId) (x : VarId) (c : CtorInfo) (updtHeader : Bool) (ys : A
   emitLn "}";
   emitCtorSetArgs z ys
 
-def emitProj (z : VarId) (i : Nat) (x : VarId) : M Unit := do
-  emitLhs z; emit "lean_ctor_get("; emit x; emit ", "; emit i; emitLn ");"
+-- Emit struct field projection
+def emitStructProj (z : VarId) (i : Nat) (x : VarId) : M Unit := do
+  emitLhs z; emit x; emit ".field_"; emit i; emitLn ";"
+
+def emitProj (z : VarId) (i : Nat) (x : VarId) (srcType : IRType) : M Unit := do
+  match srcType with
+  | IRType.struct _ _ => emitStructProj z i x
+  | _ => 
+    emitLhs z; emit "lean_ctor_get("; emit x; emit ", "; emit i; emitLn ");"
 
 def emitUProj (z : VarId) (i : Nat) (x : VarId) : M Unit := do
-  emitLhs z; emit "lean_ctor_get_usize("; emit x; emit ", "; emit i; emitLn ");"
+  let xType ← getVarType x
+  match xType with
+  | some (IRType.struct _ _) => do
+    -- Struct types: direct field access
+    emitLhs z; emit x; emit ".field_"; emit i; emitLn ";"
+  | _ => do
+    -- Object types: use lean_ctor_get_usize function
+    emitLhs z; emit "lean_ctor_get_usize("; emit x; emit ", "; emit i; emitLn ");"
 
 def emitSProj (z : VarId) (t : IRType) (n offset : Nat) (x : VarId) : M Unit := do
-  emitLhs z;
-  match t with
-  | IRType.float    => emit "lean_ctor_get_float"
-  | IRType.float32  => emit "lean_ctor_get_float32"
-  | IRType.uint8    => emit "lean_ctor_get_uint8"
-  | IRType.uint16   => emit "lean_ctor_get_uint16"
-  | IRType.uint32   => emit "lean_ctor_get_uint32"
-  | IRType.uint64   => emit "lean_ctor_get_uint64"
-  | _               => throw "invalid instruction"
-  emit "("; emit x; emit ", "; emitOffset n offset; emitLn ");"
+  let xType ← getVarType x
+  match xType with
+  | some (IRType.struct _ _) => do
+    -- Struct types: offset directly corresponds to field index
+    emitLhs z; emit x; emit ".field_"; emit offset; emitLn ";"
+  | _ => do
+    -- Object types: use lean_ctor_get_* functions
+    emitLhs z;
+    match t with
+    | IRType.float    => emit "lean_ctor_get_float"
+    | IRType.float32  => emit "lean_ctor_get_float32"
+    | IRType.uint8    => emit "lean_ctor_get_uint8"
+    | IRType.uint16   => emit "lean_ctor_get_uint16"
+    | IRType.uint32   => emit "lean_ctor_get_uint32"
+    | IRType.uint64   => emit "lean_ctor_get_uint64"
+    | _               => throw "invalid instruction"
+    emit "("; emit x; emit ", "; emitOffset n offset; emitLn ");"
 
 def toStringArgs (ys : Array Arg) : List String :=
   ys.toList.map argToCString
@@ -461,6 +629,9 @@ def emitBoxFn (xType : IRType) : M Unit :=
   | IRType.uint64  => emit "lean_box_uint64"
   | IRType.float   => emit "lean_box_float"
   | IRType.float32 => emit "lean_box_float32"
+  | IRType.struct _ types => do
+    let typeName := genStructTypeName types
+    emit s!"lean_box_{typeName}"
   | _              => emit "lean_box"
 
 def emitBox (z : VarId) (x : VarId) (xType : IRType) : M Unit := do
@@ -523,10 +694,14 @@ def emitLit (z : VarId) (t : IRType) (v : LitVal) : M Unit := do
 
 def emitVDecl (z : VarId) (t : IRType) (v : Expr) : M Unit :=
   match v with
-  | Expr.ctor c ys      => emitCtor z c ys
+  | Expr.ctor c ys      => emitCtor z t c ys
   | Expr.reset n x      => emitReset z n x
   | Expr.reuse x c u ys => emitReuse z x c u ys
-  | Expr.proj i x       => emitProj z i x
+  | Expr.proj i x       => do
+    let xType ← getVarType x
+    match xType with
+    | some srcType => emitProj z i x srcType
+    | none => throw s!"unknown variable type for {x}"
   | Expr.uproj i x      => emitUProj z i x
   | Expr.sproj n o x    => emitSProj z t n o x
   | Expr.fap c ys       => emitFullApp z c ys
@@ -626,7 +801,7 @@ partial def emitBlock (b : FnBody) : M Unit := do
       emitTailCall v
     else
       emitVDecl x t v
-      emitBlock b
+      withLocalVar x t (emitBlock b)
   | FnBody.inc x n c p b       =>
     unless p do emitInc x n c
     emitBlock b
@@ -689,7 +864,8 @@ def emitDeclAux (d : Decl) : M Unit := do
           let x := xs[i]!
           emit "lean_object* "; emit x.x; emit " = _args["; emit i; emitLn "];"
       emitLn "_start:";
-      withReader (fun ctx => { ctx with mainFn := f, mainParams := xs }) (emitFnBody b);
+      let localCtx := xs.foldl (fun ctx p => ctx.addParam p) {}
+      withReader (fun ctx => { ctx with mainFn := f, mainParams := xs, localCtx := localCtx }) (emitFnBody b);
       emitLn "}"
     | _ => pure ()
 
@@ -706,7 +882,8 @@ def emitFns : M Unit := do
   decls.reverse.forM emitDecl
 
 def emitMarkPersistent (d : Decl) (n : Name) : M Unit := do
-  if d.resultType.isObj then
+  -- Only mark heap objects as persistent, not struct types
+  if d.resultType.isObj && !d.resultType.isStruct then
     emit "lean_mark_persistent("
     emitCName n
     emitLn ");"
@@ -762,6 +939,7 @@ def emitInitFn : M Unit := do
 
 def main : M Unit := do
   emitFileHeader
+  emitStructTypeDecls
   emitFnDecls
   emitFns
   emitInitFn

@@ -11,13 +11,14 @@ public import Lean.Compiler.IR.Format
 public import Lean.Compiler.LCNF.CompilerM
 public import Lean.Compiler.LCNF.MonoTypes
 public import Lean.Compiler.LCNF.Types
+public import Lean.Compiler.StructAttr
 
 public section
 
 namespace Lean
 namespace IR
 
-open Lean.Compiler (LCNF.CacheExtension LCNF.isTypeFormerType LCNF.toLCNFType LCNF.toMonoType)
+open Lean.Compiler (LCNF.CacheExtension LCNF.isTypeFormerType LCNF.toLCNFType LCNF.toMonoType hasStructAttr)
 
 def irTypeForEnum (numCtors : Nat) : IRType :=
   if numCtors == 1 then
@@ -34,7 +35,15 @@ def irTypeForEnum (numCtors : Nat) : IRType :=
 builtin_initialize irTypeExt : LCNF.CacheExtension Name IRType ←
   LCNF.CacheExtension.register
 
-def nameToIRType (name : Name) : CoreM IRType := do
+private def isAnyProducingType (type : Lean.Expr) : Bool :=
+  match type with
+  | .const ``lcAny _ => true
+  | .forallE _ _ b _ => isAnyProducingType b
+  | _ => false
+
+mutual
+
+partial def nameToIRType (name : Name) : CoreM IRType := do
   match (← irTypeExt.find? name) with
   | some type => return type
   | none =>
@@ -58,6 +67,11 @@ where fillCache : CoreM IRType := do
     | _ =>
       let env ← Lean.getEnv
       let some (.inductInfo inductiveVal) := env.find? name | return .tobject
+
+      -- Check if type is marked with @[struct] attribute
+      if hasStructAttr env name then
+        return ← generateStructType inductiveVal
+
       let ctorNames := inductiveVal.ctors
       let numCtors := ctorNames.length
       let mut numScalarCtors := 0
@@ -80,13 +94,30 @@ where fillCache : CoreM IRType := do
       else
         return .tobject
 
-private def isAnyProducingType (type : Lean.Expr) : Bool :=
-  match type with
-  | .const ``lcAny _ => true
-  | .forallE _ _ b _ => isAnyProducingType b
-  | _ => false
+-- Generate IRType.struct for types marked with @[struct] attribute
+partial def generateStructType (inductiveVal : InductiveVal) : CoreM IRType := do
+  let env ← Lean.getEnv
+  let mut fieldTypes : Array IRType := #[]
 
-def toIRType (type : Lean.Expr) : CoreM IRType := do
+  for ctorName in inductiveVal.ctors do
+    let some (.ctorInfo ctorInfo) := env.find? ctorName | unreachable!
+    let ctorFieldTypes ← Meta.MetaM.run' <|
+      Meta.forallTelescopeReducing ctorInfo.type fun params _ => do
+        let mut types : Array IRType := #[]
+        -- Skip parameters, only process actual fields
+        for field in params[ctorInfo.numParams...*] do
+          let fieldType ← field.fvarId!.getType
+          let lcnfFieldType ← LCNF.toLCNFType fieldType
+          let monoFieldType ← LCNF.toMonoType lcnfFieldType
+          if !monoFieldType.isErased then
+            let irFieldType ← toIRType monoFieldType
+            types := types.push irFieldType
+        return types
+    fieldTypes := fieldTypes ++ ctorFieldTypes
+
+  return IRType.struct (some inductiveVal.name) fieldTypes
+
+partial def toIRType (type : Lean.Expr) : CoreM IRType := do
   match type with
   | .const name _ => nameToIRType name
   | .app .. =>
@@ -104,6 +135,8 @@ def toIRType (type : Lean.Expr) : CoreM IRType := do
       return .object
   | .mdata _ b => toIRType b
   | _ => unreachable!
+
+end
 
 inductive CtorFieldInfo where
   | erased
@@ -141,9 +174,13 @@ def getCtorLayout (ctorName : Name) : CoreM CtorLayout := do
     return info
 where fillCache := do
   let .some (.ctorInfo ctorInfo) := (← getEnv).find? ctorName | unreachable!
+  let env ← getEnv
+  -- Check if this constructor belongs to a struct type
+  let isStructType := hasStructAttr env ctorInfo.induct
   Meta.MetaM.run' <| Meta.forallTelescopeReducing ctorInfo.type fun params _ => do
     let mut fields : Array CtorFieldInfo := .emptyWithCapacity ctorInfo.numFields
     let mut nextIdx := 0
+    let mut structFieldIdx := 0  -- For struct types: sequential field index
     let mut has1BScalar := false
     let mut has2BScalar := false
     let mut has4BScalar := false
@@ -153,7 +190,26 @@ where fillCache := do
       let lcnfFieldType ← LCNF.toLCNFType fieldType
       let monoFieldType ← LCNF.toMonoType lcnfFieldType
       let irFieldType ← toIRType monoFieldType
-      let ctorField ← match irFieldType with
+      let ctorField ← if isStructType then
+        -- For struct types, all non-erased fields get sequential indices
+        if monoFieldType.isErased then
+          pure .erased
+        else
+          let idx := structFieldIdx
+          structFieldIdx := structFieldIdx + 1
+          -- Use .scalar with sequential offset for struct field mapping
+          match irFieldType with
+          | .float => pure <| .scalar 8 idx .float
+          | .float32 => pure <| .scalar 4 idx .float32
+          | .uint64 => pure <| .scalar 8 idx .uint64
+          | .uint32 => pure <| .scalar 4 idx .uint32
+          | .uint16 => pure <| .scalar 2 idx .uint16
+          | .uint8 => pure <| .scalar 1 idx .uint8
+          | .usize => pure <| .usize idx
+          | _ => pure <| .object idx irFieldType
+      else
+        -- Regular object layout for non-struct types
+        match irFieldType with
       | .object | .tagged | .tobject => do
         let i := nextIdx
         nextIdx := nextIdx + 1
@@ -178,7 +234,10 @@ where fillCache := do
       | .float =>
         has8BScalar := true
         .pure <| .scalar 8 0 .float
-      | .struct .. | .union .. => unreachable!
+      | .struct .. | .union .. => do
+        let i := nextIdx
+        nextIdx := nextIdx + 1
+        pure <| .object i irFieldType
       fields := fields.push ctorField
     let numObjs := nextIdx
     ⟨fields, nextIdx⟩ := Id.run <| StateT.run (s := nextIdx) <| fields.mapM fun field => do

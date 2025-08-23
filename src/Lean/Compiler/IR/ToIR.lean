@@ -196,7 +196,25 @@ partial def lowerLet (decl : LCNF.LetDecl) (k : LCNF.Code) : M FnBody := do
           | some .erased => loop (i + 1)
           | none => lowerCode k
         loop 0
-      return .vdecl objVar ctorInfo.type (.ctor ctorInfo objArgs) (← lowerNonObjectFields ())
+      if type.isStruct then
+        -- For struct types, construct arguments in field order
+        let structArgs : Array Arg ← do
+          let mut result : Array Arg := #[]
+          for h : i in *...fields.size do
+            match fields[i] with
+            | .object .. =>
+              result := result.push irArgs[i]!
+            | .usize .. | .scalar .. =>
+              -- For struct constructors, we need the variable directly
+              match irArgs[i]! with
+              | .var varId => result := result.push (.var varId)
+              | .erased => result := result.push .erased
+            | .erased => result := result.push .erased
+          pure result
+        return .vdecl objVar type (.ctor ctorInfo structArgs) (← lowerCode k)
+      else
+        -- For object types, use object args and then set non-object fields
+        return .vdecl objVar type (.ctor ctorInfo objArgs) (← lowerNonObjectFields ())
     | some (.defnInfo ..) | some (.opaqueInfo ..) =>
       mkFap name irArgs
     | some (.axiomInfo ..) | .some (.quotInfo ..) | .some (.inductInfo ..) | .some (.thmInfo ..) =>

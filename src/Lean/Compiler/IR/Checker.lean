@@ -153,10 +153,10 @@ def checkExpr (ty : IRType) (e : Expr) : M Unit := do
     checkObjType ty
   | .box xty x =>
     checkObjType ty
-    checkScalarVar x
+    checkVarType x (fun t => t.isScalar || t.isStruct) "scalar or struct expected"
     checkVarType x (· == xty)
   | .unbox x =>
-    checkScalarType ty
+    checkType ty (fun t => t.isScalar || t.isStruct) "scalar or struct expected"
     checkObjVar x
   | .proj i x =>
     let xType ← getType x;

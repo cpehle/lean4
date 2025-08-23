@@ -1,0 +1,5 @@
+Person: id=12345, name=Alice, age=30
+Employee: name=Alice, dept=Engineering, salary=75000
+Company: TechCorp, CEO: Alice, revenue=1000000
+Team: id=100, members=3, budget=50000
+Calculation result: 1087375
