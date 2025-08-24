@@ -1513,3 +1513,102 @@ extern "C" LEAN_EXPORT lean_object *lean_llvm_position_builder_before(
     return lean_io_result_mk_ok(lean_box(0));
 #endif  // LEAN_LLVM
 }
+
+
+extern "C" LEAN_EXPORT lean_object *lean_llvm_struct_type_in_context(
+    size_t ctx, lean_object *elementTypes, uint8_t isPacked, lean_object * /* w */) {
+#ifndef LEAN_LLVM
+    lean_always_assert(
+        false && ("Please build a version of Lean4 with -DLLVM=ON to invoke "
+                  "the LLVM backend function."));
+#else
+    lean::array_ref<lean_object *> elementTypesRef(elementTypes, true);
+    LLVMTypeRef *element_types = array_ref_to_ArrayLLVMType(elementTypesRef);
+    LLVMTypeRef struct_ty = LLVMStructTypeInContext(lean_to_Context(ctx), element_types, 
+                                                    elementTypesRef.size(), isPacked);
+    free(element_types);
+    return lean_io_result_mk_ok(lean_box_usize(Type_to_lean(struct_ty)));
+#endif  // LEAN_LLVM
+}
+
+extern "C" LEAN_EXPORT lean_object *lean_llvm_build_insert_value(
+    size_t ctx, size_t builder, size_t aggVal, size_t eltVal, uint64_t idx, 
+    lean_object *name, lean_object * /* w */) {
+#ifndef LEAN_LLVM
+    lean_always_assert(
+        false && ("Please build a version of Lean4 with -DLLVM=ON to invoke "
+                  "the LLVM backend function."));
+#else
+    lean::string_ref nameRef = lean::string_ref(name, true);
+    LLVMValueRef result = LLVMBuildInsertValue(lean_to_Builder(builder), 
+                                               lean_to_Value(aggVal), 
+                                               lean_to_Value(eltVal), 
+                                               idx, nameRef.data());
+    return lean_io_result_mk_ok(lean_box_usize(Value_to_lean(result)));
+#endif  // LEAN_LLVM
+}
+
+extern "C" LEAN_EXPORT lean_object *lean_llvm_build_extract_value(
+    size_t ctx, size_t builder, size_t aggVal, uint64_t idx, 
+    lean_object *name, lean_object * /* w */) {
+#ifndef LEAN_LLVM
+    lean_always_assert(
+        false && ("Please build a version of Lean4 with -DLLVM=ON to invoke "
+                  "the LLVM backend function."));
+#else
+    lean::string_ref nameRef = lean::string_ref(name, true);
+    LLVMValueRef result = LLVMBuildExtractValue(lean_to_Builder(builder), 
+                                                lean_to_Value(aggVal), 
+                                                idx, nameRef.data());
+    return lean_io_result_mk_ok(lean_box_usize(Value_to_lean(result)));
+#endif  // LEAN_LLVM
+}
+
+extern "C" LEAN_EXPORT lean_object *lean_llvm_size_of_type_in_bits(
+    size_t ctx, size_t ty, size_t mod, lean_object * /* w */) {
+#ifndef LEAN_LLVM
+    lean_always_assert(
+        false && ("Please build a version of Lean4 with -DLLVM=ON to invoke "
+                  "the LLVM backend function."));
+#else
+    LLVMTargetDataRef targetData = LLVMGetModuleDataLayout(lean_to_Module(mod));
+    uint64_t sizeInBits = LLVMSizeOfTypeInBits(targetData, lean_to_Type(ty));
+    LLVMTypeRef i64Type = LLVMInt64TypeInContext(lean_to_Context(ctx));
+    LLVMValueRef result = LLVMConstInt(i64Type, sizeInBits, 0);
+    return lean_io_result_mk_ok(lean_box_usize(Value_to_lean(result)));
+#endif  // LEAN_LLVM
+}
+
+extern "C" LEAN_EXPORT lean_object *lean_llvm_build_udiv(
+    size_t ctx, size_t builder, size_t lhs, size_t rhs, 
+    lean_object *name, lean_object * /* w */) {
+#ifndef LEAN_LLVM
+    lean_always_assert(
+        false && ("Please build a version of Lean4 with -DLLVM=ON to invoke "
+                  "the LLVM backend function."));
+#else
+    lean::string_ref nameRef = lean::string_ref(name, true);
+    LLVMValueRef result = LLVMBuildUDiv(lean_to_Builder(builder), 
+                                        lean_to_Value(lhs), 
+                                        lean_to_Value(rhs), 
+                                        nameRef.data());
+    return lean_io_result_mk_ok(lean_box_usize(Value_to_lean(result)));
+#endif  // LEAN_LLVM
+}
+
+extern "C" LEAN_EXPORT lean_object *lean_llvm_build_pointer_cast(
+    size_t ctx, size_t builder, size_t val, size_t destTy, 
+    lean_object *name, lean_object * /* w */) {
+#ifndef LEAN_LLVM
+    lean_always_assert(
+        false && ("Please build a version of Lean4 with -DLLVM=ON to invoke "
+                  "the LLVM backend function."));
+#else
+    lean::string_ref nameRef = lean::string_ref(name, true);
+    LLVMValueRef result = LLVMBuildPointerCast(lean_to_Builder(builder), 
+                                               lean_to_Value(val), 
+                                               lean_to_Type(destTy), 
+                                               nameRef.data());
+    return lean_io_result_mk_ok(lean_box_usize(Value_to_lean(result)));
+#endif  // LEAN_LLVM
+}
