@@ -171,6 +171,9 @@ opaque pointerType (elemty : LLVMType ctx) : BaseIO (LLVMType ctx)
 @[extern "lean_llvm_array_type"]
 opaque arrayType (elemty : LLVMType ctx) (nelem : UInt64) : BaseIO (LLVMType ctx)
 
+@[extern "lean_llvm_struct_type_in_context"]
+opaque structTypeInContext (ctx : Context) (elementTypes : @&Array (LLVMType ctx)) (isPacked : Bool := false) : BaseIO (LLVMType ctx)
+
 @[extern "lean_llvm_const_array"]
 opaque constArray (elemty : LLVMType ctx) (vals : @&Array (Value ctx)) : BaseIO (LLVMType ctx)
 
@@ -267,6 +270,21 @@ opaque buildNot (builder : Builder ctx) (x : Value ctx) (name : @&String := "") 
 
 @[extern "lean_llvm_build_icmp"]
 opaque buildICmp (builder : Builder ctx) (predicate : IntPredicate) (x y : Value ctx) (name : @&String := "") : BaseIO (Value ctx)
+
+@[extern "lean_llvm_build_insert_value"]
+opaque buildInsertValue (builder : Builder ctx) (aggVal : Value ctx) (eltVal : Value ctx) (idx : UInt64) (name : @&String := "") : BaseIO (Value ctx)
+
+@[extern "lean_llvm_build_extract_value"]
+opaque buildExtractValue (builder : Builder ctx) (aggVal : Value ctx) (idx : UInt64) (name : @&String := "") : BaseIO (Value ctx)
+
+@[extern "lean_llvm_size_of_type_in_bits"]
+opaque sizeOfTypeInBits (ty : LLVMType ctx) (mod : Module ctx) : BaseIO (Value ctx)
+
+@[extern "lean_llvm_build_udiv"]
+opaque buildUDiv (builder : Builder ctx) (x y : Value ctx) (name : @&String := "") : BaseIO (Value ctx)
+
+@[extern "lean_llvm_build_pointer_cast"]
+opaque buildPointerCast (builder : Builder ctx) (val : Value ctx) (destTy : LLVMType ctx) (name : @&String := "") : BaseIO (Value ctx)
 
 @[extern "lean_llvm_add_case"]
 opaque addCase (switch onVal : Value ctx) (destBB : BasicBlock ctx) : BaseIO Unit
