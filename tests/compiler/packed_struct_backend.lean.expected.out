@@ -1,0 +1,4 @@
+Padded struct - a: 18, b: 878082192, c: 171
+Packed struct - a: 18, b: 878082192, c: 171
+Packed rect - top-left: (1.000000, 2.000000)
+Packed rect - bottom-right: (3.000000, 4.000000)
