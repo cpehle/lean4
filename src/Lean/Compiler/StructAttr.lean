@@ -41,4 +41,32 @@ builtin_initialize structAttr : TagAttribute ←
 def hasStructAttr (env : Environment) (declName : Name) : Bool :=
   structAttr.hasTag env declName
 
+/--
+The `@[packed]` attribute instructs the compiler to generate a packed struct in the LLVM backend,
+which removes padding between struct fields for more compact memory layout.
+
+This attribute should be used with `@[struct]` for types where:
+- Memory efficiency is more important than alignment performance
+- The struct will be used in arrays or other memory-critical contexts
+- Compatibility with C packed structs is required
+
+Example usage:
+```lean
+@[struct, packed]
+structure CompactData where
+  a : UInt8
+  b : UInt32
+  c : UInt8
+```
+
+Note: Packed structs may have performance implications on some architectures due to
+unaligned memory access.
+-/
+@[builtin_doc]
+builtin_initialize packedAttr : TagAttribute ←
+  registerTagAttribute `packed "instruct the compiler to generate packed structs in the LLVM backend (removes padding between fields)"
+
+def hasPackedAttr (env : Environment) (declName : Name) : Bool :=
+  packedAttr.hasTag env declName
+
 end Lean.Compiler

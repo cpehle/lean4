@@ -1,4 +1,6 @@
 Point 1: (0.000000, 0.000000)
 Point 2: (3.000000, 4.000000)
 Distance: 5.000000
-Color: RGB(255, 128, 64)
+Rectangle: (Position: (3.000000, 4.000000), Size: (2.000000, 2.000000))
+Area: 4.000000
+Diagonal Length: 2.828427
