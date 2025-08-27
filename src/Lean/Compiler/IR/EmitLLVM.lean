@@ -17,10 +17,12 @@ public import Lean.Compiler.IR.SimpCase
 public import Lean.Compiler.IR.Boxing
 public import Lean.Compiler.IR.ResetReuse
 public import Lean.Compiler.IR.LLVMBindings
+public import Lean.Compiler.StructAttr
 
 public section
 
 open Lean.IR.ExplicitBoxing (isBoxedName)
+open Lean.Compiler (hasPackedAttr)
 
 namespace Lean.IR
 
@@ -81,7 +83,7 @@ instance : Inhabited (M llvmctx α) where
   default := throw "Error: inhabitant"
 
 def addVarToState (x : VarId) (v : LLVM.Value llvmctx) (ty : LLVM.LLVMType llvmctx) (irty : IRType) : M llvmctx Unit := do
-  modify (fun s => { s with 
+  modify (fun s => { s with
     var2val := s.var2val.insert x (ty, v)
     var2irtype := s.var2irtype.insert x irty
   })
@@ -333,9 +335,14 @@ partial def toLLVMType (t : IRType) : M llvmctx (LLVM.LLVMType llvmctx) := do
   | IRType.tagged     => do LLVM.pointerType (← LLVM.i8Type llvmctx)
   | IRType.tobject    => do LLVM.pointerType (← LLVM.i8Type llvmctx)
   | IRType.erased     => do LLVM.pointerType (← LLVM.i8Type llvmctx)
-  | IRType.struct _ types _ => do
+  | IRType.struct leanTypeName types _ => do
     let fieldTypes ← types.mapM toLLVMType
-    LLVM.structTypeInContext llvmctx fieldTypes (isPacked := false)
+    -- Check if the struct type has the packed attribute
+    let env ← getEnv
+    let isPacked := match leanTypeName with
+      | some name => Lean.Compiler.hasPackedAttr env name
+      | none => false
+    LLVM.structTypeInContext llvmctx fieldTypes (isPacked := isPacked)
   | IRType.union _ _  => panic! "not implemented yet"
 
 def throwInvalidExportName {α : Type} (n : Name) : M llvmctx α := do
@@ -587,11 +594,11 @@ def getVarIRType (x : VarId) : M llvmctx (Option IRType) := do
 
 -- Emit struct constructor using LLVM struct operations
 def emitStructCtor (builder : LLVM.Builder llvmctx)
-    (z : VarId) (types : Array IRType) (ys : Array Arg) : M llvmctx Unit := do
-  let structType ← toLLVMType (IRType.struct none types #[])
+    (z : VarId) (structType : IRType) (ys : Array Arg) : M llvmctx Unit := do
+  let llvmStructType ← toLLVMType structType
   let (_zty, zslot) ← emitLhsSlot_ z
   -- Create an undef struct value to start with
-  let mut structVal ← LLVM.getUndef structType
+  let mut structVal ← LLVM.getUndef llvmStructType
   -- Insert each field value
   for h : i in *...ys.size do
     let (_yty, yval) ← emitArgVal builder ys[i] s!"field_{i}"
@@ -608,13 +615,13 @@ def emitStructProj (builder : LLVM.Builder llvmctx)
 -- Generate struct boxing function: lean_object* lean_box_structname(structtype v)
 def generateStructBoxingFunction (mod : LLVM.Module llvmctx) (structType : IRType) : M llvmctx Unit := do
   match structType with
-  | IRType.struct _ types _ => do
-    let typeName := genStructTypeName types
+  | IRType.struct leanTypeName types _ => do
+    let typeName := genStructTypeName leanTypeName types
     let fnName := s!"lean_box_{typeName}"
     let llvmStructType ← toLLVMType structType
     let retType ← LLVM.voidPtrType llvmctx
     let fnType ← LLVM.functionType retType #[llvmStructType]
-    
+
     -- Check if function already exists
     match ← LLVM.getNamedFunction mod fnName with
     | some _ => pure () -- Already generated
@@ -623,46 +630,46 @@ def generateStructBoxingFunction (mod : LLVM.Module llvmctx) (structType : IRTyp
       let bb ← LLVM.appendBasicBlockInContext llvmctx fn "entry"
       let builder ← LLVM.createBuilderInContext llvmctx
       LLVM.positionBuilderAtEnd builder bb
-      
+
       -- Get the struct parameter
       let structParam ← LLVM.getParam fn 0
-      
+
       -- Calculate struct size for allocation
       let sizeofStruct ← LLVM.sizeOfTypeInBits llvmStructType (← getLLVMModule)
       let sizeInBytes ← LLVM.buildUDiv builder sizeofStruct (← LLVM.constInt (← LLVM.i64Type llvmctx) 8) "struct_size"
-      
+
       -- Allocate lean object: lean_alloc_ctor(0, 0, struct_size)
       let zero ← LLVM.constInt (← LLVM.i32Type llvmctx) 0
       let argtys := #[← LLVM.i32Type llvmctx, ← LLVM.i32Type llvmctx, ← LLVM.i64Type llvmctx]
       let allocFnType ← LLVM.functionType retType argtys
       let allocFn ← LLVM.getOrAddFunction mod "lean_alloc_ctor" allocFnType
       let obj ← LLVM.buildCall2 builder allocFnType allocFn #[zero, zero, sizeInBytes] "obj"
-      
+
       -- Get pointer to scalar data area: lean_ctor_scalar_cptr(obj)
       let scalarPtrFnType ← LLVM.functionType (← LLVM.pointerType (← LLVM.i8Type llvmctx)) #[retType]
       let scalarPtrFn ← LLVM.getOrAddFunction mod "lean_ctor_scalar_cptr" scalarPtrFnType
       let scalarPtr ← LLVM.buildCall2 builder scalarPtrFnType scalarPtrFn #[obj] "scalar_ptr"
-      
+
       -- Cast to struct pointer and store
       let structPtr ← LLVM.buildPointerCast builder scalarPtr (← LLVM.pointerType llvmStructType) "struct_ptr"
       LLVM.buildStore builder structParam structPtr
-      
+
       -- Return the object
       let _ ← LLVM.buildRet builder obj
       pure ()
-      
+
   | _ => pure () -- Not a struct type
 
--- Generate struct unboxing function: structtype lean_unbox_structname(lean_object* o)  
+-- Generate struct unboxing function: structtype lean_unbox_structname(lean_object* o)
 def generateStructUnboxingFunction (mod : LLVM.Module llvmctx) (structType : IRType) : M llvmctx Unit := do
   match structType with
-  | IRType.struct _ types _ => do
-    let typeName := genStructTypeName types
+  | IRType.struct leanTypeName types _ => do
+    let typeName := genStructTypeName leanTypeName types
     let fnName := s!"lean_unbox_{typeName}"
     let llvmStructType ← toLLVMType structType
     let objType ← LLVM.voidPtrType llvmctx
     let fnType ← LLVM.functionType llvmStructType #[objType]
-    
+
     -- Check if function already exists
     match ← LLVM.getNamedFunction mod fnName with
     | some _ => pure () -- Already generated
@@ -671,23 +678,23 @@ def generateStructUnboxingFunction (mod : LLVM.Module llvmctx) (structType : IRT
       let bb ← LLVM.appendBasicBlockInContext llvmctx fn "entry"
       let builder ← LLVM.createBuilderInContext llvmctx
       LLVM.positionBuilderAtEnd builder bb
-      
+
       -- Get the object parameter
       let objParam ← LLVM.getParam fn 0
-      
+
       -- Get pointer to scalar data: lean_ctor_scalar_cptr(o)
       let scalarPtrFnType ← LLVM.functionType (← LLVM.pointerType (← LLVM.i8Type llvmctx)) #[objType]
       let scalarPtrFn ← LLVM.getOrAddFunction mod "lean_ctor_scalar_cptr" scalarPtrFnType
       let scalarPtr ← LLVM.buildCall2 builder scalarPtrFnType scalarPtrFn #[objParam] "scalar_ptr"
-      
+
       -- Cast to struct pointer and load
       let structPtr ← LLVM.buildPointerCast builder scalarPtr (← LLVM.pointerType llvmStructType) "struct_ptr"
       let structVal ← LLVM.buildLoad2 builder llvmStructType structPtr "struct_val"
-      
+
       -- Return the struct value
       let _ ← LLVM.buildRet builder structVal
       pure ()
-      
+
   | _ => pure () -- Not a struct type
 
 -- Collect struct types from IR expressions and function bodies (similar to C backend)
@@ -701,7 +708,7 @@ partial def collectStructTypesFromExpr (e : Expr) : List IRType :=
 
 partial def collectStructTypesFromBody (b : FnBody) : List IRType :=
   match b with
-  | FnBody.vdecl _ t e b => 
+  | FnBody.vdecl _ t e b =>
     let eTypes := collectStructTypesFromExpr e
     let bTypes := collectStructTypesFromBody b
     let tTypes := match t with
@@ -716,10 +723,10 @@ partial def collectStructTypesFromBody (b : FnBody) : List IRType :=
       | st@(IRType.struct ..) => st :: acc
       | _ => acc) []
     vTypes ++ bTypes ++ paramTypes
-  | FnBody.set _ _ _ b | FnBody.uset _ _ _ b | FnBody.setTag _ _ b 
-  | FnBody.sset _ _ _ _ _ b | FnBody.inc _ _ _ _ b | FnBody.dec _ _ _ _ b 
+  | FnBody.set _ _ _ b | FnBody.uset _ _ _ b | FnBody.setTag _ _ b
+  | FnBody.sset _ _ _ _ _ b | FnBody.inc _ _ _ _ b | FnBody.dec _ _ _ _ b
   | FnBody.del _ b => collectStructTypesFromBody b
-  | FnBody.case _ _ _ alts => 
+  | FnBody.case _ _ _ alts =>
     alts.toList.foldl (fun acc alt => acc ++ collectStructTypesFromBody alt.body) []
   | _ => []
 
@@ -743,7 +750,7 @@ def generateStructBoxingFunctions (mod : LLVM.Module llvmctx) : M llvmctx Unit :
   let decls := getDecls env
   let allStructTypes := decls.foldl (fun acc d => acc ++ collectStructTypesFromDecl d) []
   let uniqueStructTypes := allStructTypes.eraseDups
-  
+
   for structType in uniqueStructTypes do
     generateStructBoxingFunction mod structType
     generateStructUnboxingFunction mod structType
@@ -761,9 +768,9 @@ def emitCtorSetArgs (builder : LLVM.Builder llvmctx)
 def emitCtor (builder : LLVM.Builder llvmctx)
     (z : VarId) (t : IRType) (c : CtorInfo) (ys : Array Arg) : M llvmctx Unit := do
   match t with
-  | IRType.struct _ types _ => 
+  | IRType.struct _ _ _ =>
     -- Handle struct constructors
-    emitStructCtor builder z types ys
+    emitStructCtor builder z t ys
   | _ =>
     -- Handle regular object constructors
     let (_llvmty, slot) ← emitLhsSlot_ z
@@ -1088,10 +1095,10 @@ def emitBox (builder : LLVM.Builder llvmctx) (z : VarId) (x : VarId) (xType : IR
     | IRType.uint64  => pure ("lean_box_uint64", ← LLVM.size_tType llvmctx, xv)
     | IRType.float   => pure ("lean_box_float", ← LLVM.doubleTypeInContext llvmctx, xv)
     | IRType.float32 => pure ("lean_box_float32", ← LLVM.floatTypeInContext llvmctx, xv)
-    | IRType.struct _ types _ => do
+    | IRType.struct leanTypeName types _ => do
          -- For struct types, we need to create a boxing function call
          let structType ← toLLVMType xType
-         let fnName := s!"lean_box_{genStructTypeName types}"
+         let fnName := s!"lean_box_{genStructTypeName leanTypeName types}"
          pure (fnName, structType, xv)
     | _              =>
          -- sign extend smaller values into i64
@@ -1124,9 +1131,9 @@ def callUnboxForType (builder : LLVM.Builder llvmctx)
      | IRType.uint64  => pure ("lean_unbox_uint64", ← toLLVMType t)
      | IRType.float   => pure ("lean_unbox_float", ← toLLVMType t)
      | IRType.float32 => pure ("lean_unbox_float32", ← toLLVMType t)
-     | IRType.struct _ types _ => do
+     | IRType.struct leanTypeName types _ => do
          let structType ← toLLVMType t
-         let fnName := s!"lean_unbox_{genStructTypeName types}"
+         let fnName := s!"lean_unbox_{genStructTypeName leanTypeName types}"
          pure (fnName, structType)
      | _              => pure ("lean_unbox", ← LLVM.size_tType llvmctx)
   let argtys := #[← LLVM.voidPtrType llvmctx ]

@@ -118,14 +118,14 @@ def toCType : IRType → String
   | IRType.tagged     => "lean_object*"
   | IRType.tobject    => "lean_object*"
   | IRType.erased     => "lean_object*"
-  | IRType.struct _ types _ => genStructTypeName types
+  | IRType.struct leanTypeName types _ => genStructTypeName leanTypeName types
   | IRType.union _ _  => panic! "not implemented yet"
 
 -- Emit struct type declaration
 def emitStructTypeDecl (structType : IRType) : M Unit := do
   match structType with
-  | IRType.struct _ types fieldNames => do
-    let typeName := genStructTypeName types
+  | IRType.struct leanTypeName types fieldNames => do
+    let typeName := genStructTypeName leanTypeName types
     emit s!"typedef struct {typeName} "
     emitLn "{"
     types.size.forM fun i _ => do
@@ -144,8 +144,8 @@ def emitStructTypeDecl (structType : IRType) : M Unit := do
 
 def emitStructBoxingFunctions (structType : IRType) : M Unit := do
   match structType with
-  | IRType.struct _ types _ => do
-    let typeName := genStructTypeName types
+  | IRType.struct leanTypeName types _ => do
+    let typeName := genStructTypeName leanTypeName types
     -- Emit boxing function
     emit s!"static inline lean_object* lean_box_{typeName}({typeName} v) "
     emitLn "{"
@@ -516,9 +516,9 @@ def emitCtorSetArgs (z : VarId) (ys : Array Arg) : M Unit :=
     emit "lean_ctor_set("; emit z; emit ", "; emit i; emit ", "; emitArg ys[i]; emitLn ");"
 
 -- Emit struct constructor using compound literal syntax
-def emitStructCtor (z : VarId) (types : Array IRType) (ys : Array Arg) : M Unit := do
+def emitStructCtor (z : VarId) (leanTypeName : Option Name) (types : Array IRType) (ys : Array Arg) : M Unit := do
   emitLhs z
-  let typeName := genStructTypeName types
+  let typeName := genStructTypeName leanTypeName types
   emit s!"({typeName})"
   emit "{"
   ys.size.forM fun i _ => do
@@ -528,7 +528,7 @@ def emitStructCtor (z : VarId) (types : Array IRType) (ys : Array Arg) : M Unit 
 
 def emitCtor (z : VarId) (t : IRType) (c : CtorInfo) (ys : Array Arg) : M Unit := do
   match t with
-  | IRType.struct _ types _ => emitStructCtor z types ys
+  | IRType.struct leanTypeName types _ => emitStructCtor z leanTypeName types ys
   | _ => do
     emitLhs z;
     if c.size == 0 && c.usize == 0 && c.ssize == 0 then do
@@ -659,8 +659,8 @@ def emitBoxFn (xType : IRType) : M Unit :=
   | IRType.uint64  => emit "lean_box_uint64"
   | IRType.float   => emit "lean_box_float"
   | IRType.float32 => emit "lean_box_float32"
-  | IRType.struct _ types _ => do
-    let typeName := genStructTypeName types
+  | IRType.struct leanTypeName types _ => do
+    let typeName := genStructTypeName leanTypeName types
     emit s!"lean_box_{typeName}"
   | _              => emit "lean_box"
 

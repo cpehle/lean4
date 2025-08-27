@@ -552,9 +552,13 @@ def mkIf (x : VarId) (t e : FnBody) : FnBody :=
   ]
 
 -- Generate a deterministic hash-based name for struct types
-def genStructTypeName (types : Array IRType) : String :=
+def genStructTypeName (leanTypeName : Option Name) (types : Array IRType) : String :=
   let typeStr := toString (types.map (fun ty => repr ty))
-  let hash := typeStr.hash
+  let nameStr := match leanTypeName with
+    | some name => name.toString
+    | none => ""
+  let combinedStr := nameStr ++ typeStr
+  let hash := combinedStr.hash
   s!"lean_struct_{hash}"
 
 def getUnboxOpName (t : IRType) : String :=
@@ -564,7 +568,7 @@ def getUnboxOpName (t : IRType) : String :=
   | IRType.uint64   => "lean_unbox_uint64"
   | IRType.float    => "lean_unbox_float"
   | IRType.float32  => "lean_unbox_float32"
-  | IRType.struct _ types _ => s!"lean_unbox_{genStructTypeName types}"
+  | IRType.struct leanTypeName types _ => s!"lean_unbox_{genStructTypeName leanTypeName types}"
   | _               => "lean_unbox"
 
 end Lean.IR
