@@ -1,0 +1,19 @@
+=== Test 1: Defer and finally order ===
+In try block
+After defer declaration
+In finally block
+Defer in try
+
+=== Test 2: Multiple defers with finally ===
+Normal execution
+Finally block
+Defer 1
+Defer 2
+
+=== Test 3: Defer, exception, and finally ===
+About to throw
+Caught: Test exception
+Finally after exception
+Defer before exception
+
+=== Tests completed ===

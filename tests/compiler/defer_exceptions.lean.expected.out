@@ -1,0 +1,39 @@
+=== Test 1: Defer with exception ===
+Before defer
+About to throw
+Caught exception: Test exception
+Defer executed despite exception
+
+=== Test 2: Multiple defers with exception ===
+Exception caught
+Defer 1
+Defer 2
+Defer 3
+
+=== Test 3: Defer with try/finally ===
+In try block
+In catch block
+In finally block
+Defer in try block
+
+=== Test 4: Defer in catch block ===
+Processing in catch
+Defer in catch block
+
+=== Test 5: Nested try/catch with defer ===
+Inner catch
+Inner defer
+After inner try
+Outer defer
+
+=== Test 6: Defer order with finally ===
+Normal execution
+Finally executes after defers
+Defer 1
+Defer 2
+
+=== Test 7: Exception in deferred code ===
+Normal execution
+Deferred message (no exception)
+
+=== All exception tests completed ===
