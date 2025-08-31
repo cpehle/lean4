@@ -1,0 +1,30 @@
+=== Test 1: Basic defer ===
+Starting test1
+Main action
+End of test1
+Deferred action 1
+
+=== Test 2: Multiple defers (LIFO order) ===
+Starting test2
+Main action
+Deferred action 2
+Deferred action 1
+
+=== Test 3: Defer with early return ===
+Starting test3
+This should execute before return
+
+=== Test 4: Defer in loop with break ===
+Starting test4
+Iteration 1
+Deferred in iteration 1
+Iteration 2
+Deferred in iteration 2
+After loop
+
+=== Test 5: Defer with mutable variables ===
+Starting test5
+Current value of x: 2
+Final value of x: 2
+
+=== All tests completed ===

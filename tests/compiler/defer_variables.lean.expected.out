@@ -1,0 +1,33 @@
+=== Test 1: Variable reference capture ===
+Before exit: x = 2
+Deferred: x = 2
+
+=== Test 2: Immutable variables ===
+Before exit: y = 42
+Deferred: y = 42
+
+=== Test 3: Explicit value capture ===
+Before exit: x = 2, captured = 0
+Deferred with captured value: 0
+
+=== Test 4: Multiple defers with variable changes ===
+Before exit: counter = 3
+Defer 1: counter = 3
+Defer 2: counter = 3
+Defer 3: counter = 3
+
+=== Test 5: Defer in loop ===
+Loop i=1: x = 15
+Defer for i=1: x = 15
+Loop i=2: x = 25
+Defer for i=2: x = 25
+Loop i=3: x = 35
+Defer for i=3: x = 35
+
+=== Test 6: Nested scopes ===
+Inner block: inner = 210, outer = 110
+After inner block: outer = 120
+Outer defer: outer = 120
+Inner defer: inner = 210, outer = 120
+
+=== Variable tests completed ===

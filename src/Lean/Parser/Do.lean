@@ -199,6 +199,12 @@ is highlighted when hovering over `return`.
 @[builtin_doElem_parser] def doReturn    := leading_parser:leadPrec
   withPosition ("return" >> optional (ppSpace >> checkLineEq >> termParser))
 /--
+`defer doSeq` executes `doSeq` just before the enclosing do block returns.
+Multiple defer statements execute in reverse order (LIFO).
+-/
+@[builtin_doElem_parser] def doDefer := leading_parser:leadPrec
+  "defer " >> doSeq
+/--
 `dbg_trace e` prints `e` (which can be an interpolated string literal) to stderr.
 It should only be used for debugging.
 -/

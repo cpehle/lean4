@@ -222,6 +222,8 @@ inductive Code where
   | break        (ref : Syntax)
   | continue     (ref : Syntax)
   | return       (ref : Syntax) (val : Syntax)
+  /-- Defer executes deferredCode before any exit from the current block -/
+  | defer        (ref : Syntax) (deferredCode : Code) (k : Code)
   /-- Recall that an if-then-else may declare a variable using `optIdent` for the branches `thenBranch` and `elseBranch`. We store the variable name at `var?`. -/
   | ite          (ref : Syntax) (h? : Option Var) (optIdent : Syntax) (cond : Syntax) (thenBranch : Code) (elseBranch : Code)
   | match        (ref : Syntax) (gen : Syntax) (discrs : Syntax) (optMotive : Syntax) (alts : Array (Alt Code))
@@ -238,6 +240,7 @@ def Code.getRef? : Code → Option Syntax
   | .break ref           => ref
   | .continue ref        => ref
   | .return ref _        => ref
+  | .defer ref _ _       => ref
   | .ite ref ..          => ref
   | .match ref ..        => ref
   | .matchExpr ref ..    => ref
@@ -264,6 +267,7 @@ partial def CodeBlock.toMessageData (codeBlock : CodeBlock) : MessageData :=
     | .joinpoint n ps body k => m!"let {n.simpMacroScopes} {varsToMessageData (ps.map Prod.fst)} := {indentD (loop body)}\n{loop k}"
     | .seq e k               => m!"{e}\n{loop k}"
     | .action e              => e
+    | .defer _ d k           => m!"defer {indentD (loop d)}\n{loop k}"
     | .ite _ _ _ c t e       => m!"if {c} then {indentD (loop t)}\nelse{loop e}"
     | .jmp _ j xs            => m!"jmp {j.simpMacroScopes} {xs.toList}"
     | .break _               => m!"break {us}"
@@ -423,6 +427,7 @@ partial def pullExitPointsAux (rs : VarSet) (c : Code) : StateRefT (Array JPDecl
   | .seq e k               => return .seq e (← pullExitPointsAux rs k)
   | .ite ref x? o c t e    => return .ite ref x? o c (← pullExitPointsAux (eraseOptVar rs x?) t) (← pullExitPointsAux (eraseOptVar rs x?) e)
   | .jmp ..                => return  c
+  | .defer ref d k         => return .defer ref d (← pullExitPointsAux rs k)
   | .break ref             => mkSimpleJmp ref rs (.break ref)
   | .continue ref          => mkSimpleJmp ref rs (.continue ref)
   | .return ref val        => mkJmp ref rs val (fun y => return .return ref y)
@@ -1053,6 +1058,13 @@ def seqToTerm (action : Syntax) (k : Syntax) : M Syntax := withRef action <| wit
     let action ← withRef action ``(($action : $((←read).m) PUnit))
     ``(Bind.bind $action (fun (_ : PUnit) => $k))
 
+def deferToTerm (deferredCode : Syntax) (k : Syntax) : M Syntax := withFreshMacroScope do
+  -- Execute deferredCode after k completes
+  -- We bind k first, save its result, then execute deferred code, then return the result
+  let x ← `(x)
+  let u ← `(_)
+  ``(Bind.bind $k (fun $x => Bind.bind $deferredCode (fun $u => pure $x)))
+
 def declToTerm (decl : Syntax) (k : Syntax) : M Syntax := withRef decl <| withFreshMacroScope do
   let kind := decl.getKind
   if kind == ``Parser.Term.doLet then
@@ -1144,6 +1156,7 @@ where
     | .continue ref       => withRef ref continueToTerm
     | .break ref          => withRef ref breakToTerm
     | .action e           => actionTerminalToTerm e
+    | .defer ref d k      => withRef ref <| deferToTerm (← toTerm d) (← toTerm k)
     | .joinpoint j ps b k => mkJoinPoint j ps (← toTerm b) (← toTerm k)
     | .jmp ref j args     => return mkJmp ref j args
     | .decl _ stx k       => declToTerm stx (← toTerm k)
@@ -1377,6 +1390,27 @@ def doReturnToCode (doReturn : Syntax) (doElems: List Syntax) : M CodeBlock := w
   let argOpt := doReturn[1]
   let arg ← if argOpt.isNone then liftMacroM mkUnit else pure argOpt[0]
   return mkReturn (← getRef) arg
+
+/-- Thread defer through all exit points in the code -/
+partial def threadDeferThroughCode (ref : Syntax) (deferredCode : Code) : Code → Code
+  | .return r v => .defer ref deferredCode (.return r v)
+  | .break r => .defer ref deferredCode (.break r)
+  | .continue r => .defer ref deferredCode (.continue r)
+  | .action a => .defer ref deferredCode (.action a)
+  | .seq a k => .seq a (threadDeferThroughCode ref deferredCode k)
+  | .decl xs elem k => .decl xs elem (threadDeferThroughCode ref deferredCode k)
+  | .reassign xs elem k => .reassign xs elem (threadDeferThroughCode ref deferredCode k)
+  | .defer r d k => .defer r d (threadDeferThroughCode ref deferredCode k)
+  | .ite r h o c t e => .ite r h o c 
+      (threadDeferThroughCode ref deferredCode t)
+      (threadDeferThroughCode ref deferredCode e)
+  | .match r g d m alts =>
+      .match r g d m (alts.map fun alt => { alt with rhs := threadDeferThroughCode ref deferredCode alt.rhs })
+  | .matchExpr r m d alts e =>
+      .matchExpr r m d (alts.map fun alt => { alt with rhs := threadDeferThroughCode ref deferredCode alt.rhs })
+        (threadDeferThroughCode ref deferredCode e)
+  | .joinpoint n ps b k => .joinpoint n ps (threadDeferThroughCode ref deferredCode b) (threadDeferThroughCode ref deferredCode k)
+  | .jmp r j args => .defer ref deferredCode (.jmp r j args)
 
 structure Catch where
   x         : Syntax
@@ -1650,6 +1684,49 @@ mutual
     let matchCode ← mkMatchExpr ref «meta» discr alts elseBranch
     concatWith matchCode doElems
 
+  /-- Extract all defer statements from a Code block and return them along with the code without defers -/
+  partial def extractDefers : Code → (List Code × Code)
+    | .defer _ deferredCode k => 
+      let (moreDefers, restCode) := extractDefers k
+      (deferredCode :: moreDefers, restCode)
+    | .seq a k => 
+      let (defers, restCode) := extractDefers k
+      (defers, .seq a restCode)
+    | .decl xs elem k =>
+      let (defers, restCode) := extractDefers k
+      (defers, .decl xs elem restCode)
+    | .reassign xs elem k =>
+      let (defers, restCode) := extractDefers k
+      (defers, .reassign xs elem restCode)
+    | .ite ref h o c thenBranch elseBranch =>
+      let (thenDefers, thenCode) := extractDefers thenBranch
+      let (elseDefers, elseCode) := extractDefers elseBranch
+      -- Defers must be extracted from both branches
+      let allDefers := thenDefers ++ elseDefers
+      (allDefers, .ite ref h o c thenCode elseCode)
+    | .match ref g d m alts =>
+      let (allDefers, newAlts) := alts.foldl (fun (defers, alts) alt =>
+        let (altDefers, altCode) := extractDefers alt.rhs
+        (defers ++ altDefers, alts.push { alt with rhs := altCode })
+      ) ([], #[])
+      (allDefers, .match ref g d m newAlts)
+    | .matchExpr ref «meta» discr alts elseBranch =>
+      let (elseDefers, elseCode) := extractDefers elseBranch
+      let (allDefers, newAlts) := alts.foldl (fun (defers, alts) alt =>
+        let (altDefers, altCode) := extractDefers alt.rhs
+        (defers ++ altDefers, alts.push { alt with rhs := altCode })
+      ) (elseDefers, #[])
+      (allDefers, .matchExpr ref «meta» discr newAlts elseCode)
+    | .joinpoint n ps b k =>
+      let (bodyDefers, bodyCode) := extractDefers b
+      let (contDefers, contCode) := extractDefers k
+      (bodyDefers ++ contDefers, .joinpoint n ps bodyCode contCode)
+    | other => ([], other)
+
+  /-- Wrap code with defers to ensure they execute even on exceptions -/
+  partial def wrapCodeWithDefers (ref : Syntax) (defers : List Code) (code : Code) : Code :=
+    defers.foldl (fun acc deferCode => .defer ref deferCode acc) code
+
   /--
     Generate `CodeBlock` for `doTry; doElems`
     ```
@@ -1661,6 +1738,10 @@ mutual
   -/
   partial def doTryToCode (doTry : Syntax) (doElems: List Syntax) : M CodeBlock := do
     let tryCode ← doSeqToCode (getDoSeqElems doTry[1])
+    
+    -- Extract defers from the try block to ensure they execute even on exceptions
+    let (tryDefers, tryCodeWithoutDefers) := extractDefers tryCode.code
+    
     let optFinally := doTry[3]
     let catches ← doTry[2].getArgs.mapM fun catchStx : Syntax => do
       if catchStx.getKind == ``Parser.Term.doCatch then
@@ -1679,8 +1760,31 @@ mutual
       else
         throwError "unexpected kind of `catch`"
     let finallyCode? ← if optFinally.isNone then pure none else some <$> doSeqToCode (getDoSeqElems optFinally[0][1])
+    
+    -- If we have defers, we need to ensure they execute even on exceptions
+    -- We'll add them to the finally block or create one if needed
+    let finallyCode? ← if tryDefers.isEmpty then 
+      pure finallyCode?
+    else match finallyCode? with
+      | none => do
+        -- Create a finally block with just the defers
+        let ref ← getRef
+        let unit ← liftMacroM mkPureUnitAction
+        -- Chain defers in reverse order (LIFO)
+        let deferCode := tryDefers.reverse.foldl (fun acc d => .defer ref d acc) unit.code
+        pure (some { code := deferCode, uvars := unit.uvars })
+      | some finallyBlock => do
+        -- Add defers after the existing finally code (defers execute in LIFO order)
+        let ref ← getRef
+        -- Execute finally first, then defers in LIFO order
+        let deferCode := tryDefers.reverse.foldl (fun acc d => .defer ref d acc) finallyBlock.code
+        pure (some { code := deferCode, uvars := finallyBlock.uvars })
+    
     if catches.isEmpty && finallyCode?.isNone then
       throwError "invalid `try`, it must have a `catch` or `finally`"
+    
+    -- Update the try code to remove defers since they're now in finally
+    let tryCode := { tryCode with code := tryCodeWithoutDefers }
     let ctx ← read
     let ws    := getTryCatchUpdatedVars tryCode catches finallyCode?
     let uvars := varSetToArray ws
@@ -1774,6 +1878,8 @@ mutual
             return mkContinue ref
           else if k == ``Parser.Term.doReturn then
             doReturnToCode doElem doElems
+          else if k == ``Parser.Term.doDefer then
+            doDeferToCode doElem doElems
           else if k == ``Parser.Term.doDbgTrace then
             return mkSeq doElem (← doSeqToCode doElems)
           else if k == ``Parser.Term.doAssert then
@@ -1791,6 +1897,20 @@ mutual
               return mkSeq term (← doSeqToCode doElems)
           else
             throwError "unexpected do-element of kind {doElem.getKind}:\n{doElem}"
+
+  /-- Generate `CodeBlock` for `doDefer` which is of the form
+     ```
+     "defer " >> doSeq
+     ```
+     The deferred code is executed before any exit from the enclosing block. -/
+  partial def doDeferToCode (doDefer : Syntax) (doElems: List Syntax) : M CodeBlock := withRef doDefer do
+    let deferSeq := doDefer[1]
+    let deferredCodeBlock ← doSeqToCode (getDoSeqElems deferSeq)
+    let nextCodeBlock ← doSeqToCode doElems
+    -- Thread defer through all exit points in the rest of the code
+    let resultCode := threadDeferThroughCode (← getRef) deferredCodeBlock.code nextCodeBlock.code
+    return { code := resultCode, uvars := union deferredCodeBlock.uvars nextCodeBlock.uvars }
+
 end
 
 def run (doStx : Syntax) (m : Syntax) (returnType : Syntax) : TermElabM CodeBlock :=
