@@ -503,6 +503,9 @@ def insert [BEq α] [Hashable α] [Inhabited β] (ext : CacheExtension α β) (a
 def find? [BEq α] [Hashable α] [Inhabited β] (ext : CacheExtension α β) (a : α) : CoreM (Option β) := do
   return ext.toEnvExtension.getState (← getEnv) |>.2.find? a
 
+def erase [BEq α] [Hashable α] [Inhabited β] (ext : CacheExtension α β) (a : α) : CoreM Unit := do
+  modifyEnv (ext.modifyState · fun ⟨as, m⟩ => (as.filter (· != a), m.erase a))
+
 end CacheExtension
 
 end Lean.Compiler.LCNF

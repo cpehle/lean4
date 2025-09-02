@@ -864,7 +864,7 @@ end
 
 def emitDeclAux (d : Decl) : M Unit := do
   let env ← getEnv
-  let (_, jpMap) := mkVarJPMaps d
+  let (varMap, jpMap) := mkVarJPMaps d
   withReader (fun ctx => { ctx with jpMap := jpMap }) do
   unless hasInitAttr env d.name do
     match d with
@@ -895,6 +895,8 @@ def emitDeclAux (d : Decl) : M Unit := do
           emit "lean_object* "; emit x.x; emit " = _args["; emit i; emitLn "];"
       emitLn "_start:";
       let localCtx := xs.foldl (fun ctx p => ctx.addParam p) {}
+      -- Add all variables from varMap to the local context
+      let localCtx := varMap.fold (fun ctx (x : VarId) ty => ctx.insert x.idx (LocalContextEntry.param ty)) localCtx
       withReader (fun ctx => { ctx with mainFn := f, mainParams := xs, localCtx := localCtx }) (emitFnBody b);
       emitLn "}"
     | _ => pure ()
