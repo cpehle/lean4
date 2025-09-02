@@ -62,10 +62,21 @@ typedef object_ref lit_val;
 typedef object_ref ctor_info;
 
 type to_type(object * obj) {
-    if (!is_scalar(obj)) throw exception("unsupported IRType");
-    else return static_cast<type>(unbox(obj));
+    if (!is_scalar(obj)) {
+        // Handle non-scalar types (struct and union)
+        unsigned tag = cnstr_tag(obj);
+        if (tag == 10) { // IRType.struct
+            return type::Struct;
+        } else if (tag == 11) { // IRType.union
+            return type::Union;
+        }
+        throw exception("unsupported IRType");
+    } else {
+        return static_cast<type>(unbox(obj));
+    }
 }
 type cnstr_get_type(object_ref const & o, unsigned i) { return to_type(cnstr_get(o.raw(), i)); }
+object * cnstr_get_type_obj(object_ref const & o, unsigned i) { return cnstr_get(o.raw(), i); }
 
 bool arg_is_irrelevant(arg const & a) { return is_scalar(a.raw()); }
 var_id const & arg_var_id(arg const & a) { lean_assert(!arg_is_irrelevant(a)); return cnstr_get_ref_t<var_id>(a, 0); }
@@ -209,7 +220,7 @@ std::string format_fn_body_head(fn_body const & b) {
 }
 
 static bool type_is_scalar(type t) {
-    return t != type::Object && t != type::Tagged && t != type::TObject && t != type::Irrelevant;
+    return t != type::Object && t != type::Tagged && t != type::TObject && t != type::Irrelevant && t != type::Struct && t != type::Union;
 }
 
 extern "C" object* lean_get_regular_init_fn_name_for(object* env, object* fn);
@@ -258,8 +269,8 @@ object * box_t(value v, type t) {
     case type::Tagged:
     case type::TObject:
     case type::Irrelevant:
+    case type::Struct:  // Structs are heap-allocated objects in the interpreter
         return v.m_obj;
-    case type::Struct:
     case type::Union:
         throw exception("not implemented yet");
     }
@@ -279,8 +290,8 @@ value unbox_t(object * o, type t) {
     case type::Object:
     case type::Tagged:
     case type::TObject:
+    case type::Struct:  // Structs don't need unboxing - they're already objects
         break;
-    case type::Struct:
     case type::Union:
         throw exception("not implemented yet");
     }
@@ -356,6 +367,8 @@ class interpreter {
     std::vector<value> m_arg_stack;
     // stack of join points
     std::vector<fn_body const *> m_jp_stack;
+    // Map from struct object pointers to their type objects for proper field projection
+    std::unordered_map<object*, object*> m_struct_types;
     struct frame {
         name m_fn;
         // base pointers into the stack above
@@ -422,6 +435,129 @@ private:
         return arg_is_irrelevant(a) ? box(0) : var(arg_var_id(a));
     }
 
+    /** \brief Allocate struct object with proper field layout based on struct type info */
+    object * alloc_struct(ctor_info const & i, array_ref<arg> const & args, object * type_obj) {
+        lean_assert(!is_scalar(type_obj));
+        lean_assert(cnstr_tag(type_obj) == 10); // Must be IRType.struct
+        
+        // Extract the types array from the struct type (field 1 of IRType.struct)
+        object * types_array = cnstr_get(type_obj, 1);
+        size_t num_fields = array_size(types_array);
+        
+        size_t tag = ctor_info_tag(i).get_small_value();
+        
+        // Calculate the actual size needed for the struct based on field types
+        // For structs, we use a custom layout with fields in declaration order
+        size_t total_size = sizeof(lean_object);  // Start with header size
+        for (size_t i = 0; i < num_fields; i++) {
+            object * field_type_obj = array_get(types_array, i);
+            type field_type = to_type(field_type_obj);
+            switch (field_type) {
+                case type::Float:
+                    total_size += sizeof(double);
+                    break;
+                case type::Float32:
+                    total_size += sizeof(float);
+                    break;
+                case type::UInt8:
+                    total_size += 1;
+                    break;
+                case type::UInt16:
+                    total_size += 2;
+                    break;
+                case type::UInt32:
+                    total_size += 4;
+                    break;
+                case type::UInt64:
+                    total_size += 8;
+                    break;
+                case type::USize:
+                    total_size += sizeof(size_t);
+                    break;
+                case type::Object:
+                case type::Tagged:
+                case type::TObject:
+                case type::Struct:
+                    total_size += sizeof(void*);
+                    break;
+                default:
+                    total_size += sizeof(void*);
+                    break;
+            }
+        }
+        
+        // Allocate raw memory for the struct with custom layout
+        object *o = (object*)lean_alloc_small_object(total_size);
+        lean_set_st_header(o, tag, 0);  // Set header with tag and 0 for other field
+        
+        // For structs, fields are laid out in declaration order
+        // Start after the header
+        uint8_t* data_ptr = (uint8_t*)o + sizeof(lean_object);
+        size_t current_offset = 0;
+        
+        for (size_t i = 0; i < args.size() && i < num_fields; i++) {
+            value v = eval_arg(args[i]);
+            object * field_type_obj = array_get(types_array, i);
+            type field_type = to_type(field_type_obj);
+            
+            switch (field_type) {
+                case type::Float:
+                    *((double*)(data_ptr + current_offset)) = v.m_float;
+                    current_offset += sizeof(double);
+                    break;
+                case type::Float32:
+                    *((float*)(data_ptr + current_offset)) = v.m_float32;
+                    current_offset += sizeof(float);
+                    break;
+                case type::UInt8:
+                    *((uint8_t*)(data_ptr + current_offset)) = v.m_num;
+                    current_offset += 1;
+                    break;
+                case type::UInt16:
+                    *((uint16_t*)(data_ptr + current_offset)) = v.m_num;
+                    current_offset += 2;
+                    break;
+                case type::UInt32:
+                    *((uint32_t*)(data_ptr + current_offset)) = v.m_num;
+                    current_offset += 4;
+                    break;
+                case type::UInt64:
+                    *((uint64_t*)(data_ptr + current_offset)) = v.m_num;
+                    current_offset += 8;
+                    break;
+                case type::USize:
+                    *((size_t*)(data_ptr + current_offset)) = v.m_num;
+                    current_offset += sizeof(size_t);
+                    break;
+                case type::Object:
+                case type::Tagged:
+                case type::TObject:
+                    *((object**)(data_ptr + current_offset)) = v.m_obj;
+                    current_offset += sizeof(void*);
+                    break;
+                case type::Struct:
+                    // Nested struct - store pointer and register it
+                    *((object**)(data_ptr + current_offset)) = v.m_obj;
+                    // If this field is a struct, register it too
+                    if (!is_scalar(field_type_obj) && cnstr_tag(field_type_obj) == 10) {
+                        m_struct_types[v.m_obj] = field_type_obj;
+                    }
+                    current_offset += sizeof(void*);
+                    break;
+                default:
+                    // Default to object pointer
+                    *((object**)(data_ptr + current_offset)) = v.m_obj;
+                    current_offset += sizeof(void*);
+                    break;
+            }
+        }
+        
+        // Store the struct type for later use in projections
+        m_struct_types[o] = type_obj;
+        
+        return o;
+    }
+    
     /** \brief Allocate constructor object with given tag and arguments */
     object * alloc_ctor(ctor_info const & i, array_ref<arg> const & args) {
         size_t tag = ctor_info_tag(i).get_small_value();
@@ -456,10 +592,15 @@ private:
         return cls;
     }
 
-    value eval_expr(expr const & e, type t) {
+    value eval_expr(expr const & e, type t, object * type_obj = nullptr) {
         switch (expr_tag(e)) {
             case expr_kind::Ctor:
-                return value { alloc_ctor(expr_ctor_info(e), expr_ctor_args(e)) };
+                if (t == type::Struct && type_obj != nullptr && !is_scalar(type_obj) && cnstr_tag(type_obj) == 10) {
+                    // For struct types, use the type information to correctly handle fields
+                    return value { alloc_struct(expr_ctor_info(e), expr_ctor_args(e), type_obj) };
+                } else {
+                    return value { alloc_ctor(expr_ctor_info(e), expr_ctor_args(e)) };
+                }
             case expr_kind::Reset: { // release fields if unique reference in preparation for `Reuse` below
                 object * o = var(expr_reset_obj(e)).m_obj;
                 if (is_exclusive(o)) {
@@ -477,7 +618,11 @@ private:
                 // check if `Reset` above had a unique reference it consumed
                 if (is_scalar(o)) {
                     // fall back to regular allocation
-                    return alloc_ctor(expr_reuse_ctor(e), expr_reuse_args(e));
+                    if (t == type::Struct && type_obj != nullptr && !is_scalar(type_obj) && cnstr_tag(type_obj) == 10) {
+                        return alloc_struct(expr_reuse_ctor(e), expr_reuse_args(e), type_obj);
+                    } else {
+                        return alloc_ctor(expr_reuse_ctor(e), expr_reuse_args(e));
+                    }
                 } else {
                     // create new constructor object in-place
                     if (expr_reuse_update_header(e)) {
@@ -489,29 +634,199 @@ private:
                     return o;
                 }
             }
-            case expr_kind::Proj: // object field access
-                return cnstr_get(var(expr_proj_obj(e)).m_obj, expr_proj_idx(e).get_small_value());
-            case expr_kind::UProj: // USize field access
-                return cnstr_get_usize(var(expr_uproj_obj(e)).m_obj, expr_uproj_idx(e).get_small_value());
+            case expr_kind::Proj: { // object field access
+                object * o = var(expr_proj_obj(e)).m_obj;
+                size_t idx = expr_proj_idx(e).get_small_value();
+                
+                // Check if this is a struct with custom layout
+                if (!m_struct_types.empty()) {
+                    auto struct_type_it = m_struct_types.find(o);
+                    if (struct_type_it != m_struct_types.end()) {
+                        // This is a struct - read from custom layout
+                        object * struct_type = struct_type_it->second;
+                        object * types_array = cnstr_get(struct_type, 1);
+                        
+                        // Calculate offset to the field
+                        uint8_t* data_ptr = (uint8_t*)o + sizeof(lean_object);
+                        size_t offset = 0;
+                        
+                        for (size_t i = 0; i < idx && i < array_size(types_array); i++) {
+                            object * field_type_obj = array_get(types_array, i);
+                            type field_type = to_type(field_type_obj);
+                            
+                            // Add size of this field to offset
+                            switch (field_type) {
+                                case type::Float: offset += sizeof(double); break;
+                                case type::Float32: offset += sizeof(float); break;
+                                case type::UInt8: offset += 1; break;
+                                case type::UInt16: offset += 2; break;
+                                case type::UInt32: offset += 4; break;
+                                case type::UInt64: offset += 8; break;
+                                case type::USize: offset += sizeof(size_t); break;
+                                case type::Object:
+                                case type::Tagged:
+                                case type::TObject:
+                                case type::Struct:
+                                    offset += sizeof(void*); break;
+                                default:
+                                    offset += sizeof(void*); break;
+                            }
+                        }
+                        
+                        // Get the field value from the calculated offset
+                        object * field_value = *((object**)(data_ptr + offset));
+                        
+                        // Check if this field is also a struct and register it
+                        if (idx < array_size(types_array)) {
+                            object * field_type_obj = array_get(types_array, idx);
+                            type field_type = to_type(field_type_obj);
+                            if (field_type == type::Struct && !is_scalar(field_type_obj)) {
+                                m_struct_types[field_value] = field_type_obj;
+                            }
+                        }
+                        
+                        return field_value;
+                    }
+                }
+                
+                // Not a struct - use regular constructor access
+                return cnstr_get(o, idx);
+            }
+            case expr_kind::UProj: { // USize field access
+                object * o = var(expr_uproj_obj(e)).m_obj;
+                size_t idx = expr_uproj_idx(e).get_small_value();
+                
+                // Check if this is a struct with custom layout
+                if (!m_struct_types.empty()) {
+                    auto struct_type_it = m_struct_types.find(o);
+                    if (struct_type_it != m_struct_types.end()) {
+                        // This is a struct - read from custom layout
+                        object * struct_type = struct_type_it->second;
+                        object * types_array = cnstr_get(struct_type, 1);
+                        
+                        // Calculate offset to the field
+                        uint8_t* data_ptr = (uint8_t*)o + sizeof(lean_object);
+                        size_t offset = 0;
+                        
+                        for (size_t i = 0; i < idx && i < array_size(types_array); i++) {
+                            object * field_type_obj = array_get(types_array, i);
+                            type field_type = to_type(field_type_obj);
+                            
+                            // Add size of this field to offset
+                            switch (field_type) {
+                                case type::Float: offset += sizeof(double); break;
+                                case type::Float32: offset += sizeof(float); break;
+                                case type::UInt8: offset += 1; break;
+                                case type::UInt16: offset += 2; break;
+                                case type::UInt32: offset += 4; break;
+                                case type::UInt64: offset += 8; break;
+                                case type::USize: offset += sizeof(size_t); break;
+                                case type::Object:
+                                case type::Tagged:
+                                case type::TObject:
+                                case type::Struct:
+                                    offset += sizeof(void*); break;
+                                default:
+                                    offset += sizeof(void*); break;
+                            }
+                        }
+                        
+                        // Read the USize value from the calculated offset
+                        return *((size_t*)(data_ptr + offset));
+                    }
+                }
+                
+                // Not a struct - use regular constructor access
+                return cnstr_get_usize(o, idx);
+            }
             case expr_kind::SProj: { // other unboxed field access
-                size_t offset = expr_sproj_idx(e).get_small_value() * sizeof(void *) +
-                                expr_sproj_offset(e).get_small_value();
                 object * o = var(expr_sproj_obj(e)).m_obj;
-                switch (t) {
-                    case type::Float: return value::from_float(cnstr_get_float(o, offset));
-                    case type::Float32: return value::from_float32(cnstr_get_float32(o, offset));
-                    case type::UInt8: return cnstr_get_uint8(o, offset);
-                    case type::UInt16: return cnstr_get_uint16(o, offset);
-                    case type::UInt32: return cnstr_get_uint32(o, offset);
-                    case type::UInt64: return cnstr_get_uint64(o, offset);
-                    case type::USize:
-                    case type::Irrelevant:
-                    case type::Object:
-                    case type::Tagged:
-                    case type::TObject:
-                    case type::Struct:
-                    case type::Union:
-                        break;
+                
+                // Only check for struct if we have any structs at all (optimization)
+                if (!m_struct_types.empty()) {
+                    auto struct_type_it = m_struct_types.find(o);
+                    if (struct_type_it != m_struct_types.end()) {
+                        // This is a struct with custom layout
+                        size_t field_idx = expr_sproj_offset(e).get_small_value();
+                        object * struct_type = struct_type_it->second;
+                        object * types_array = cnstr_get(struct_type, 1);
+                        
+                        // Calculate byte offset for the field in declaration order
+                        // Start after the header
+                        uint8_t* data_ptr = (uint8_t*)o + sizeof(lean_object);
+                        size_t offset = 0;
+                        
+                        for (size_t i = 0; i < field_idx && i < array_size(types_array); i++) {
+                            object * field_type_obj = array_get(types_array, i);
+                            type field_type = to_type(field_type_obj);
+                            
+                            // Add size of this field to offset
+                            switch (field_type) {
+                                case type::Float: offset += sizeof(double); break;
+                                case type::Float32: offset += sizeof(float); break;
+                                case type::UInt8: offset += 1; break;
+                                case type::UInt16: offset += 2; break;
+                                case type::UInt32: offset += 4; break;
+                                case type::UInt64: offset += 8; break;
+                                case type::USize: offset += sizeof(size_t); break;
+                                case type::Object:
+                                case type::Tagged:
+                                case type::TObject:
+                                case type::Struct:
+                                    offset += sizeof(void*); break;
+                                default:
+                                    offset += sizeof(void*); break;
+                            }
+                        }
+                        
+                        // Read the value from the calculated offset
+                        switch (t) {
+                            case type::Float: 
+                                return value::from_float(*((double*)(data_ptr + offset)));
+                            case type::Float32: 
+                                return value::from_float32(*((float*)(data_ptr + offset)));
+                            case type::UInt8: 
+                                return *((uint8_t*)(data_ptr + offset));
+                            case type::UInt16: 
+                                return *((uint16_t*)(data_ptr + offset));
+                            case type::UInt32: 
+                                return *((uint32_t*)(data_ptr + offset));
+                            case type::UInt64: 
+                                return *((uint64_t*)(data_ptr + offset));
+                            default:
+                                throw exception("invalid scalar type in SProj for struct");
+                        }
+                    } else {
+                        // Not a struct - use the regular offset calculation with cnstr_get functions
+                        size_t offset = expr_sproj_idx(e).get_small_value() * sizeof(void *) +
+                                       expr_sproj_offset(e).get_small_value();
+                        
+                        switch (t) {
+                            case type::Float: return value::from_float(cnstr_get_float(o, offset));
+                            case type::Float32: return value::from_float32(cnstr_get_float32(o, offset));
+                            case type::UInt8: return cnstr_get_uint8(o, offset);
+                            case type::UInt16: return cnstr_get_uint16(o, offset);
+                            case type::UInt32: return cnstr_get_uint32(o, offset);
+                            case type::UInt64: return cnstr_get_uint64(o, offset);
+                            default:
+                                break;
+                        }
+                    }
+                } else {
+                    // No structs in the program - use the regular offset calculation
+                    size_t offset = expr_sproj_idx(e).get_small_value() * sizeof(void *) +
+                                   expr_sproj_offset(e).get_small_value();
+                    
+                    switch (t) {
+                        case type::Float: return value::from_float(cnstr_get_float(o, offset));
+                        case type::Float32: return value::from_float32(cnstr_get_float32(o, offset));
+                        case type::UInt8: return cnstr_get_uint8(o, offset);
+                        case type::UInt16: return cnstr_get_uint16(o, offset);
+                        case type::UInt32: return cnstr_get_uint32(o, offset);
+                        case type::UInt64: return cnstr_get_uint64(o, offset);
+                        default:
+                            break;
+                    }
                 }
                 throw exception("invalid instruction");
             }
@@ -575,11 +890,10 @@ private:
                             case type::Object:
                             case type::Tagged:
                             case type::TObject:
+                            case type::Struct:  // Treat structs as objects for literals
                                 return n.to_obj_arg();
                             case type::Irrelevant:
-                                break;
                             case type::Union:
-                            case type::Struct:
                                 break;
                         }
                         throw exception("invalid instruction");
@@ -642,7 +956,8 @@ private:
                         check_system();
                         break;
                     }
-                    value v = eval_expr(fn_body_vdecl_expr(b), fn_body_vdecl_type(b));
+                    object * type_obj = cnstr_get_type_obj(b, 1); // Get raw type object
+                    value v = eval_expr(fn_body_vdecl_expr(b), fn_body_vdecl_type(b), type_obj);
                     // NOTE: `var` must be called *after* `eval_expr` because the stack may get resized and invalidate
                     // the pointer
                     var(fn_body_vdecl_var(b)) = v;
@@ -869,8 +1184,8 @@ private:
                 case type::Tagged:
                 case type::TObject:
                 case type::Irrelevant:
+                case type::Struct:  // Structs are objects in native constants  
                     return *static_cast<object **>(e.m_native.m_addr);
-                case type::Struct:
                 case type::Union:
                     throw exception("not implemented yet");
             }
