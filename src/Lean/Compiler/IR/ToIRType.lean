@@ -36,6 +36,10 @@ def irTypeForEnum (numCtors : Nat) : IRType :=
 builtin_initialize irTypeExt : LCNF.CacheExtension Name IRType ←
   LCNF.CacheExtension.register
 
+@[export lean_compiler_clear_ir_type_cache]
+def clearIRTypeCache (name : Name) : CoreM Unit := do
+  irTypeExt.erase name
+
 private def isAnyProducingType (type : Lean.Expr) : Bool :=
   match type with
   | .const ``lcAny _ => true
@@ -46,7 +50,8 @@ mutual
 
 partial def nameToIRType (name : Name) : CoreM IRType := do
   match (← irTypeExt.find? name) with
-  | some type => return type
+  | some type => 
+    return type
   | none =>
     let type ← fillCache
     irTypeExt.insert name type
@@ -70,7 +75,8 @@ where fillCache : CoreM IRType := do
       let some (.inductInfo inductiveVal) := env.find? name | return .tobject
 
       -- Check if type is marked with @[struct] attribute
-      if hasStructAttr env name then
+      let hasAttr := hasStructAttr env name
+      if hasAttr then
         return ← generateStructType inductiveVal
 
       let ctorNames := inductiveVal.ctors
