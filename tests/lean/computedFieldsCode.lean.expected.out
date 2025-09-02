@@ -46,7 +46,6 @@
       default →
         dec x_1;
         ret x_2
-[Compiler.IR] [result]
     def Exp.ctorElim (x_1 : ◾) (x_2 : @& tobj) (x_3 : tobj) (x_4 : ◾) (x_5 : tobj) : tobj :=
       let x_6 : tobj := Exp.ctorElim._redArg x_3 x_5;
       ret x_6
@@ -58,7 +57,6 @@
     def Exp.var.elim._redArg (x_1 : tobj) (x_2 : tobj) : tobj :=
       let x_3 : tobj := Exp.ctorElim._redArg x_1 x_2;
       ret x_3
-[Compiler.IR] [result]
     def Exp.var.elim (x_1 : ◾) (x_2 : tobj) (x_3 : ◾) (x_4 : tobj) : tobj :=
       let x_5 : tobj := Exp.ctorElim._redArg x_2 x_4;
       ret x_5
@@ -66,7 +64,6 @@
     def Exp.app.elim._redArg (x_1 : tobj) (x_2 : tobj) : tobj :=
       let x_3 : tobj := Exp.ctorElim._redArg x_1 x_2;
       ret x_3
-[Compiler.IR] [result]
     def Exp.app.elim (x_1 : ◾) (x_2 : tobj) (x_3 : ◾) (x_4 : tobj) : tobj :=
       let x_5 : tobj := Exp.ctorElim._redArg x_2 x_4;
       ret x_5
@@ -74,7 +71,6 @@
     def Exp.a1.elim._redArg (x_1 : tobj) (x_2 : tobj) : tobj :=
       let x_3 : tobj := Exp.ctorElim._redArg x_1 x_2;
       ret x_3
-[Compiler.IR] [result]
     def Exp.a1.elim (x_1 : ◾) (x_2 : tobj) (x_3 : ◾) (x_4 : tobj) : tobj :=
       let x_5 : tobj := Exp.ctorElim._redArg x_2 x_4;
       ret x_5
@@ -82,7 +78,6 @@
     def Exp.a2.elim._redArg (x_1 : tobj) (x_2 : tobj) : tobj :=
       let x_3 : tobj := Exp.ctorElim._redArg x_1 x_2;
       ret x_3
-[Compiler.IR] [result]
     def Exp.a2.elim (x_1 : ◾) (x_2 : tobj) (x_3 : ◾) (x_4 : tobj) : tobj :=
       let x_5 : tobj := Exp.ctorElim._redArg x_2 x_4;
       ret x_5
@@ -90,7 +85,6 @@
     def Exp.a3.elim._redArg (x_1 : tobj) (x_2 : tobj) : tobj :=
       let x_3 : tobj := Exp.ctorElim._redArg x_1 x_2;
       ret x_3
-[Compiler.IR] [result]
     def Exp.a3.elim (x_1 : ◾) (x_2 : tobj) (x_3 : ◾) (x_4 : tobj) : tobj :=
       let x_5 : tobj := Exp.ctorElim._redArg x_2 x_4;
       ret x_5
@@ -98,7 +92,6 @@
     def Exp.a4.elim._redArg (x_1 : tobj) (x_2 : tobj) : tobj :=
       let x_3 : tobj := Exp.ctorElim._redArg x_1 x_2;
       ret x_3
-[Compiler.IR] [result]
     def Exp.a4.elim (x_1 : ◾) (x_2 : tobj) (x_3 : ◾) (x_4 : tobj) : tobj :=
       let x_5 : tobj := Exp.ctorElim._redArg x_2 x_4;
       ret x_5
@@ -106,7 +99,6 @@
     def Exp.a5.elim._redArg (x_1 : tobj) (x_2 : tobj) : tobj :=
       let x_3 : tobj := Exp.ctorElim._redArg x_1 x_2;
       ret x_3
-[Compiler.IR] [result]
     def Exp.a5.elim (x_1 : ◾) (x_2 : tobj) (x_3 : ◾) (x_4 : tobj) : tobj :=
       let x_5 : tobj := Exp.ctorElim._redArg x_2 x_4;
       ret x_5
@@ -154,15 +146,6 @@
         dec x_2;
         inc x_8;
         ret x_8
-    def Exp.casesOn._override._redArg._boxed (x_1 : tobj) (x_2 : tobj) (x_3 : tobj) (x_4 : tobj) (x_5 : tobj) (x_6 : tobj) (x_7 : tobj) (x_8 : tobj) : tobj :=
-      let x_9 : tobj := Exp.casesOn._override._redArg x_1 x_2 x_3 x_4 x_5 x_6 x_7 x_8;
-      dec x_8;
-      dec x_7;
-      dec x_6;
-      dec x_5;
-      dec x_4;
-      ret x_9
-[Compiler.IR] [result]
     def Exp.casesOn._override (x_1 : ◾) (x_2 : tobj) (x_3 : tobj) (x_4 : tobj) (x_5 : @& tobj) (x_6 : @& tobj) (x_7 : @& tobj) (x_8 : @& tobj) (x_9 : @& tobj) : tobj :=
       case x_2 : tobj of
       Exp.var._impl →
@@ -206,6 +189,14 @@
         dec x_3;
         inc x_9;
         ret x_9
+    def Exp.casesOn._override._redArg._boxed (x_1 : tobj) (x_2 : tobj) (x_3 : tobj) (x_4 : tobj) (x_5 : tobj) (x_6 : tobj) (x_7 : tobj) (x_8 : tobj) : tobj :=
+      let x_9 : tobj := Exp.casesOn._override._redArg x_1 x_2 x_3 x_4 x_5 x_6 x_7 x_8;
+      dec x_8;
+      dec x_7;
+      dec x_6;
+      dec x_5;
+      dec x_4;
+      ret x_9
     def Exp.casesOn._override._boxed (x_1 : tobj) (x_2 : tobj) (x_3 : tobj) (x_4 : tobj) (x_5 : tobj) (x_6 : tobj) (x_7 : tobj) (x_8 : tobj) (x_9 : tobj) : tobj :=
       let x_10 : tobj := Exp.casesOn._override x_1 x_2 x_3 x_4 x_5 x_6 x_7 x_8 x_9;
       dec x_9;
@@ -219,16 +210,32 @@
       let x_2 : u64 := UInt32.toUInt64 x_1;
       let x_3 : u64 := 1000;
       let x_4 : u64 := UInt64.add x_2 x_3;
-      let x_5 : obj := ctor_0.0.12[Exp.var._impl];
+      let x_5 : tobj := ctor_0.0.12[Exp.var._impl];
       sset x_5[0, 0] : u64 := x_4;
       sset x_5[0, 8] : u32 := x_1;
       ret x_5
-    def Exp.var._override._boxed (x_1 : tobj) : tobj :=
-      let x_2 : u32 := unbox x_1;
-      dec x_1;
-      let x_3 : tobj := Exp.var._override x_2;
-      ret x_3
-[Compiler.IR] [result]
+    def Exp.app._override (x_1 : tobj) (x_2 : tobj) : tobj :=
+      let x_3 : u64 := Exp.hash._override x_1;
+      let x_4 : u64 := Exp.hash._override x_2;
+      let x_5 : u64 := mixHash x_3 x_4;
+      let x_6 : tobj := ctor_1.0.8[Exp.app._impl] x_1 x_2;
+      sset x_6[2, 0] : u64 := x_5;
+      ret x_6
+    def Exp.a1._override : tobj :=
+      let x_1 : tobj := ctor_2[Exp.a1._impl];
+      ret x_1
+    def Exp.a2._override : tobj :=
+      let x_1 : tobj := ctor_3[Exp.a2._impl];
+      ret x_1
+    def Exp.a3._override : tobj :=
+      let x_1 : tobj := ctor_4[Exp.a3._impl];
+      ret x_1
+    def Exp.a4._override : tobj :=
+      let x_1 : tobj := ctor_5[Exp.a4._impl];
+      ret x_1
+    def Exp.a5._override : tobj :=
+      let x_1 : tobj := ctor_6[Exp.a5._impl];
+      ret x_1
     def Exp.hash._override (x_1 : @& tobj) : u64 :=
       case x_1 : tobj of
       Exp.var._impl →
@@ -240,46 +247,23 @@
       default →
         let x_4 : u64 := 42;
         ret x_4
-    def Exp.hash._override._boxed (x_1 : tobj) : obj :=
+    def Exp.var._override._boxed (x_1 : tobj) : tobj :=
+      let x_2 : u32 := unbox x_1;
+      dec x_1;
+      let x_3 : tobj := Exp.var._override x_2;
+      ret x_3
+    def Exp.hash._override._boxed (x_1 : tobj) : tobj :=
       let x_2 : u64 := Exp.hash._override x_1;
       dec x_1;
-      let x_3 : obj := box x_2;
+      let x_3 : tobj := box x_2;
       ret x_3
-[Compiler.IR] [result]
-    def Exp.app._override (x_1 : tobj) (x_2 : tobj) : tobj :=
-      let x_3 : u64 := Exp.hash._override x_1;
-      let x_4 : u64 := Exp.hash._override x_2;
-      let x_5 : u64 := mixHash x_3 x_4;
-      let x_6 : obj := ctor_1.0.8[Exp.app._impl] x_1 x_2;
-      sset x_6[2, 0] : u64 := x_5;
-      ret x_6
-[Compiler.IR] [result]
-    def Exp.a1._override : tobj :=
-      let x_1 : tagged := ctor_2[Exp.a1._impl];
-      ret x_1
-[Compiler.IR] [result]
-    def Exp.a2._override : tobj :=
-      let x_1 : tagged := ctor_3[Exp.a2._impl];
-      ret x_1
-[Compiler.IR] [result]
-    def Exp.a3._override : tobj :=
-      let x_1 : tagged := ctor_4[Exp.a3._impl];
-      ret x_1
-[Compiler.IR] [result]
-    def Exp.a4._override : tobj :=
-      let x_1 : tagged := ctor_5[Exp.a4._impl];
-      ret x_1
-[Compiler.IR] [result]
-    def Exp.a5._override : tobj :=
-      let x_1 : tagged := ctor_6[Exp.a5._impl];
-      ret x_1
 [Compiler.IR] [result]
     def f._closed_0 : tobj :=
       let x_1 : u32 := 10;
       let x_2 : tobj := Exp.var._override x_1;
       ret x_2
     def f._closed_1 : tobj :=
-      let x_1 : tagged := ctor_5[Exp.a4._impl];
+      let x_1 : tobj := ctor_5[Exp.a4._impl];
       let x_2 : tobj := f._closed_0;
       let x_3 : tobj := Exp.app._override x_2 x_1;
       ret x_3
@@ -303,7 +287,7 @@
     def g._boxed (x_1 : tobj) : tagged :=
       let x_2 : u8 := g x_1;
       dec x_1;
-      let x_3 : tagged := box x_2;
+      let x_3 : tobj := box x_2;
       ret x_3
 [Compiler.IR] [result]
     def hash' (x_1 : @& tobj) : tobj :=

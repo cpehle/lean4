@@ -11,6 +11,7 @@ public import Lean.Class
 public import Lean.ReducibilityAttrs
 public import Lean.Util.MonadBacktrack
 public import Lean.Compiler.InlineAttrs
+public import Lean.Compiler.StructAttr
 public import Lean.Meta.TransparencyMode
 import Init.Data.Range.Polymorphic.Iterators
 
