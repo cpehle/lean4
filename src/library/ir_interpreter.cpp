@@ -49,7 +49,6 @@ functions, which have a (relatively) homogeneous ABI that we can use without run
 #include "library/init_attribute.h"
 #include "util/nat.h"
 #include "util/option_declarations.h"
-#include "util/name_hash_map.h"
 
 #ifndef LEAN_DEFAULT_INTERPRETER_PREFER_NATIVE
 #define LEAN_DEFAULT_INTERPRETER_PREFER_NATIVE true
@@ -63,10 +62,21 @@ typedef object_ref lit_val;
 typedef object_ref ctor_info;
 
 type to_type(object * obj) {
-    if (!is_scalar(obj)) throw exception("unsupported IRType");
-    else return static_cast<type>(unbox(obj));
+    if (!is_scalar(obj)) {
+        // Handle non-scalar types (struct and union)
+        unsigned tag = cnstr_tag(obj);
+        if (tag == 10) { // IRType.struct
+            return type::Struct;
+        } else if (tag == 11) { // IRType.union
+            return type::Union;
+        }
+        throw exception("unsupported IRType");
+    } else {
+        return static_cast<type>(unbox(obj));
+    }
 }
 type cnstr_get_type(object_ref const & o, unsigned i) { return to_type(cnstr_get(o.raw(), i)); }
+object * cnstr_get_type_obj(object_ref const & o, unsigned i) { return cnstr_get(o.raw(), i); }
 
 bool arg_is_irrelevant(arg const & a) { return is_scalar(a.raw()); }
 var_id const & arg_var_id(arg const & a) { lean_assert(!arg_is_irrelevant(a)); return cnstr_get_ref_t<var_id>(a, 0); }
@@ -180,56 +190,37 @@ decl_kind decl_tag(decl const & a) { return is_scalar(a.raw()) ? static_cast<dec
 fun_id const & decl_fun_id(decl const & b) { return cnstr_get_ref_t<fun_id>(b, 0); }
 array_ref<param> const & decl_params(decl const & b) { return cnstr_get_ref_t<array_ref<param>>(b, 1); }
 type decl_type(decl const & b) { return cnstr_get_type(b, 2); }
-fn_body const & decl_fun_body(decl const & b) {
-    if (decl_tag(b) != decl_kind::Fun) {
-        throw exception(sstream() << "(interpreter) IR of declaration '" << decl_fun_id(b) << "' not available; this may point to a missing `meta` check in a metaprogram");
-    }
-    return cnstr_get_ref_t<fn_body>(b, 3);
-}
+fn_body const & decl_fun_body(decl const & b) { lean_assert(decl_tag(b) == decl_kind::Fun); return cnstr_get_ref_t<fn_body>(b, 3); }
 
 extern "C" object * lean_ir_find_env_decl(object * env, object * n);
 option_ref<decl> find_ir_decl(elab_environment const & env, name const & n) {
     return option_ref<decl>(lean_ir_find_env_decl(env.to_obj_arg(), n.to_obj_arg()));
 }
 
-extern "C" object * lean_ir_find_env_decl_boxed(object * env, object * n);
-option_ref<decl> find_ir_decl_boxed(elab_environment const & env, name const & n) {
-    return option_ref<decl>(lean_ir_find_env_decl_boxed(env.to_obj_arg(), n.to_obj_arg()));
-}
-
 extern "C" double lean_float_of_nat(lean_obj_arg a);
 extern "C" float lean_float32_of_nat(lean_obj_arg a);
 
+static string_ref * g_mangle_prefix = nullptr;
+static string_ref * g_boxed_suffix = nullptr;
+static string_ref * g_boxed_mangled_suffix = nullptr;
 static name * g_interpreter_prefer_native = nullptr;
-DEBUG_CODE(static name * g_interpreter_step = nullptr;)
-DEBUG_CODE(static name * g_interpreter_call = nullptr;)
 
 // constants (lacking native declarations) initialized by `lean_run_init`
-// We can assume this variable is never written to and read from in parallel; see `enableInitializersExecution`.
-static name_hash_map<object *> * g_init_globals;
+static name_map<object *> * g_init_globals;
 
 // reuse the compiler's name mangling to compute native symbol names
-/* getSymbolStem (env : Environment) (fn : Name) :  String */
-extern "C" obj_res lean_get_symbol_stem(obj_arg env, obj_arg fn);
-string_ref get_symbol_stem(elab_environment const & env, name const & fn) {
-    return string_ref(lean_get_symbol_stem(env.to_obj_arg(), fn.to_obj_arg()));
-}
-
-extern "C" obj_res lean_mk_mangled_boxed_name(obj_arg str);
-
-string_ref mk_mangled_boxed_name(string_ref const & str) {
-    return string_ref(lean_mk_mangled_boxed_name(str.to_obj_arg()));
+extern "C" object * lean_name_mangle(object * n, object * pre);
+string_ref name_mangle(name const & n, string_ref const & pre) {
+    return string_ref(lean_name_mangle(n.to_obj_arg(), pre.to_obj_arg()));
 }
 
 extern "C" object * lean_ir_format_fn_body_head(object * b);
 std::string format_fn_body_head(fn_body const & b) {
-    object_ref s(lean_ir_format_fn_body_head(b.to_obj_arg()));
-    return string_to_std(s.raw());
+    return string_to_std(lean_ir_format_fn_body_head(b.to_obj_arg()));
 }
 
 static bool type_is_scalar(type t) {
-    return t != type::Object && t != type::Tagged && t != type::TObject && t != type::Irrelevant
-            && t != type::Void;
+    return t != type::Object && t != type::Tagged && t != type::TObject && t != type::Irrelevant && t != type::Struct && t != type::Union;
 }
 
 extern "C" object* lean_get_regular_init_fn_name_for(object* env, object* fn);
@@ -283,9 +274,8 @@ object * box_t(value v, type t) {
     case type::Tagged:
     case type::TObject:
     case type::Irrelevant:
-    case type::Void:
+    case type::Struct:  // Structs are heap-allocated objects in the interpreter
         return v.m_obj;
-    case type::Struct:
     case type::Union:
         throw exception("not implemented yet");
     }
@@ -302,12 +292,11 @@ value unbox_t(object * o, type t) {
     case type::UInt64:  return unbox_uint64(o);
     case type::USize:   return unbox_size_t(o);
     case type::Irrelevant:
-    case type::Void:
     case type::Object:
     case type::Tagged:
     case type::TObject:
+    case type::Struct:  // Structs don't need unboxing - they're already objects
         break;
-    case type::Struct:
     case type::Union:
         throw exception("not implemented yet");
     }
@@ -374,14 +363,17 @@ struct native_symbol_cache_entry {
 
 // Caches native symbol lookup successes _and_ failures; we assume no native code is loaded or
 // unloaded after the interpreter is first invoked, so this can be a global cache.
-name_hash_map<native_symbol_cache_entry> * g_native_symbol_cache;
-std::shared_mutex * g_native_symbol_cache_mutex;
+name_map<native_symbol_cache_entry> * g_native_symbol_cache;
+// could be `shared_mutex` with C++17
+std::shared_timed_mutex * g_native_symbol_cache_mutex;
 
 class interpreter {
     // stack of IR variable slots
     std::vector<value> m_arg_stack;
     // stack of join points
     std::vector<fn_body const *> m_jp_stack;
+    // Map from struct object pointers to their type objects for proper field projection
+    std::unordered_map<object*, object*> m_struct_types;
     struct frame {
         name m_fn;
         // base pointers into the stack above
@@ -400,7 +392,7 @@ class interpreter {
       value m_val;
     };
     // caches values of nullary functions ("constants")
-    name_hash_map<constant_cache_entry> m_constant_cache;
+    name_map<constant_cache_entry> m_constant_cache;
     struct symbol_cache_entry {
         // looking up IR from .oleans is slow enough to warrant its own cache; but as local IR can
         // be backtracked, this cache needs to be local as well.
@@ -408,7 +400,7 @@ class interpreter {
         native_symbol_cache_entry m_native;
     };
     // caches symbol lookup successes _and_ failures
-    name_hash_map<symbol_cache_entry> m_symbol_cache;
+    name_map<symbol_cache_entry> m_symbol_cache;
 
     /** \brief Get current stack frame */
     inline frame & get_frame() {
@@ -424,6 +416,16 @@ class interpreter {
             m_arg_stack.resize(i + 1);
         }
         return m_arg_stack[i];
+    }
+
+    inline static bool is_struct_ir_type_obj(object * type_obj) {
+        return type_obj != nullptr && !is_scalar(type_obj) && cnstr_tag(type_obj) == 10; // IRType.struct
+    }
+
+    inline void erase_struct_type_if_dying(object * o) {
+        if (!is_scalar(o) && is_exclusive(o)) {
+            m_struct_types.erase(o);
+        }
     }
 
 public:
@@ -448,6 +450,129 @@ private:
         return arg_is_irrelevant(a) ? box(0) : var(arg_var_id(a));
     }
 
+    /** \brief Allocate struct object with proper field layout based on struct type info */
+    object * alloc_struct(ctor_info const & i, array_ref<arg> const & args, object * type_obj) {
+        lean_assert(!is_scalar(type_obj));
+        lean_assert(cnstr_tag(type_obj) == 10); // Must be IRType.struct
+        
+        // Extract the types array from the struct type (field 1 of IRType.struct)
+        object * types_array = cnstr_get(type_obj, 1);
+        size_t num_fields = array_size(types_array);
+        
+        size_t tag = ctor_info_tag(i).get_small_value();
+        
+        // Calculate the actual size needed for the struct based on field types
+        // For structs, we use a custom layout with fields in declaration order
+        size_t total_size = sizeof(lean_object);  // Start with header size
+        for (size_t i = 0; i < num_fields; i++) {
+            object * field_type_obj = array_get(types_array, i);
+            type field_type = to_type(field_type_obj);
+            switch (field_type) {
+                case type::Float:
+                    total_size += sizeof(double);
+                    break;
+                case type::Float32:
+                    total_size += sizeof(float);
+                    break;
+                case type::UInt8:
+                    total_size += 1;
+                    break;
+                case type::UInt16:
+                    total_size += 2;
+                    break;
+                case type::UInt32:
+                    total_size += 4;
+                    break;
+                case type::UInt64:
+                    total_size += 8;
+                    break;
+                case type::USize:
+                    total_size += sizeof(size_t);
+                    break;
+                case type::Object:
+                case type::Tagged:
+                case type::TObject:
+                case type::Struct:
+                    total_size += sizeof(void*);
+                    break;
+                default:
+                    total_size += sizeof(void*);
+                    break;
+            }
+        }
+        
+        // Allocate raw memory for the struct with custom layout
+        object *o = (object*)lean_alloc_small_object(total_size);
+        lean_set_st_header(o, tag, 0);  // Set header with tag and 0 for other field
+        
+        // For structs, fields are laid out in declaration order
+        // Start after the header
+        uint8_t* data_ptr = (uint8_t*)o + sizeof(lean_object);
+        size_t current_offset = 0;
+        
+        for (size_t i = 0; i < args.size() && i < num_fields; i++) {
+            value v = eval_arg(args[i]);
+            object * field_type_obj = array_get(types_array, i);
+            type field_type = to_type(field_type_obj);
+            
+            switch (field_type) {
+                case type::Float:
+                    *((double*)(data_ptr + current_offset)) = v.m_float;
+                    current_offset += sizeof(double);
+                    break;
+                case type::Float32:
+                    *((float*)(data_ptr + current_offset)) = v.m_float32;
+                    current_offset += sizeof(float);
+                    break;
+                case type::UInt8:
+                    *((uint8_t*)(data_ptr + current_offset)) = v.m_num;
+                    current_offset += 1;
+                    break;
+                case type::UInt16:
+                    *((uint16_t*)(data_ptr + current_offset)) = v.m_num;
+                    current_offset += 2;
+                    break;
+                case type::UInt32:
+                    *((uint32_t*)(data_ptr + current_offset)) = v.m_num;
+                    current_offset += 4;
+                    break;
+                case type::UInt64:
+                    *((uint64_t*)(data_ptr + current_offset)) = v.m_num;
+                    current_offset += 8;
+                    break;
+                case type::USize:
+                    *((size_t*)(data_ptr + current_offset)) = v.m_num;
+                    current_offset += sizeof(size_t);
+                    break;
+                case type::Object:
+                case type::Tagged:
+                case type::TObject:
+                    *((object**)(data_ptr + current_offset)) = v.m_obj;
+                    current_offset += sizeof(void*);
+                    break;
+                case type::Struct:
+                    // Nested struct - store pointer and register it
+                    *((object**)(data_ptr + current_offset)) = v.m_obj;
+                    // If this field is a struct, register it too
+                    if (!is_scalar(field_type_obj) && cnstr_tag(field_type_obj) == 10) {
+                        m_struct_types[v.m_obj] = field_type_obj;
+                    }
+                    current_offset += sizeof(void*);
+                    break;
+                default:
+                    // Default to object pointer
+                    *((object**)(data_ptr + current_offset)) = v.m_obj;
+                    current_offset += sizeof(void*);
+                    break;
+            }
+        }
+        
+        // Store the struct type for later use in projections
+        m_struct_types[o] = type_obj;
+        
+        return o;
+    }
+    
     /** \brief Allocate constructor object with given tag and arguments */
     object * alloc_ctor(ctor_info const & i, array_ref<arg> const & args) {
         size_t tag = ctor_info_tag(i).get_small_value();
@@ -482,14 +607,20 @@ private:
         return cls;
     }
 
-    value eval_expr(expr const & e, type t) {
+    value eval_expr(expr const & e, type t, object * type_obj = nullptr) {
         switch (expr_tag(e)) {
             case expr_kind::Ctor:
-                return value { alloc_ctor(expr_ctor_info(e), expr_ctor_args(e)) };
+                if (t == type::Struct && is_struct_ir_type_obj(type_obj)) {
+                    // For struct types, use the type information to correctly handle fields
+                    return value { alloc_struct(expr_ctor_info(e), expr_ctor_args(e), type_obj) };
+                } else {
+                    return value { alloc_ctor(expr_ctor_info(e), expr_ctor_args(e)) };
+                }
             case expr_kind::Reset: { // release fields if unique reference in preparation for `Reuse` below
                 object * o = var(expr_reset_obj(e)).m_obj;
                 if (is_exclusive(o)) {
                     for (size_t i = 0; i < expr_reset_num_objs(e).get_small_value(); i++) {
+                        erase_struct_type_if_dying(cnstr_get(o, i));
                         cnstr_release(o, i);
                     }
                     return o;
@@ -503,8 +634,14 @@ private:
                 // check if `Reset` above had a unique reference it consumed
                 if (is_scalar(o)) {
                     // fall back to regular allocation
-                    return alloc_ctor(expr_reuse_ctor(e), expr_reuse_args(e));
+                    if (t == type::Struct && is_struct_ir_type_obj(type_obj)) {
+                        return alloc_struct(expr_reuse_ctor(e), expr_reuse_args(e), type_obj);
+                    } else {
+                        return alloc_ctor(expr_reuse_ctor(e), expr_reuse_args(e));
+                    }
                 } else {
+                    // This location is being repurposed; clear stale layout metadata first.
+                    m_struct_types.erase(o);
                     // create new constructor object in-place
                     if (expr_reuse_update_header(e)) {
                         cnstr_set_tag(o, ctor_info_tag(expr_reuse_ctor(e)).get_small_value());
@@ -512,33 +649,205 @@ private:
                     for (size_t i = 0; i < expr_reuse_args(e).size(); i++) {
                         cnstr_set(o, i, eval_arg(expr_reuse_args(e)[i]).m_obj);
                     }
+                    if (t == type::Struct && is_struct_ir_type_obj(type_obj)) {
+                        m_struct_types[o] = type_obj;
+                    }
                     return o;
                 }
             }
-            case expr_kind::Proj: // object field access
-                return cnstr_get(var(expr_proj_obj(e)).m_obj, expr_proj_idx(e).get_small_value());
-            case expr_kind::UProj: // USize field access
-                return cnstr_get_usize(var(expr_uproj_obj(e)).m_obj, expr_uproj_idx(e).get_small_value());
+            case expr_kind::Proj: { // object field access
+                object * o = var(expr_proj_obj(e)).m_obj;
+                size_t idx = expr_proj_idx(e).get_small_value();
+                
+                // Check if this is a struct with custom layout
+                if (!m_struct_types.empty()) {
+                    auto struct_type_it = m_struct_types.find(o);
+                    if (struct_type_it != m_struct_types.end()) {
+                        // This is a struct - read from custom layout
+                        object * struct_type = struct_type_it->second;
+                        object * types_array = cnstr_get(struct_type, 1);
+                        
+                        // Calculate offset to the field
+                        uint8_t* data_ptr = (uint8_t*)o + sizeof(lean_object);
+                        size_t offset = 0;
+                        
+                        for (size_t i = 0; i < idx && i < array_size(types_array); i++) {
+                            object * field_type_obj = array_get(types_array, i);
+                            type field_type = to_type(field_type_obj);
+                            
+                            // Add size of this field to offset
+                            switch (field_type) {
+                                case type::Float: offset += sizeof(double); break;
+                                case type::Float32: offset += sizeof(float); break;
+                                case type::UInt8: offset += 1; break;
+                                case type::UInt16: offset += 2; break;
+                                case type::UInt32: offset += 4; break;
+                                case type::UInt64: offset += 8; break;
+                                case type::USize: offset += sizeof(size_t); break;
+                                case type::Object:
+                                case type::Tagged:
+                                case type::TObject:
+                                case type::Struct:
+                                    offset += sizeof(void*); break;
+                                default:
+                                    offset += sizeof(void*); break;
+                            }
+                        }
+                        
+                        // Get the field value from the calculated offset
+                        object * field_value = *((object**)(data_ptr + offset));
+                        
+                        // Check if this field is also a struct and register it
+                        if (idx < array_size(types_array)) {
+                            object * field_type_obj = array_get(types_array, idx);
+                            type field_type = to_type(field_type_obj);
+                            if (field_type == type::Struct && !is_scalar(field_type_obj)) {
+                                m_struct_types[field_value] = field_type_obj;
+                            }
+                        }
+                        
+                        return field_value;
+                    }
+                }
+                
+                // Not a struct - use regular constructor access
+                return cnstr_get(o, idx);
+            }
+            case expr_kind::UProj: { // USize field access
+                object * o = var(expr_uproj_obj(e)).m_obj;
+                size_t idx = expr_uproj_idx(e).get_small_value();
+                
+                // Check if this is a struct with custom layout
+                if (!m_struct_types.empty()) {
+                    auto struct_type_it = m_struct_types.find(o);
+                    if (struct_type_it != m_struct_types.end()) {
+                        // This is a struct - read from custom layout
+                        object * struct_type = struct_type_it->second;
+                        object * types_array = cnstr_get(struct_type, 1);
+                        
+                        // Calculate offset to the field
+                        uint8_t* data_ptr = (uint8_t*)o + sizeof(lean_object);
+                        size_t offset = 0;
+                        
+                        for (size_t i = 0; i < idx && i < array_size(types_array); i++) {
+                            object * field_type_obj = array_get(types_array, i);
+                            type field_type = to_type(field_type_obj);
+                            
+                            // Add size of this field to offset
+                            switch (field_type) {
+                                case type::Float: offset += sizeof(double); break;
+                                case type::Float32: offset += sizeof(float); break;
+                                case type::UInt8: offset += 1; break;
+                                case type::UInt16: offset += 2; break;
+                                case type::UInt32: offset += 4; break;
+                                case type::UInt64: offset += 8; break;
+                                case type::USize: offset += sizeof(size_t); break;
+                                case type::Object:
+                                case type::Tagged:
+                                case type::TObject:
+                                case type::Struct:
+                                    offset += sizeof(void*); break;
+                                default:
+                                    offset += sizeof(void*); break;
+                            }
+                        }
+                        
+                        // Read the USize value from the calculated offset
+                        return *((size_t*)(data_ptr + offset));
+                    }
+                }
+                
+                // Not a struct - use regular constructor access
+                return cnstr_get_usize(o, idx);
+            }
             case expr_kind::SProj: { // other unboxed field access
-                size_t offset = expr_sproj_idx(e).get_small_value() * sizeof(void *) +
-                                expr_sproj_offset(e).get_small_value();
                 object * o = var(expr_sproj_obj(e)).m_obj;
-                switch (t) {
-                    case type::Float: return value::from_float(cnstr_get_float(o, offset));
-                    case type::Float32: return value::from_float32(cnstr_get_float32(o, offset));
-                    case type::UInt8: return cnstr_get_uint8(o, offset);
-                    case type::UInt16: return cnstr_get_uint16(o, offset);
-                    case type::UInt32: return cnstr_get_uint32(o, offset);
-                    case type::UInt64: return cnstr_get_uint64(o, offset);
-                    case type::USize:
-                    case type::Irrelevant:
-                    case type::Void:
-                    case type::Object:
-                    case type::Tagged:
-                    case type::TObject:
-                    case type::Struct:
-                    case type::Union:
-                        break;
+                
+                // Only check for struct if we have any structs at all (optimization)
+                if (!m_struct_types.empty()) {
+                    auto struct_type_it = m_struct_types.find(o);
+                    if (struct_type_it != m_struct_types.end()) {
+                        // This is a struct with custom layout
+                        size_t field_idx = expr_sproj_offset(e).get_small_value();
+                        object * struct_type = struct_type_it->second;
+                        object * types_array = cnstr_get(struct_type, 1);
+                        
+                        // Calculate byte offset for the field in declaration order
+                        // Start after the header
+                        uint8_t* data_ptr = (uint8_t*)o + sizeof(lean_object);
+                        size_t offset = 0;
+                        
+                        for (size_t i = 0; i < field_idx && i < array_size(types_array); i++) {
+                            object * field_type_obj = array_get(types_array, i);
+                            type field_type = to_type(field_type_obj);
+                            
+                            // Add size of this field to offset
+                            switch (field_type) {
+                                case type::Float: offset += sizeof(double); break;
+                                case type::Float32: offset += sizeof(float); break;
+                                case type::UInt8: offset += 1; break;
+                                case type::UInt16: offset += 2; break;
+                                case type::UInt32: offset += 4; break;
+                                case type::UInt64: offset += 8; break;
+                                case type::USize: offset += sizeof(size_t); break;
+                                case type::Object:
+                                case type::Tagged:
+                                case type::TObject:
+                                case type::Struct:
+                                    offset += sizeof(void*); break;
+                                default:
+                                    offset += sizeof(void*); break;
+                            }
+                        }
+                        
+                        // Read the value from the calculated offset
+                        switch (t) {
+                            case type::Float: 
+                                return value::from_float(*((double*)(data_ptr + offset)));
+                            case type::Float32: 
+                                return value::from_float32(*((float*)(data_ptr + offset)));
+                            case type::UInt8: 
+                                return *((uint8_t*)(data_ptr + offset));
+                            case type::UInt16: 
+                                return *((uint16_t*)(data_ptr + offset));
+                            case type::UInt32: 
+                                return *((uint32_t*)(data_ptr + offset));
+                            case type::UInt64: 
+                                return *((uint64_t*)(data_ptr + offset));
+                            default:
+                                throw exception("invalid scalar type in SProj for struct");
+                        }
+                    } else {
+                        // Not a struct - use the regular offset calculation with cnstr_get functions
+                        size_t offset = expr_sproj_idx(e).get_small_value() * sizeof(void *) +
+                                       expr_sproj_offset(e).get_small_value();
+                        
+                        switch (t) {
+                            case type::Float: return value::from_float(cnstr_get_float(o, offset));
+                            case type::Float32: return value::from_float32(cnstr_get_float32(o, offset));
+                            case type::UInt8: return cnstr_get_uint8(o, offset);
+                            case type::UInt16: return cnstr_get_uint16(o, offset);
+                            case type::UInt32: return cnstr_get_uint32(o, offset);
+                            case type::UInt64: return cnstr_get_uint64(o, offset);
+                            default:
+                                break;
+                        }
+                    }
+                } else {
+                    // No structs in the program - use the regular offset calculation
+                    size_t offset = expr_sproj_idx(e).get_small_value() * sizeof(void *) +
+                                   expr_sproj_offset(e).get_small_value();
+                    
+                    switch (t) {
+                        case type::Float: return value::from_float(cnstr_get_float(o, offset));
+                        case type::Float32: return value::from_float32(cnstr_get_float32(o, offset));
+                        case type::UInt8: return cnstr_get_uint8(o, offset);
+                        case type::UInt16: return cnstr_get_uint16(o, offset);
+                        case type::UInt32: return cnstr_get_uint32(o, offset);
+                        case type::UInt64: return cnstr_get_uint64(o, offset);
+                        default:
+                            break;
+                    }
                 }
                 throw exception("invalid instruction");
             }
@@ -602,12 +911,10 @@ private:
                             case type::Object:
                             case type::Tagged:
                             case type::TObject:
+                            case type::Struct:  // Treat structs as objects for literals
                                 return n.to_obj_arg();
                             case type::Irrelevant:
-                            case type::Void:
-                                break;
                             case type::Union:
-                            case type::Struct:
                                 break;
                         }
                         throw exception("invalid instruction");
@@ -644,7 +951,7 @@ private:
         // make reference reassignable...
         std::reference_wrapper<fn_body const> b(b0);
         while (true) {
-            DEBUG_CODE(lean_trace(*g_interpreter_step,
+            DEBUG_CODE(lean_trace(name({"interpreter", "step"}),
                                   tout() << std::string(m_call_stack.size(), ' ') << format_fn_body_head(b) << "\n";);)
             switch (fn_body_tag(b)) {
                 case fn_body_kind::VDecl: { // variable declaration
@@ -670,11 +977,12 @@ private:
                         check_system();
                         break;
                     }
-                    value v = eval_expr(fn_body_vdecl_expr(b), fn_body_vdecl_type(b));
+                    object * type_obj = cnstr_get_type_obj(b, 1); // Get raw type object
+                    value v = eval_expr(fn_body_vdecl_expr(b), fn_body_vdecl_type(b), type_obj);
                     // NOTE: `var` must be called *after* `eval_expr` because the stack may get resized and invalidate
                     // the pointer
                     var(fn_body_vdecl_var(b)) = v;
-                    DEBUG_CODE(lean_trace(*g_interpreter_step,
+                    DEBUG_CODE(lean_trace(name({"interpreter", "step"}),
                                           tout() << std::string(m_call_stack.size(), ' ') << "=> x_";
                                           tout() << fn_body_vdecl_var(b).get_small_value() << " = ";
                                           print_value(tout(), var(fn_body_vdecl_var(b)), fn_body_vdecl_type(b));
@@ -727,7 +1035,6 @@ private:
                         case type::UInt64: cnstr_set_uint64(o, offset, v.m_num); break;
                         case type::USize:
                         case type::Irrelevant:
-                        case type::Void:
                         case type::Object:
                         case type::Tagged:
                         case type::TObject:
@@ -744,16 +1051,23 @@ private:
                     break;
                 case fn_body_kind::Dec: { // decrement reference counter
                     size_t n = fn_body_dec_val(b).get_small_value();
+                    object * o = var(fn_body_dec_var(b)).m_obj;
                     for (size_t i = 0; i < n; i++) {
-                        dec(var(fn_body_dec_var(b)).m_obj);
+                        erase_struct_type_if_dying(o);
+                        dec(o);
                     }
                     b = fn_body_dec_cont(b);
                     break;
                 }
-                case fn_body_kind::Del: // delete object of unique reference
-                    lean_free_object(var(fn_body_del_var(b)).m_obj);
+                case fn_body_kind::Del: { // delete object of unique reference
+                    object * o = var(fn_body_del_var(b)).m_obj;
+                    if (!is_scalar(o)) {
+                        m_struct_types.erase(o);
+                    }
+                    lean_free_object(o);
                     b = fn_body_del_cont(b);
                     break;
+                }
                 case fn_body_kind::Case: { // branch according to constructor tag
                     array_ref<alt_core> const & alts = fn_body_case_alts(b);
                     unsigned tag;
@@ -799,7 +1113,7 @@ private:
     // specify argument base pointer explicitly because we've usually already pushed some function arguments
     void push_frame(decl const & d, size_t arg_bp) {
         DEBUG_CODE({
-            lean_trace(*g_interpreter_call,
+            lean_trace(name({"interpreter", "call"}),
                        tout() << std::string(m_call_stack.size(), ' ')
                               << decl_fun_id(d);
                        for (size_t i = arg_bp; i < m_arg_stack.size(); i++) {
@@ -815,7 +1129,7 @@ private:
         m_jp_stack.resize(get_frame().m_jp_bp);
         m_call_stack.pop_back();
         DEBUG_CODE({
-            lean_trace(*g_interpreter_call,
+            lean_trace(name({"interpreter", "call"}),
                        tout() << std::string(m_call_stack.size(), ' ')
                               << "=> ";
                        print_value(tout(), r, t);
@@ -825,29 +1139,26 @@ private:
 
     /** \brief Return cached lookup result for given unmangled function name in the current binary. */
     symbol_cache_entry lookup_symbol(name const & fn) {
-        auto e = m_symbol_cache.find(fn);
-        if (e != m_symbol_cache.end()) {
-            return e->second;
+        if (symbol_cache_entry const * e = m_symbol_cache.find(fn)) {
+            return *e;
         }
-        std::shared_lock<std::shared_mutex> lock(*g_native_symbol_cache_mutex);
-        auto ne = g_native_symbol_cache->find(fn);
-        if (ne != g_native_symbol_cache->end()) {
-            symbol_cache_entry e_new { get_decl(fn), ne->second };
-            m_symbol_cache.insert({ fn, e_new });
+        std::shared_lock<std::shared_timed_mutex> lock(*g_native_symbol_cache_mutex);
+        if (native_symbol_cache_entry const * ne = g_native_symbol_cache->find(fn)) {
+            symbol_cache_entry e_new { get_decl(fn), *ne };
+            m_symbol_cache.insert(fn, e_new);
             return e_new;
         }
         lock.unlock();
-        std::unique_lock<std::shared_mutex> unique_lock(*g_native_symbol_cache_mutex);
-        ne = g_native_symbol_cache->find(fn);
-        if (ne != g_native_symbol_cache->end()) {
-            symbol_cache_entry e_new { get_decl(fn), ne->second };
-            m_symbol_cache.insert({ fn, e_new });
+        std::unique_lock<std::shared_timed_mutex> unique_lock(*g_native_symbol_cache_mutex);
+        if (native_symbol_cache_entry const * ne = g_native_symbol_cache->find(fn)) {
+            symbol_cache_entry e_new { get_decl(fn), *ne };
+            m_symbol_cache.insert(fn, e_new);
             return e_new;
         }
         symbol_cache_entry e_new { get_decl(fn), {nullptr, false} };
         if (m_prefer_native || decl_tag(e_new.m_decl) == decl_kind::Extern || has_init_attribute(m_env, fn)) {
-            string_ref mangled = get_symbol_stem(m_env, fn);
-            string_ref boxed_mangled = mk_mangled_boxed_name(mangled);
+            string_ref mangled = name_mangle(fn, *g_mangle_prefix);
+            string_ref boxed_mangled(string_append(mangled.to_obj_arg(), g_boxed_mangled_suffix->raw()));
             // check for boxed version first
             if (void *p_boxed = lookup_symbol_in_cur_exe(boxed_mangled.data())) {
                 e_new.m_native.m_addr = p_boxed;
@@ -863,8 +1174,8 @@ private:
                 }
             }
         }
-        g_native_symbol_cache->insert({ fn, e_new.m_native });
-        m_symbol_cache.insert({ fn, e_new });
+        g_native_symbol_cache->insert(fn, e_new.m_native);
+        m_symbol_cache.insert(fn, e_new);
         return e_new;
     }
 
@@ -879,19 +1190,15 @@ private:
 
     /** \brief Evaluate nullary function ("constant"). */
     value load(name const & fn, type t) {
-        auto cached_entry = m_constant_cache.find(fn);
-        if (cached_entry != m_constant_cache.end()) {
-            auto cached = cached_entry->second;
-            if (!cached.m_is_scalar) {
-                inc(cached.m_val.m_obj);
+        if (constant_cache_entry const * cached = m_constant_cache.find(fn)) {
+            if (!cached->m_is_scalar) {
+                inc(cached->m_val.m_obj);
             }
-            return cached.m_val;
+            return cached->m_val;
         }
-        auto o_entry = g_init_globals->find(fn);
-        if (o_entry != g_init_globals->end()) {
+        if (object * const * o = g_init_globals->find(fn)) {
             // persistent, so no `inc` needed
-            auto o = o_entry->second;
-            return type_is_scalar(t) ? unbox_t(o, t) : o;
+            return type_is_scalar(t) ? unbox_t(*o, t) : *o;
         }
 
         symbol_cache_entry e = lookup_symbol(fn);
@@ -911,9 +1218,8 @@ private:
                 case type::Tagged:
                 case type::TObject:
                 case type::Irrelevant:
-                case type::Void:
+                case type::Struct:  // Structs are objects in native constants  
                     return *static_cast<object **>(e.m_native.m_addr);
-                case type::Struct:
                 case type::Union:
                     throw exception("not implemented yet");
             }
@@ -925,16 +1231,13 @@ private:
             throw exception(sstream() << "cannot evaluate `[init]` declaration '" << fn << "' in the same module");
         }
         push_frame(e.m_decl, m_arg_stack.size());
-        // `Unreachable` can be from `mkDummyExternDecl`, which may mean that we failed to run the
-        // initializer, suggesting some incorrect `meta` phase setup. Let's make sure we give a
-        // better signal than a segfault in that case.
-        lean_always_assert(fn_body_tag(decl_fun_body(e.m_decl)) != fn_body_kind::Unreachable);
+        lean_always_assert(decl_tag(e.m_decl) == decl_kind::Fun);
         value r = eval_body(decl_fun_body(e.m_decl));
         pop_frame(r, decl_type(e.m_decl));
         if (!type_is_scalar(t)) {
             inc(r.m_obj);
         }
-        m_constant_cache.insert({ fn, constant_cache_entry { type_is_scalar(t), r } });
+        m_constant_cache.insert(fn, constant_cache_entry { type_is_scalar(t), r });
         return r;
     }
 
@@ -968,8 +1271,8 @@ private:
             }
         } else {
             if (decl_tag(e.m_decl) == decl_kind::Extern) {
-                string_ref mangled = get_symbol_stem(m_env, fn);
-                string_ref boxed_mangled = mk_mangled_boxed_name(mangled);
+                string_ref mangled = name_mangle(fn, *g_mangle_prefix);
+                string_ref boxed_mangled(string_append(mangled.to_obj_arg(), g_boxed_mangled_suffix->raw()));
                 throw exception(sstream() << "Could not find native implementation of external declaration '" << fn
                                           << "' (symbols '" << boxed_mangled.data() << "' or '" << mangled.data() << "').\n"
                                           << "For declarations from `Init`, `Std`, or `Lean`, you need to set `supportInterpreter := true` "
@@ -1056,12 +1359,11 @@ public:
     interpreter(interpreter const &) = delete;
 
     ~interpreter() {
-        for (auto& it: m_constant_cache) {
-            auto e = it.second;
+        for_each(m_constant_cache, [](name const &, constant_cache_entry const & e) {
             if (!e.m_is_scalar) {
                 dec(e.m_val.m_obj);
             }
-        }
+        });
     }
 
     /** A variant of `call` designed for external uses.
@@ -1083,7 +1385,7 @@ public:
             } else {
                 // `lookup_symbol` does not prefer the boxed version for interpreted functions, so check manually.
                 decl d = e.m_decl;
-                if (option_ref<decl> d_boxed = find_ir_decl_boxed(m_env, fn)) {
+                if (option_ref<decl> d_boxed = find_ir_decl(m_env, fn + *g_boxed_suffix)) {
                     d = *d_boxed.get();
                 }
                 r = mk_stub_closure(d, 0, nullptr);
@@ -1128,7 +1430,7 @@ public:
 
     object * run_init(name const & decl, name const & init_decl) {
         try {
-            object * args[] = {};
+            object * args[] = { io_mk_world() };
             object * r = call_boxed(init_decl, 1, args);
             if (io_result_is_ok(r)) {
                 object * o = io_result_get_value(r);
@@ -1138,7 +1440,7 @@ public:
                 if (e.m_native.m_addr) {
                     *((object **)e.m_native.m_addr) = o;
                 } else {
-                    g_init_globals->insert({ decl, o });
+                    g_init_globals->insert(decl, o);
                 }
                 return lean_io_result_mk_ok(box(0));
             } else {
@@ -1178,9 +1480,9 @@ uint32 run_main(elab_environment const & env, options const & opts, list_ref<str
 }
 
 /* runMain (env : Environment) (opts : Iptions) (args : List String) : BaseIO UInt32 */
-extern "C" LEAN_EXPORT uint32_t lean_run_main(b_obj_arg env, b_obj_arg opts, b_obj_arg args) {
+extern "C" LEAN_EXPORT obj_res lean_run_main(b_obj_arg env, b_obj_arg opts, b_obj_arg args, obj_arg) {
     uint32 ret = run_main(TO_REF(elab_environment, env), TO_REF(options, opts), TO_REF(list_ref<string_ref>, args));
-    return ret;
+    return io_result_mk_ok(box(ret));
 }
 
 extern "C" LEAN_EXPORT object * lean_eval_const(object * env, object * opts, object * c) {
@@ -1191,12 +1493,15 @@ extern "C" LEAN_EXPORT object * lean_eval_const(object * env, object * opts, obj
     }
 }
 
-/* runModInitCore (sym : @& String) : IO Bool */
-extern "C" LEAN_EXPORT obj_res lean_run_mod_init_core(b_obj_arg  sym) {
-    if (void * init = lookup_symbol_in_cur_exe(string_cstr(sym))) {
-        auto init_fn = reinterpret_cast<object *(*)(uint8_t)>(init);
+/* mkModuleInitializationFunctionName (moduleName : Name) : String */
+extern "C" obj_res lean_mk_module_initialization_function_name(obj_arg);
+
+extern "C" LEAN_EXPORT object * lean_run_mod_init(object * mod, object *) {
+    string_ref mangled = string_ref(lean_mk_module_initialization_function_name(mod));
+    if (void * init = lookup_symbol_in_cur_exe(mangled.data())) {
+        auto init_fn = reinterpret_cast<object *(*)(uint8_t, object *)>(init);
         uint8_t builtin = 0;
-        object * r = init_fn(builtin);
+        object * r = init_fn(builtin, io_mk_world());
         if (io_result_is_ok(r)) {
             dec_ref(r);
             return lean_io_result_mk_ok(box(true));
@@ -1216,27 +1521,31 @@ extern "C" LEAN_EXPORT object * lean_run_init(object * env, object * opts, objec
 }
 
 void initialize_ir_interpreter() {
+    ir::g_mangle_prefix = new string_ref("l_");
+    mark_persistent(ir::g_mangle_prefix->raw());
+    ir::g_boxed_suffix = new string_ref("_boxed");
+    mark_persistent(ir::g_boxed_suffix->raw());
+    ir::g_boxed_mangled_suffix = new string_ref("___boxed");
+    mark_persistent(ir::g_boxed_mangled_suffix->raw());
     ir::g_interpreter_prefer_native = new name({"interpreter", "prefer_native"});
-    ir::g_init_globals = new name_hash_map<object *>();
+    ir::g_init_globals = new name_map<object *>();
     register_bool_option(*ir::g_interpreter_prefer_native, LEAN_DEFAULT_INTERPRETER_PREFER_NATIVE, "(interpreter) whether to use precompiled code where available");
     DEBUG_CODE({
-        ir::g_interpreter_call = new name({"interpreter", "call"});
-        register_trace_class(*ir::g_interpreter_call);
-        ir::g_interpreter_step = new name({"interpreter", "step"});
-        register_trace_class(*ir::g_interpreter_step);
+        register_trace_class({"interpreter"});
+        register_trace_class({"interpreter", "call"});
+        register_trace_class({"interpreter", "step"});
     });
-    ir::g_native_symbol_cache = new name_hash_map<ir::native_symbol_cache_entry>();
-    ir::g_native_symbol_cache_mutex = new std::shared_mutex();
+    ir::g_native_symbol_cache = new name_map<ir::native_symbol_cache_entry>();
+    ir::g_native_symbol_cache_mutex = new std::shared_timed_mutex();
 }
 
 void finalize_ir_interpreter() {
     delete ir::g_native_symbol_cache_mutex;
     delete ir::g_native_symbol_cache;
-    DEBUG_CODE({
-        delete ir::g_interpreter_call;
-        delete ir::g_interpreter_step;
-    });
     delete ir::g_init_globals;
     delete ir::g_interpreter_prefer_native;
+    delete ir::g_boxed_mangled_suffix;
+    delete ir::g_boxed_suffix;
+    delete ir::g_mangle_prefix;
 }
 }
