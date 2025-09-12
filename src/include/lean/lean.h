@@ -619,6 +619,18 @@ static inline b_lean_obj_res lean_ctor_get(b_lean_obj_arg o, unsigned i) {
     return lean_ctor_obj_cptr(o)[i];
 }
 
+/* Borrowed variant for constructor field access - returns borrowed reference */
+static inline b_lean_obj_res lean_ctor_get_borrowed(b_lean_obj_arg o, unsigned i) {
+    assert(i < lean_ctor_num_objs(o));
+    return lean_ctor_obj_cptr(o)[i];
+}
+
+/* Borrowed projection operation */
+static inline b_lean_obj_res lean_proj_borrowed(b_lean_obj_arg o, unsigned i) {
+    assert(i < lean_ctor_num_objs(o));
+    return lean_ctor_obj_cptr(o)[i];
+}
+
 static inline void lean_ctor_set(b_lean_obj_arg o, unsigned i, lean_obj_arg v) {
     assert(i < lean_ctor_num_objs(o));
     lean_ctor_obj_cptr(o)[i] = v;
@@ -741,6 +753,12 @@ static inline size_t lean_closure_byte_size(lean_object * o) {
 static inline size_t lean_closure_data_byte_size(lean_object * o) {
     // Matches for closures.
     return lean_closure_byte_size(o);
+}
+
+/* Set closure argument without incrementing reference count (for borrowed captures) */
+static inline void lean_closure_set_borrowed(u_lean_obj_arg o, unsigned i, b_lean_obj_arg a) {
+    assert(i < lean_closure_num_fixed(o));
+    lean_to_closure(o)->m_objs[i] = a;
 }
 
 LEAN_EXPORT lean_object* lean_apply_1(lean_object* f, lean_object* a1);
