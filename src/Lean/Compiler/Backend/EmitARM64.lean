@@ -372,9 +372,21 @@ def emitDataSection (env : Environment) (decls : Array IR.Decl) : EmitM Unit := 
     | .fdecl name params retType _ _ =>
       if params.isEmpty && isClosedConstName env name then
         let mangledName := "_" ++ name.mangle
+        -- Add alignment before each global constant
+        match retType with
+        | .uint8 => emitLn "  .align 0  // byte alignment"
+        | .uint16 => emitLn "  .align 1  // halfword alignment"
+        | .uint32 | .float32 => emitLn "  .align 2  // word alignment"
+        | _ => emitLn "  .align 3  // doubleword alignment"
         emitLn s!"  .globl {mangledName}"
         emitLn s!"{mangledName}:"
-        emitLn "  .quad 0  // Initialized at startup"
+        -- Emit appropriate storage size based on return type
+        match retType with
+        | .uint8 => emitLn "  .byte 0  // uint8 initialized at startup"
+        | .uint16 => emitLn "  .short 0  // uint16 initialized at startup"
+        | .uint32 | .float32 => emitLn "  .long 0  // uint32/float32 initialized at startup"
+        | .uint64 | .usize | .float => emitLn "  .quad 0  // uint64/usize/float initialized at startup"
+        | _ => emitLn "  .quad 0  // Object initialized at startup"
     | _ => pure ()
   emitLn ""
   emitLn "  .text"
@@ -455,7 +467,18 @@ def emitInitFunction (env : Environment) (modName : Name) (decls : Array IR.Decl
         emitLn s!"  // Initialize {constName}"
         emitLn s!"  bl {initName}"
         emitLn s!"  adrp x8, {constName}@PAGE"
-        emitLn s!"  str x0, [x8, {constName}@PAGEOFF]"
+        -- Use appropriate store instruction based on type
+        match ty with
+        | .uint8 =>
+          emitLn s!"  add x8, x8, {constName}@PAGEOFF"
+          emitLn "  strb w0, [x8]"
+        | .uint16 =>
+          emitLn s!"  add x8, x8, {constName}@PAGEOFF"
+          emitLn "  strh w0, [x8]"
+        | .uint32 | .float32 =>
+          emitLn s!"  str w0, [x8, {constName}@PAGEOFF]"
+        | _ =>
+          emitLn s!"  str x0, [x8, {constName}@PAGEOFF]"
         if ty.isObj then
           emitLn "  // Mark persistent"
           emitLn s!"  adrp x8, {constName}@PAGE"

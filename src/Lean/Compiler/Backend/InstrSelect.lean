@@ -62,6 +62,8 @@ structure SelectState where
   nextLabel : Nat
   /-- Mapping from join point IDs to labels -/
   jpLabels : Std.TreeMap Index String (fun a b => compare a b)
+  /-- Mapping from join point IDs to their parameter variables (for phi resolution) -/
+  jpParams : Std.TreeMap Index (Array VarId) (fun a b => compare a b)
   /-- Environment for looking up declarations -/
   env : Environment
   /-- Function name for unique label generation -/
@@ -651,14 +653,22 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
       -- Load the global variable address
       let fnName ← getFunctionName f
       emit (Instr.comment s!"load global constant {fnName}")
-      -- Use adrp/ldr to load global variable on ARM64 macOS
+      -- Use adrp + appropriate load instruction based on type
       emit (Instr.adrp dstReg s!"{fnName}@PAGE")
-      -- Use byte load for scalars, full register load for objects
-      if dstType.isScalar then
-        -- ldrb uses base+offset addressing, construct the memory operand
+      match dstType with
+      | .uint8 =>
+        -- Load byte: ldrb wN, [base, offset]
         emit (Instr.add dstReg dstReg (.label s!"{fnName}@PAGEOFF"))
         emit (Instr.ldrb dstReg (.mem dstReg 0))
-      else
+      | .uint16 =>
+        -- Load halfword: ldrh wN, [base, offset]
+        emit (Instr.add dstReg dstReg (.label s!"{fnName}@PAGEOFF"))
+        emit (Instr.ldrh dstReg (.mem dstReg 0))
+      | .uint32 | .float32 =>
+        -- Load word (32-bit)
+        emit (Instr.ldr dstReg (.reg dstReg) s!", {fnName}@PAGEOFF")
+      | _ =>
+        -- Load doubleword (64-bit) - objects, uint64, usize, float
         emit (Instr.ldr dstReg (.reg dstReg) s!", {fnName}@PAGEOFF")
     else
       let fnName ← getFunctionName f
@@ -880,11 +890,14 @@ partial def selectFnBody (body : FnBody) : SelectM Unit := do
       selectExpr x ty e
       selectFnBody rest
 
-  | .jdecl j _params _jpBody rest => do
+  | .jdecl j params jpBody rest => do
     let jpLabel ← getJPLabel j
+    -- Store parameter VarIds for phi resolution
+    let paramVars := params.map (·.x)
+    modify fun st => { st with jpParams := st.jpParams.insert j.idx paramVars }
     selectFnBody rest
     emit (Instr.label jpLabel)
-    selectFnBody _jpBody
+    selectFnBody jpBody
 
   | .set x i y rest => do
     let xReg ← varToReg x
@@ -1068,12 +1081,61 @@ partial def selectFnBody (body : FnBody) : SelectM Unit := do
     emit (Instr.pop #[Reg.phys PhysReg.x29, Reg.phys PhysReg.x30])
     emit Instr.ret
 
-  | .jmp j _args => do
+  | .jmp j args => do
     emit (Instr.comment s!"jump to JP{j.idx}")
-    -- Join point arguments are handled by SSA phi resolution during register allocation
-    -- The register allocator has already ensured phi values are in the correct locations
-    let label ← getJPLabel j
-    emit (Instr.b label)
+    -- Phi resolution: move arguments into parameter locations
+    let s ← get
+    match s.jpParams.get? j.idx with
+    | none =>
+      -- No parameters, just jump
+      let label ← getJPLabel j
+      emit (Instr.b label)
+    | some params =>
+      -- For each (arg, param) pair, move arg value into param location
+      for i in [:min args.size params.size] do
+        let arg := args[i]!
+        let param := params[i]!
+        match arg with
+        | .var argVar =>
+          -- Check allocation status of both arg and param
+          let argPhys := s.allocState.allocation.get? argVar.idx
+          let argSpill := s.allocState.stackSlots.get? argVar.idx
+          let paramPhys := s.allocState.allocation.get? param.idx
+          let paramSpill := s.allocState.stackSlots.get? param.idx
+
+          match argPhys, argSpill, paramPhys, paramSpill with
+          | some argReg, _, some paramReg, _ =>
+            -- Both in physical registers
+            if argReg != paramReg then
+              emit (Instr.mov (.phys paramReg) (.reg (.phys argReg)))
+          | some argReg, _, none, some paramSlot =>
+            -- Arg in register, param spilled to stack
+            storeToStackSlot (.phys argReg) paramSlot
+          | none, some argSlot, some paramReg, _ =>
+            -- Arg spilled, param in register
+            let _ ← loadSpilledVar argVar argSlot
+            emit (Instr.mov (.phys paramReg) (.reg (.phys PhysReg.x8)))
+          | none, some argSlot, none, some paramSlot =>
+            -- Both spilled to stack
+            if argSlot != paramSlot then
+              let _ ← loadSpilledVar argVar argSlot
+              storeToStackSlot (.phys PhysReg.x8) paramSlot
+          | _, _, _, _ =>
+            emit (Instr.comment s!"ERROR: phi arg vreg{argVar.idx} or param vreg{param.idx} not allocated!")
+        | .erased =>
+          -- Erased argument - set param to 0
+          let paramPhys := s.allocState.allocation.get? param.idx
+          let paramSpill := s.allocState.stackSlots.get? param.idx
+          match paramPhys, paramSpill with
+          | some paramReg, _ =>
+            emit (Instr.mov (.phys paramReg) (.imm 0))
+          | none, some paramSlot =>
+            emit (Instr.mov (.phys PhysReg.x8) (.imm 0))
+            storeToStackSlot (.phys PhysReg.x8) paramSlot
+          | _, _ =>
+            emit (Instr.comment s!"ERROR: phi param vreg{param.idx} not allocated!")
+      let label ← getJPLabel j
+      emit (Instr.b label)
 
   | .unreachable => do
     emit (Instr.comment "unreachable")
@@ -1194,6 +1256,7 @@ def compileDecl (env : Environment) (decl : Decl) : MachineFunction :=
     stackSpillBytes := ((allocState.nextStackSlot * 8 + 15) / 16) * 16,
     nextLabel := 0,
     jpLabels := {},
+    jpParams := {},
     env := env,
     fnName := fnName,
     stringLitOrder := #[],
