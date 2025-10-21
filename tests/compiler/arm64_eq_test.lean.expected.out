@@ -1,0 +1,2 @@
+isZero 0 = true
+isZero 5 = false

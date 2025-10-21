@@ -105,6 +105,14 @@ FOREACH(T ${LEANCOMPTESTS})
            COMMAND bash -c "${TEST_VARS} ./test_single.sh ${T_NAME}")
 ENDFOREACH(T)
 
+file(GLOB LEANARM64TESTS "${LEAN_SOURCE_DIR}/../tests/compiler/arm64_*.lean")
+FOREACH(T ${LEANARM64TESTS})
+  GET_FILENAME_COMPONENT(T_NAME ${T} NAME)
+  add_test(NAME "leanarm64test_${T_NAME}"
+           WORKING_DIRECTORY "${LEAN_SOURCE_DIR}/../tests/compiler"
+           COMMAND bash -c "${TEST_VARS} ./test_single_arm64.sh ${T_NAME}")
+ENDFOREACH(T)
+
 add_test(NAME leancomptest_foreign
          WORKING_DIRECTORY "${LEAN_SOURCE_DIR}/../tests/compiler/foreign"
          COMMAND bash -c "${LEAN_BIN}/leanmake --always-make")

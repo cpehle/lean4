@@ -1,0 +1,121 @@
+[  4%] Performing update step for 'mimalloc'
+[  8%] No patch step for 'mimalloc'
+[ 12%] No configure step for 'mimalloc'
+[ 16%] No build step for 'mimalloc'
+[ 20%] No install step for 'mimalloc'
+[ 25%] Completed 'mimalloc'
+[ 33%] Built target mimalloc
+[ 37%] Performing configure step for 'stage0'
+-- No build type selected, default to Release
+-- 64-bit machine detected
+-- LIBUV_LDFLAGS: -L/opt/homebrew/Cellar/libuv/1.50.0/lib-luv
+-- LIBUV_INCLUDE_DIRS: /opt/homebrew/Cellar/libuv/1.50.0/include
+CMake Warning (dev) at CMakeLists.txt:347 (find_package):
+  Policy CMP0148 is not set: The FindPythonInterp and FindPythonLibs modules
+  are removed.  Run "cmake --help-policy CMP0148" for policy details.  Use
+  the cmake_policy command to set the policy and suppress this warning.
+
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning at CMakeLists.txt:379 (message):
+  Disabling LLVM support
+
+
+-- stage0 sha1: 7071c939603c393268f424c03654d85496cb6a78
+-- Configuring done (0.1s)
+-- Generating done (0.1s)
+-- Build files have been written to: /Users/pehle/dev/lean4/build/release/stage0
+[ 41%] Performing build step for 'stage0'
+[  0%] Built target initialize
+[  0%] Built target leaninitialize
+[  1%] Built target leanshell
+[  3%] Built target constructions
+[ 16%] Built target util
+[ 29%] Built target kernel
+[ 45%] Built target library
+[ 46%] Built target leancpp_1
+[ 47%] Built target leancpp
+[ 47%] Built target make_stdlib
+[ 72%] Built target leanrt_initial-exec
+[ 72%] Built target Init_shared
+[ 72%] Built target leanshared
+[ 72%] Built target lake_shared
+[ 72%] Built target lake
+[ 74%] Built target leanmain
+[ 75%] Built target leanmanifest
+[ 75%] Built target lean
+[100%] Built target leanrt
+[ 45%] No install step for 'stage0'
+[ 50%] Completed 'stage0'
+[ 66%] Built target stage0
+[ 70%] Performing configure step for 'stage1'
+-- 64-bit machine detected
+-- LIBUV_LDFLAGS: -L/opt/homebrew/Cellar/libuv/1.50.0/lib-luv
+-- LIBUV_INCLUDE_DIRS: /opt/homebrew/Cellar/libuv/1.50.0/include
+CMake Warning (dev) at CMakeLists.txt:347 (find_package):
+  Policy CMP0148 is not set: The FindPythonInterp and FindPythonLibs modules
+  are removed.  Run "cmake --help-policy CMP0148" for policy details.  Use
+  the cmake_policy command to set the policy and suppress this warning.
+
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning at CMakeLists.txt:379 (message):
+  Disabling LLVM support
+
+
+-- git commit sha1: 055060990c6ac614cb8ba210b241272fe563c73e
+-- Configuring done (0.2s)
+-- Generating done (0.1s)
+-- Build files have been written to: /Users/pehle/dev/lean4/build/release/stage1
+[ 75%] Performing build step for 'stage1'
+[  0%] Built target initialize
+[  0%] Built target leaninitialize
+[  1%] Built target leanshell
+[  3%] Built target constructions
+[ 16%] Built target util
+[ 29%] Built target kernel
+[ 45%] Built target library
+[ 46%] Built target leancpp_1
+[ 46%] Built target copy-cadical
+[ 47%] Built target leancpp
+⚠ [2736/3546] Replayed Lean.Compiler.IR.SSA
+warning: Lean/Compiler/IR/SSA.lean:89:11: unused variable `i`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: Lean/Compiler/IR/SSA.lean:100:12: unused variable `i`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: Lean/Compiler/IR/SSA.lean:110:12: unused variable `i`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: Lean/Compiler/IR/SSA.lean:110:14: unused variable `o`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: Lean/Compiler/IR/SSA.lean:110:18: unused variable `ty`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+⚠ [2738/3546] Replayed Lean.Compiler.Backend.ARM64
+warning: Lean/Compiler/Backend/ARM64.lean:230:9: unused variable `regs`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+warning: Lean/Compiler/Backend/ARM64.lean:231:8: unused variable `regs`
+
+Note: This linter can be disabled with `set_option linter.unusedVariables false`
+✖ [3849/3861] Building Lean.Compiler.Backend.RegisterAlloc (556ms)
+trace: .> LEAN_PATH=/Users/pehle/dev/lean4/build/release/stage1/lib/lean /Users/pehle/dev/lean4/build/release/stage0/bin/lean -s40000 /Users/pehle/dev/lean4/src/Lean/Compiler/Backend/RegisterAlloc.lean -o /Users/pehle/dev/lean4/build/release/stage1/lib/lean/Lean/Compiler/Backend/RegisterAlloc.olean -i /Users/pehle/dev/lean4/build/release/stage1/lib/lean/Lean/Compiler/Backend/RegisterAlloc.ilean -c /Users/pehle/dev/lean4/build/release/stage1/lib/temp/Lean/Compiler/Backend/RegisterAlloc.c --setup /Users/pehle/dev/lean4/build/release/stage1/lib/temp/Lean/Compiler/Backend/RegisterAlloc.setup.json --json
+error: Lean/Compiler/Backend/RegisterAlloc.lean:192:25: Invalid field `get`: The environment does not contain `Array.get`
+  calleeSavedRegs
+has type
+  Array PhysReg
+error: Lean exited with code 1
+Some required targets logged failures:
+- Lean.Compiler.Backend.RegisterAlloc
+error: build failed
+make[7]: *** [Init] Error 1
+make[6]: *** [CMakeFiles/make_stdlib] Error 2
+make[5]: *** [CMakeFiles/make_stdlib.dir/all] Error 2
+make[4]: *** [all] Error 2
+make[3]: *** [stage1-prefix/src/stage1-stamp/stage1-build] Error 2
+make[2]: *** [CMakeFiles/stage1.dir/all] Error 2
+make[1]: *** [CMakeFiles/stage1.dir/rule] Error 2
+make: *** [stage1] Error 2

@@ -1,0 +1,160 @@
+ARM64 Backend Tests
+====================
+
+=== Test Add ===
+
+  .globl _l_testAdd
+  .align 2
+_l_testAdd:
+  // Function: testAdd
+  stp x29, x30, [sp, #-16]!
+  mov x29, sp
+  // save param 0: xx0 → xx19
+  mov x19, x0
+  // save param 1: xx1 → xx20
+  mov x20, x1
+  // call Nat.add with 2 args
+  mov x0, x19
+  mov x1, x20
+  bl _l_Nat_add
+  mov x27, x0
+  // return
+  mov x0, x27
+  ldp x29, x30, [sp], #16
+  ret
+
+
+=== Test Return ===
+
+  .globl _l_testId
+  .align 2
+_l_testId:
+  // Function: testId
+  stp x29, x30, [sp, #-16]!
+  mov x29, sp
+  // save param 0: xx0 → xx19
+  mov x19, x0
+  // return
+  mov x0, x19
+  ldp x29, x30, [sp], #16
+  ret
+
+
+=== Test Constructor ===
+
+  .globl _l_mkPair
+  .align 2
+_l_mkPair:
+  // Function: mkPair
+  stp x29, x30, [sp, #-16]!
+  mov x29, sp
+  // save param 0: xx0 → xx19
+  mov x19, x0
+  // save param 1: xx1 → xx20
+  mov x20, x1
+  // ctor Pair (tag=0, objs=2, scalar=0)
+  mov x0, #0
+  mov x1, #2
+  mov x2, #0
+  bl _lean_alloc_ctor
+  mov x27, x0
+  mov x0, x27
+  mov x1, #0
+  mov x2, x19
+  bl _lean_ctor_set
+  mov x0, x27
+  mov x1, #1
+  mov x2, x20
+  bl _lean_ctor_set
+  // return
+  mov x0, x27
+  ldp x29, x30, [sp], #16
+  ret
+
+
+=== Test Projection ===
+
+  .globl _l_fst
+  .align 2
+_l_fst:
+  // Function: fst
+  stp x29, x30, [sp, #-16]!
+  mov x29, sp
+  // save param 0: xx0 → xx19
+  mov x19, x0
+  // proj field 0
+  ldr x27, [x19, #8]
+  // return
+  mov x0, x27
+  ldp x29, x30, [sp], #16
+  ret
+
+
+=== Test Case ===
+
+  .globl _l_notBool
+  .align 2
+_l_notBool:
+  // Function: notBool
+  stp x29, x30, [sp, #-16]!
+  mov x29, sp
+  // save param 0: xx0 → xx19
+  mov x19, x0
+  // case
+  ldr x8, [x19]
+  cmp x8, #0
+  b.eq .Lcase1_fn15397140181275010763
+  cmp x8, #1
+  b.eq .Lcase2_fn15397140181275010763
+.Lcase1_fn15397140181275010763:
+.Lcase_alt3_fn15397140181275010763:
+  // return
+  mov x0, x19
+  ldp x29, x30, [sp], #16
+  ret
+  b .Lcase_end0_fn15397140181275010763
+.Lcase2_fn15397140181275010763:
+.Lcase_alt4_fn15397140181275010763:
+  // return
+  mov x0, x19
+  ldp x29, x30, [sp], #16
+  ret
+  b .Lcase_end0_fn15397140181275010763
+.Lcase_end0_fn15397140181275010763:
+
+
+=== Test Literal ===
+
+  .globl _l_const42
+  .align 2
+_l_const42:
+  // Function: const42
+  stp x29, x30, [sp, #-16]!
+  mov x29, sp
+  mov x27, #42
+  // return
+  mov x0, x27
+  ldp x29, x30, [sp], #16
+  ret
+
+
+=== Test Boxing ===
+
+  .globl _l_boxNat
+  .align 2
+_l_boxNat:
+  // Function: boxNat
+  stp x29, x30, [sp, #-16]!
+  mov x29, sp
+  // save param 0: xx0 → xx19
+  mov x19, x0
+  // box
+  lsl x27, x19, #1
+  orr x27, x27, #1
+  // return
+  mov x0, x27
+  ldp x29, x30, [sp], #16
+  ret
+
+
+All tests completed!

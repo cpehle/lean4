@@ -1,0 +1,3 @@
+factorial 5 = 120
+sumTo 10 = 55
+listSum [1,2,3,4,5] = 15

@@ -607,7 +607,12 @@ static inline uint8_t * lean_ctor_scalar_cptr(lean_object * o) {
     return (uint8_t*)(lean_ctor_obj_cptr(o) + lean_ctor_num_objs(o));
 }
 
-static inline lean_object * lean_alloc_ctor(unsigned tag, unsigned num_objs, unsigned scalar_sz) {
+#if defined(LEAN_RUNTIME_EXPORT)
+LEAN_EXPORT lean_object * lean_alloc_ctor(unsigned tag, unsigned num_objs, unsigned scalar_sz)
+#else
+static inline lean_object * lean_alloc_ctor(unsigned tag, unsigned num_objs, unsigned scalar_sz)
+#endif
+{
     assert(tag <= LeanMaxCtorTag && num_objs < LEAN_MAX_CTOR_FIELDS && scalar_sz < LEAN_MAX_CTOR_SCALARS_SIZE);
     lean_object * o = lean_alloc_ctor_memory(sizeof(lean_ctor_object) + sizeof(void*)*num_objs + scalar_sz);
     lean_set_st_header(o, tag, num_objs);
@@ -619,7 +624,12 @@ static inline b_lean_obj_res lean_ctor_get(b_lean_obj_arg o, unsigned i) {
     return lean_ctor_obj_cptr(o)[i];
 }
 
-static inline void lean_ctor_set(b_lean_obj_arg o, unsigned i, lean_obj_arg v) {
+#if defined(LEAN_RUNTIME_EXPORT)
+LEAN_EXPORT void lean_ctor_set(lean_object * o, unsigned i, lean_object * v)
+#else
+static inline void lean_ctor_set(b_lean_obj_arg o, unsigned i, lean_obj_arg v)
+#endif
+{
     assert(i < lean_ctor_num_objs(o));
     lean_ctor_obj_cptr(o)[i] = v;
 }

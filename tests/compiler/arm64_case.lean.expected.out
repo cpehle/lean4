@@ -1,0 +1,5 @@
+optionTest none = 0
+optionTest (some 42) = 43
+listHead [] = 0
+listHead [1,2,3] = 1
+treeSum = 60
