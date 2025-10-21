@@ -1,5 +1,7 @@
 #define lean_alloc_ctor lean_alloc_ctor_inline
 #define lean_ctor_set lean_ctor_set_inline
+#define lean_alloc_closure lean_alloc_closure_inline
+#define lean_closure_set lean_closure_set_inline
 #define lean_inc lean_inc_inline
 #define lean_inc_n lean_inc_n_inline
 #define lean_inc_ref lean_inc_ref_inline
@@ -25,6 +27,8 @@
 
 #undef lean_alloc_ctor
 #undef lean_ctor_set
+#undef lean_alloc_closure
+#undef lean_closure_set
 #undef lean_inc
 #undef lean_inc_n
 #undef lean_inc_ref
@@ -56,6 +60,14 @@ LEAN_EXPORT lean_object* lean_alloc_ctor(unsigned tag, unsigned num_objs, unsign
 
 LEAN_EXPORT void lean_ctor_set(lean_object* o, unsigned i, lean_object* v) {
   lean_ctor_set_inline(o, i, v);
+}
+
+LEAN_EXPORT lean_object* lean_alloc_closure(void* fun, unsigned arity, unsigned num_fixed) {
+  return lean_alloc_closure_inline(fun, arity, num_fixed);
+}
+
+LEAN_EXPORT void lean_closure_set(lean_object* c, unsigned i, lean_object* v) {
+  lean_closure_set_inline(c, i, v);
 }
 
 LEAN_EXPORT void lean_inc(lean_object* o) {

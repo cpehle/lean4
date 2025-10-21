@@ -735,11 +735,10 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
     emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat arity)))
     emit (Instr.mov (.phys PhysReg.x2) (.imm (Int.ofNat args.size)))
     emit (Instr.bl "_lean_alloc_closure")
-    if dstReg != .phys PhysReg.x0 then
-      emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+    -- Keep closure in x0 throughout the loop to avoid register conflicts
     -- Populate captured arguments using lean_closure_set
     for i in [:args.size] do
-      emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
+      -- x0 already contains the closure pointer from alloc or previous iteration
       emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat i)))
       match args[i]! with
       | .var v =>
@@ -748,6 +747,9 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
       | .erased =>
         emit (Instr.mov (.phys PhysReg.x2) (.imm 0))
       emit (Instr.bl "_lean_closure_set")
+    -- After all closure_set calls, save result to dstReg if needed
+    if dstReg != .phys PhysReg.x0 then
+      emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
 
   | .ap x args =>
     let xReg ← varToReg x
