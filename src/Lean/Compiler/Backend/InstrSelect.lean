@@ -701,7 +701,7 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
             let vReg ← varToReg v
             emit (Instr.mov (.phys argReg) (.reg vReg))
           | .erased =>
-            emit (Instr.mov (.phys argReg) (.imm 0))
+            emit (Instr.mov (.phys argReg) (.imm 1))  -- lean_box(0)
         let extra := if callArgs.size > 8 then callArgs.size - 8 else 0
         let extraBytes := extra * 8
         let stackBytes := ((extraBytes + 15) / 16) * 16
@@ -716,7 +716,7 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
               let vReg ← varToReg v
               emit (Instr.str vReg (.mem (.phys PhysReg.sp) offset))
             | .erased =>
-              emit (Instr.mov (.phys PhysReg.x8) (.imm 0))
+              emit (Instr.mov (.phys PhysReg.x8) (.imm 1))  -- lean_box(0)
               emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
         emit (Instr.bl fnName)
         if stackBytes > 0 then
@@ -767,7 +767,7 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
             let vReg ← varToReg v
             emit (Instr.mov (.phys argReg) (.reg vReg))
           | .erased =>
-            emit (Instr.mov (.phys argReg) (.imm 0))
+            emit (Instr.mov (.phys argReg) (.imm 1))  -- lean_box(0)
         emit (Instr.bl s!"_lean_apply_{n}")
         if dstReg != .phys PhysReg.x0 then
           emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
@@ -880,7 +880,7 @@ partial def selectFnBody (body : FnBody) : SelectM Unit := do
               -- For subsequent args, we need to be careful about register conflicts
               emit (Instr.mov (.phys argReg) (.reg vReg))
           | .erased =>
-            emit (Instr.mov (.phys argReg) (.imm 0))
+            emit (Instr.mov (.phys argReg) (.imm 1))  -- lean_box(0)
         -- Branch back to function start (after prologue)
         emit (Instr.b s!".Lfn_start_{currentFn}")
       | _ => pure () -- Should not happen based on isTailCallTo check
@@ -1018,8 +1018,23 @@ partial def selectFnBody (body : FnBody) : SelectM Unit := do
     if xType.isScalar then
       -- For scalar types, the value is already in the register
       emit (Instr.mov (.phys PhysReg.x8) (.reg xReg))
+    else if xType.isObj then
+      -- For `tagged` or `object` types, value can be scalar OR pointer at runtime.
+      -- Emit runtime check: if (value & 1), it's scalar; else it's a pointer.
+      let scalarLabel ← freshLabel "scalar_tag"
+      let compareLabel ← freshLabel "compare_tag"
+      emit (Instr.comment "runtime scalar check")
+      emit (Instr.tst xReg (.imm 1))
+      emit (Instr.bCond Cond.ne scalarLabel)
+      -- Pointer case: load tag from object header
+      emit (Instr.ldrb (.phys PhysReg.x8) (.mem xReg 7))
+      emit (Instr.b compareLabel)
+      -- Scalar case: unbox to get tag (shift right by 1)
+      emit (Instr.label scalarLabel)
+      emit (Instr.lsr (.phys PhysReg.x8) xReg (.imm 1))
+      emit (Instr.label compareLabel)
     else
-      -- For object types, load the constructor tag from the header byte.
+      -- Unknown type, assume pointer
       emit (Instr.ldrb (.phys PhysReg.x8) (.mem xReg 7))
 
     let endLabel ← freshLabel "case_end"
@@ -1123,7 +1138,7 @@ partial def selectFnBody (body : FnBody) : SelectM Unit := do
           | _, _, _, _ =>
             emit (Instr.comment s!"ERROR: phi arg vreg{argVar.idx} or param vreg{param.idx} not allocated!")
         | .erased =>
-          -- Erased argument - set param to 0
+          -- Erased argument - set param to 0 (placeholder, will be replaced by actual erased handling)
           let paramPhys := s.allocState.allocation.get? param.idx
           let paramSpill := s.allocState.stackSlots.get? param.idx
           match paramPhys, paramSpill with
