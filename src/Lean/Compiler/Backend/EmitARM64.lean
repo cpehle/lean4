@@ -342,6 +342,8 @@ def emitExternals : EmitM Unit := do
   emitLn "  .extern _lean_io_result_show_error"
   emitLn "  .extern _lean_init_task_manager"
   emitLn "  .extern _lean_finalize_task_manager"
+  emitLn "  .extern _lean_task_spawn"
+  emitLn "  .extern _lean_task_get_own"
   emitLn "  .extern _lean_mk_string"
   for i in [:Lean.closureMaxArgs] do
     let idx := i + 1
@@ -366,11 +368,11 @@ def emitDataSection (env : Environment) (decls : Array IR.Decl) : EmitM Unit := 
   emitLn "_G_initialized:"
   emitLn "  .byte 0"
   emitLn ""
-  -- Emit closed constants as global pointers (8 bytes each)
+  -- Emit closed constants and 0-param defs as global pointers (8 bytes each)
   for decl in decls do
     match decl with
     | .fdecl name params retType _ _ =>
-      if params.isEmpty && isClosedConstName env name then
+      if params.isEmpty then
         let mangledName := "_" ++ name.mangle
         -- Add alignment before each global constant
         match retType with
@@ -456,12 +458,12 @@ def emitInitFunction (env : Environment) (modName : Name) (decls : Array IR.Decl
     emitLn s!"{decDoneLabel}:"
     emitLn ""
 
-  -- Initialize closed constants by calling their init functions
-  emitLn "  // Initialize closed constants"
+  -- Initialize closed constants and 0-param defs by calling their init functions
+  emitLn "  // Initialize closed constants and 0-param defs"
   for decl in decls.toList.reverse do
     match decl with
     | .fdecl name params ty _ _ =>
-      if params.isEmpty && isClosedConstName env name then
+      if params.isEmpty then
         let constName := "_" ++ name.mangle
         let initName := "__init_" ++ name.mangle  -- Double underscore for C-exported function
         emitLn s!"  // Initialize {constName}"
@@ -663,8 +665,8 @@ def emitDecls (env : Environment) (modName : Name) (decls : Array IR.Decl) : Str
     for decl in decls do
       match decl with
       | .fdecl name params _ _ _ =>
-        -- For closed constants, emit init functions with double underscore prefix
-        if params.isEmpty && isClosedConstName env name then
+        -- For 0-param functions, emit init functions with double underscore prefix
+        if params.isEmpty then
           let initFnName := "__init_" ++ name.mangle
           let machineFunc := InstrSelect.compileDecl env decl
           emitMachineFunction machineFunc (some initFnName)

@@ -22,7 +22,19 @@
 #define lean_array_get_size lean_array_get_size_inline
 #define lean_array_get_borrowed lean_array_get_borrowed_inline
 #define lean_usize_dec_lt lean_usize_dec_lt_inline
+#define lean_nat_dec_le lean_nat_dec_le_inline
+#define lean_nat_dec_lt lean_nat_dec_lt_inline
+#define lean_usize_dec_eq lean_usize_dec_eq_inline
+#define lean_usize_of_nat lean_usize_of_nat_inline
+#define lean_task_spawn lean_task_spawn_inline
+#define lean_task_get_own lean_task_get_own_inline
+#define lean_nat_mod lean_nat_mod_inline
+#define lean_array_pop lean_array_pop_inline
+#define lean_array_fget_borrowed lean_array_fget_borrowed_inline
+#define lean_array_get lean_array_get_inline
+#define lean_uint8_to_nat lean_uint8_to_nat_inline
 
+#include <stdio.h>
 #include <lean/lean.h>
 
 #undef lean_alloc_ctor
@@ -49,6 +61,17 @@
 #undef lean_array_get_size
 #undef lean_array_get_borrowed
 #undef lean_usize_dec_lt
+#undef lean_nat_dec_le
+#undef lean_nat_dec_lt
+#undef lean_usize_dec_eq
+#undef lean_usize_of_nat
+#undef lean_task_spawn
+#undef lean_task_get_own
+#undef lean_nat_mod
+#undef lean_array_pop
+#undef lean_array_fget_borrowed
+#undef lean_array_get
+#undef lean_uint8_to_nat
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,8 +89,9 @@ LEAN_EXPORT lean_object* lean_alloc_closure(void* fun, unsigned arity, unsigned 
   return lean_alloc_closure_inline(fun, arity, num_fixed);
 }
 
-LEAN_EXPORT void lean_closure_set(lean_object* c, unsigned i, lean_object* v) {
+LEAN_EXPORT lean_object* lean_closure_set(lean_object* c, unsigned i, lean_object* v) {
   lean_closure_set_inline(c, i, v);
+  return c;  // Return closure pointer so ARM64 backend can chain calls
 }
 
 LEAN_EXPORT void lean_inc(lean_object* o) {
@@ -151,6 +175,52 @@ LEAN_EXPORT lean_object* lean_array_get_borrowed(lean_object* def_val, lean_obje
 // Usize operations
 LEAN_EXPORT uint8_t lean_usize_dec_lt(size_t a1, size_t a2) {
   return lean_usize_dec_lt_inline(a1, a2);
+}
+
+LEAN_EXPORT uint8_t lean_usize_dec_eq(size_t a1, size_t a2) {
+  return lean_usize_dec_eq_inline(a1, a2);
+}
+
+LEAN_EXPORT size_t lean_usize_of_nat(lean_object* a) {
+  return lean_usize_of_nat_inline(a);
+}
+
+// Nat operations
+LEAN_EXPORT uint8_t lean_nat_dec_le(lean_object* a1, lean_object* a2) {
+  return lean_nat_dec_le_inline(a1, a2);
+}
+
+LEAN_EXPORT uint8_t lean_nat_dec_lt(lean_object* a1, lean_object* a2) {
+  return lean_nat_dec_lt_inline(a1, a2);
+}
+
+// Task operations
+LEAN_EXPORT lean_object* lean_task_spawn(lean_object* c, lean_object* prio) {
+  return lean_task_spawn_inline(c, prio);
+}
+
+LEAN_EXPORT lean_object* lean_task_get_own(lean_object* t) {
+  return lean_task_get_own_inline(t);
+}
+
+LEAN_EXPORT lean_object* lean_nat_mod(lean_object* a1, lean_object* a2) {
+  return lean_nat_mod_inline(a1, a2);
+}
+
+LEAN_EXPORT lean_object* lean_array_pop(lean_object* a) {
+  return lean_array_pop_inline(a);
+}
+
+LEAN_EXPORT lean_object* lean_array_fget_borrowed(lean_object* a, lean_object* i) {
+  return lean_array_fget_borrowed_inline(a, i);
+}
+
+LEAN_EXPORT lean_object* lean_array_get(lean_object* def_val, lean_object* a, lean_object* i) {
+  return lean_array_get_inline(def_val, a, i);
+}
+
+LEAN_EXPORT lean_object* lean_uint8_to_nat(uint8_t n) {
+  return lean_uint8_to_nat_inline(n);
 }
 
 #ifdef __cplusplus

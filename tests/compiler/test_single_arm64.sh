@@ -62,8 +62,8 @@ LIB_DIR=$(cd ../../build/release/stage1/lib/lean && pwd)
 leanc ${LEANC_OPTS-} -O3 -DNDEBUG -mmacosx-version-min=15.0 \
   -o "$f.arm64.out" "$f.arm64.s" "$f.arm64_shim.c" runtime_bridge.c \
   -L"$LIB_DIR" -Wl,-force_load,"$LIB_DIR"/libLean.a \
-  -Wl,-force_load,"$LIB_DIR"/libleanrt.a -lleancpp -lInit -lStd -lLean -lLake -lleanrt \
-  -lleanshared -luv -Wl,-rpath,@executable_path/../lib/lean \
+  -Wl,-force_load,"$LIB_DIR"/libleanrt.a \
+  -Wl,-rpath,@executable_path/../lib/lean \
   -Wl,-rpath,"$LIB_DIR" \
   || fail "Failed to link ARM64 assembly for $f"
 

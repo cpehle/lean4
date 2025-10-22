@@ -160,6 +160,14 @@ def getFunctionArity (f : FunId) : SelectM Nat := do
   | some (Decl.extern _ params ..) => return params.size
   | none => return 0
 
+/-- Check if a VarId is a function parameter and return its index if so -/
+def getParameterIndex? (v : VarId) : SelectM (Option Nat) := do
+  let s ← get
+  for h : i in [:s.params.size] do
+    if s.params[i].x == v then
+      return some i
+  return none
+
 /-- Get stack slot offset in bytes for a spilled variable -/
 def getStackOffset (slot : Nat) : Int :=
   -- Spilled variables are stored in the stack area reserved after the prologue adjustments
@@ -803,7 +811,20 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
                   emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) oldOffset))
                   emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
                 | none =>
-                  emit (Instr.comment s!"ERROR: arg var not allocated!")
+                  -- Check if this is a stack parameter (param index >= 10)
+                  let paramIdx? ← getParameterIndex? v
+                  match paramIdx? with
+                  | some paramIdx =>
+                    if paramIdx >= 10 then
+                      -- Stack parameter: load from caller's frame at [x29, #...]
+                      -- Stack params start at [x29, #16] for param 8, so param N is at [x29, #(16 + (N - 8) * 8)]
+                      let callerOffset := Int.ofNat (16 + (paramIdx - 8) * 8)
+                      emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.x29) callerOffset))
+                      emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
+                    else
+                      emit (Instr.comment s!"ERROR: param {paramIdx} not in register (expected x19-x28)!")
+                  | none =>
+                    emit (Instr.comment s!"ERROR: arg var{v.idx} not allocated!")
             | .erased =>
               emit (Instr.mov (.phys PhysReg.x8) (.imm 1))  -- lean_box(0)
               emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
@@ -886,7 +907,19 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
                 emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) oldOffset))
                 emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
               | none =>
-                emit (Instr.comment s!"ERROR: arg var not allocated!")
+                -- Check if this is a stack parameter (param index >= 10)
+                let paramIdx? ← getParameterIndex? v
+                match paramIdx? with
+                | some paramIdx =>
+                  if paramIdx >= 10 then
+                    -- Stack parameter: load from caller's frame at [x29, #...]
+                    let callerOffset := Int.ofNat (16 + (paramIdx - 8) * 8)
+                    emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.x29) callerOffset))
+                    emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
+                  else
+                    emit (Instr.comment s!"ERROR: param {paramIdx} not in register!")
+                | none =>
+                  emit (Instr.comment s!"ERROR: arg var{v.idx} not allocated!")
           | .erased =>
             emit (Instr.mov (.phys PhysReg.x8) (.imm 0))
             emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
@@ -940,7 +973,9 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
 
   | .lit (.str s) =>
     let lit ← getStringLiteral s
-    emit (Instr.comment s!"string literal: {s}")
+    -- Escape special chars in comment to avoid breaking assembly syntax
+    let escapedStr := s.replace "\n" "\\n" |>.replace "\r" "\\r" |>.replace "\t" "\\t"
+    emit (Instr.comment s!"string literal: {escapedStr}")
     emit (Instr.adrp (.phys PhysReg.x0) s!"{lit.ptrLabel}@PAGE")
     emit (Instr.ldr (.phys PhysReg.x0) (.reg (.phys PhysReg.x0)) s!", {lit.ptrLabel}@PAGEOFF")
     emit (Instr.bl "lean_mk_string")
