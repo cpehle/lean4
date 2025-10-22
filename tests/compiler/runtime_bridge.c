@@ -48,6 +48,10 @@
 #define lean_string_dec_eq lean_string_dec_eq_inline
 #define lean_string_dec_lt lean_string_dec_lt_inline
 #define lean_string_utf8_byte_size lean_string_utf8_byte_size_inline
+#define lean_string_utf8_at_end lean_string_utf8_at_end_inline
+#define lean_nat_to_int lean_nat_to_int_inline
+#define lean_int_neg lean_int_neg_inline
+#define lean_nat_abs lean_nat_abs_inline
 
 #include <stdio.h>
 #include <lean/lean.h>
@@ -102,6 +106,10 @@
 #undef lean_string_dec_eq
 #undef lean_string_dec_lt
 #undef lean_string_utf8_byte_size
+#undef lean_string_utf8_at_end
+#undef lean_nat_to_int
+#undef lean_int_neg
+#undef lean_nat_abs
 
 #ifdef __cplusplus
 extern "C" {
@@ -319,6 +327,23 @@ LEAN_EXPORT uint8_t lean_string_dec_lt(lean_object* a, lean_object* b) {
 
 LEAN_EXPORT lean_object* lean_string_utf8_byte_size(lean_object* a) {
   return lean_string_utf8_byte_size_inline(a);
+}
+
+LEAN_EXPORT uint8_t lean_string_utf8_at_end(lean_object* s, lean_object* i) {
+  return lean_string_utf8_at_end_inline(s, i);
+}
+
+// Int/Nat conversion operations
+LEAN_EXPORT lean_object* lean_nat_to_int(lean_object* a) {
+  return lean_nat_to_int_inline(a);
+}
+
+LEAN_EXPORT lean_object* lean_int_neg(lean_object* a) {
+  return lean_int_neg_inline(a);
+}
+
+LEAN_EXPORT lean_object* lean_nat_abs(lean_object* i) {
+  return lean_nat_abs_inline(i);
 }
 
 #ifdef __cplusplus
