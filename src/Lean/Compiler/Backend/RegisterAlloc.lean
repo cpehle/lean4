@@ -190,33 +190,34 @@ def allocateRegisters (params : Array Param) (body : FnBody) (usesFloat : Bool :
       ARM64.PhysReg.x23, ARM64.PhysReg.x24, ARM64.PhysReg.x25, ARM64.PhysReg.x26,
       ARM64.PhysReg.x27, ARM64.PhysReg.x28]
 
+  -- Pre-allocate specific registers for first 10 parameters to use callee-saved regs
   let stateWithParams := Id.run do
     let mut state := initState
-    for h : i in [:params.size] do
-      let param := params[i]
-      if hReg : i < calleeSavedRegs.size then
-        -- Assign parameter to a callee-saved register to keep it live across calls
-        let targetReg := calleeSavedRegs[i]!
-        state := {
-          state with
-            allocation := state.allocation.insert param.x.idx targetReg
-            freeRegs := state.freeRegs.filter (· != targetReg)
-        }
-      else
-        -- Spill additional parameters to stack slots
-        state := {
-          state with
-            spilled := state.spilled.push param.x,
-            stackSlots := state.stackSlots.insert param.x.idx state.nextStackSlot,
-            nextStackSlot := state.nextStackSlot + 1
-        }
+    for h : i in [:min params.size calleeSavedRegs.size] do
+      if hp : i < params.size then
+        let param := params[i]
+        if hr : i < calleeSavedRegs.size then
+          let targetReg := calleeSavedRegs[i]
+          -- Create an interval for this parameter to mark the register as busy
+          let paramInterval : LiveInterval := { var := param.x, start := 0, end_ := 1000 }
+          -- Pre-assign this register, remove from free, and add to active
+          state := {
+            state with
+              allocation := state.allocation.insert param.x.idx targetReg
+              freeRegs := state.freeRegs.filter (· != targetReg)
+              active := state.active.push paramInterval
+          }
+    -- Parameters 10+ stay on the caller's stack. Reserve stack slot numbers to prevent
+    -- local variable spills from using conflicting offsets.
+    let numStackParams := if params.size > calleeSavedRegs.size then params.size - calleeSavedRegs.size else 0
+    state := { state with nextStackSlot := state.nextStackSlot + numStackParams }
     return state
 
-  -- Allocate registers for the rest of the function body
-  -- Parameters already have registers assigned, so they won't be in intervals
+  -- Filter out parameters from intervals - they're already allocated above
   let nonParamIntervals := intervals.filter fun iv =>
     !params.any fun p => p.x == iv.var
 
+  -- Run linear scan on non-parameter intervals only
   let (_result, finalState) := (linearScanAlloc nonParamIntervals).run stateWithParams
   finalState
 

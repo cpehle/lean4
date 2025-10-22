@@ -13,6 +13,7 @@ public import Lean.Compiler.IR.SSA
 public import Lean.Compiler.IR.Basic
 public import Lean.Compiler.IR.CompilerM
 public import Lean.Compiler.IR.EmitUtil
+public import Lean.Compiler.IR.Boxing
 public import Lean.Compiler.NameMangling
 public import Lean.Runtime
 public import Std.Data.TreeMap
@@ -37,6 +38,12 @@ def physMem (l : List PhysReg) (r : PhysReg) : Bool :=
   match l with
   | [] => false
   | h :: t => if h == r then true else physMem t r
+
+/-- Remove the "_boxed" suffix from a function name. -/
+def stripBoxedSuffix (n : Name) : Name :=
+  match n with
+  | Name.str pre s => if s == "_boxed" then pre else n
+  | _ => n
 
 /-- Greedily pick `count` scratch registers avoiding the supplied set. -/
 def pickScratchRegs (avoid : List PhysReg) (count : Nat) : Option (List PhysReg) :=
@@ -74,6 +81,8 @@ structure SelectState where
   nextStringId : Nat
   /-- Mapping from virtual registers to their IR types. -/
   varTypes : Std.TreeMap Index IRType (fun a b => compare a b)
+  /-- Function parameters (for accessing stack parameters) -/
+  params : Array Param
 
 abbrev SelectM := StateM SelectState
 
@@ -202,9 +211,27 @@ def varToReg (v : VarId) : SelectM Reg := do
       -- Load from stack into temporary register
       loadSpilledVar v slot
     | none =>
-      -- This shouldn't happen - all variables should be allocated or spilled
-      emit (Instr.comment s!"ERROR: vreg{v.idx} not allocated or spilled!")
-      return .virt v
+      -- Check if this is a stack parameter (param index ≥ 10)
+      match s.params.findIdx? (fun p => p.x == v) with
+      | some idx =>
+        if idx >= 10 then
+          -- This is a stack parameter at [x29, #offset]
+          -- Load it into a temporary register on demand
+          let extra := idx - 8
+          let stackOffset := Int.ofNat (16 + extra * 8)
+          emit (Instr.comment s!"load stack param {idx} from [x29, #{stackOffset}]")
+          -- Use x9 (a caller-saved scratch register) for stack parameter loads
+          let tmp := Reg.phys PhysReg.x9
+          emit (Instr.ldr tmp (.mem (.phys PhysReg.x29) stackOffset))
+          return tmp
+        else
+          -- Parameter should have been allocated to a register
+          emit (Instr.comment s!"ERROR: param {idx} (vreg{v.idx}) not allocated!")
+          return .virt v
+      | none =>
+        -- Not a parameter, this shouldn't happen
+        emit (Instr.comment s!"ERROR: vreg{v.idx} not allocated or spilled!")
+        return .virt v
 
 /-- Look up the IR type associated with a variable if available. -/
 def getVarType? (v : VarId) : SelectM (Option IRType) := do
@@ -575,49 +602,96 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
     | some _ => (Reg.phys PhysReg.x8, true)
     | none => (Reg.virt dst, false)  -- Shouldn't happen
   let dstReg := dstRegAndSpilled.1
-  let isSpilled := dstRegAndSpilled.2
+  let mut isSpilled := dstRegAndSpilled.2
+  let mut spillHandled := false  -- Track if we've already handled spilling
 
   match e with
   | .ctor info args =>
     emit (Instr.comment s!"ctor {info.name} (tag={info.cidx}, objs={info.size}, scalar={info.ssize})")
+
+    let destSlot? := s.allocState.stackSlots.get? dst.idx
+    let stackSlotInfo? := destSlot?.map fun slot => (slot, Int.ofNat (slot * 8))
+    let pointerReg? : Option Reg := if isSpilled then none else some dstReg
+
+    -- CRITICAL: When we keep the constructor pointer in a register we must ensure that
+    -- arguments using the same register are preserved before runtime calls.
+    let mut conflictVar : Option VarId := none
+    match pointerReg? with
+    | some tempReg =>
+      for arg in args do
+        match arg with
+        | .var v =>
+          let vReg ← varToReg v
+          if vReg == tempReg then
+            conflictVar := some v
+            break
+        | .erased => pure ()
+    | none => pure ()
+
+    -- If there's a conflict, save the argument value before we overwrite the register.
+    match pointerReg? with
+    | some tempReg =>
+      match conflictVar with
+      | some v =>
+        emit (Instr.comment s!"save vreg{v.idx} from {tempReg} to x9 (constructor will overwrite {tempReg})")
+        emit (Instr.mov (.phys PhysReg.x9) (.reg tempReg))
+      | none => pure ()
+    | none => pure ()
+
     -- Call lean_alloc_ctor(tag, num_objs, scalar_sz)
     -- Arguments: x0=tag, x1=num_objs, x2=scalar_sz
     emit (Instr.mov (.phys PhysReg.x0) (.imm (Int.ofNat info.cidx)))
     emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat info.size)))
     emit (Instr.mov (.phys PhysReg.x2) (.imm (Int.ofNat info.ssize)))
     emit (Instr.bl "lean_alloc_ctor")
-    -- CRITICAL: We must preserve the constructor pointer across lean_ctor_set calls.
     -- lean_ctor_set can clobber caller-saved registers (x0-x18).
-    -- If dstReg is callee-saved (x19-x28), use it directly.
-    -- Otherwise (spilled case), use x19 as temp and store to stack at end.
-    let tempReg := if isSpilled then Reg.phys PhysReg.x19 else dstReg
-    emit (Instr.mov tempReg (.reg (.phys PhysReg.x0)))
+    -- Keep the constructor pointer either in a callee-saved register or spill directly to stack.
+    match pointerReg? with
+    | some tempReg =>
+      emit (Instr.mov tempReg (.reg (.phys PhysReg.x0)))
+    | none =>
+      match stackSlotInfo? with
+      | some (slot, offset) =>
+        emit (Instr.comment s!"store constructor for spilled dst vreg{dst.idx} into stack slot {slot}")
+        emit (Instr.str (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) offset))
+        spillHandled := true
+      | none =>
+        emit (Instr.comment s!"ERROR: spilled constructor destination vreg{dst.idx} has no stack slot")
 
     -- Set fields using lean_ctor_set(o, i, v)
     for i in [:args.size] do
       let arg := args[i]!
       match arg with
       | .var v =>
+        -- Load the argument value, using x9 if it's the saved conflict variable
         let vReg ← varToReg v
+        let actualReg := match conflictVar with
+          | some cv => if cv == v then Reg.phys PhysReg.x9 else vReg
+          | none => vReg
         -- Load constructor from tempReg (preserved across calls since it's callee-saved)
-        emit (Instr.mov (.phys PhysReg.x0) (.reg tempReg))
+        match pointerReg? with
+        | some tempReg =>
+          emit (Instr.mov (.phys PhysReg.x0) (.reg tempReg))
+          -- tempReg is callee-saved, so the constructor pointer survives the call
+        | none =>
+          match stackSlotInfo? with
+          | some (_, offset) =>
+            emit (Instr.ldr (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) offset))
+          | none =>
+            emit (Instr.comment s!"ERROR: missing constructor pointer for spilled dst vreg{dst.idx}")
         emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat i)))
-        emit (Instr.mov (.phys PhysReg.x2) (.reg vReg))
+        emit (Instr.mov (.phys PhysReg.x2) (.reg actualReg))
         emit (Instr.bl "lean_ctor_set")
         -- tempReg is callee-saved, so still contains the constructor
       | .erased =>
         emit (Instr.comment s!"field {i} erased")
 
     -- Move result to final destination
-    if isSpilled then
-      -- Store from x19 to stack slot
-      match s.allocState.stackSlots.get? dst.idx with
-      | some slot =>
-        let offset := Int.ofNat (slot * 8)
-        emit (Instr.str tempReg (.mem (.phys PhysReg.sp) offset))
-      | none => pure ()
-    else if tempReg != dstReg then
-      emit (Instr.mov dstReg (.reg tempReg))
+    match pointerReg? with
+    | some tempReg =>
+      if tempReg != dstReg then
+        emit (Instr.mov dstReg (.reg tempReg))
+    | none => pure ()
 
   | .reset n x =>
     let xReg ← varToReg x
@@ -707,14 +781,29 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
         let stackBytes := ((extraBytes + 15) / 16) * 16
         if stackBytes > 0 then
           emit (Instr.sub (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat stackBytes)))
+        -- CRITICAL: For spilled variables, we must load and store immediately
+        -- because varToReg uses a single temp register (x8) for all spilled vars
         if extra > 0 then
           for j in [:extra] do
             let argIdx := j + 8
             let offset := Int.ofNat (j * 8)
             match callArgs[argIdx]! with
             | .var v =>
-              let vReg ← varToReg v
-              emit (Instr.str vReg (.mem (.phys PhysReg.sp) offset))
+              -- Check if this var is in a register or spilled
+              let s ← get
+              match s.allocState.allocation.get? v.idx with
+              | some phys =>
+                -- In register, just store it
+                emit (Instr.str (.phys phys) (.mem (.phys PhysReg.sp) offset))
+              | none =>
+                -- Spilled: need to load from OLD sp position
+                match s.allocState.stackSlots.get? v.idx with
+                | some slot =>
+                  let oldOffset := Int.ofNat (stackBytes + slot * 8)
+                  emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) oldOffset))
+                  emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
+                | none =>
+                  emit (Instr.comment s!"ERROR: arg var not allocated!")
             | .erased =>
               emit (Instr.mov (.phys PhysReg.x8) (.imm 1))  -- lean_box(0)
               emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
@@ -778,12 +867,26 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
         let totalBytes := ((argBytes + 15) / 16) * 16
         if totalBytes > 0 then
           emit (Instr.sub (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat totalBytes)))
+        -- CRITICAL: For spilled variables, load and store immediately
         for i in [:args.size] do
           let offset := Int.ofNat (i * 8)
           match args[i]! with
           | .var v =>
-            let vReg ← varToReg v
-            emit (Instr.str vReg (.mem (.phys PhysReg.sp) offset))
+            -- Check if this var is in a register or spilled
+            let s ← get
+            match s.allocState.allocation.get? v.idx with
+            | some phys =>
+              -- In register, just store it
+              emit (Instr.str (.phys phys) (.mem (.phys PhysReg.sp) offset))
+            | none =>
+              -- Spilled: need to load from OLD sp position
+              match s.allocState.stackSlots.get? v.idx with
+              | some slot =>
+                let oldOffset := Int.ofNat (totalBytes + slot * 8)
+                emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) oldOffset))
+                emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
+              | none =>
+                emit (Instr.comment s!"ERROR: arg var not allocated!")
           | .erased =>
             emit (Instr.mov (.phys PhysReg.x8) (.imm 0))
             emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
@@ -853,8 +956,8 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
     emit (Instr.mov (.phys PhysReg.x8) (.imm 1))
     emit (Instr.csel dstReg (.phys PhysReg.x8) (.phys PhysReg.xzr) Cond.gt)
 
-  -- If destination is spilled, store result to stack
-  if isSpilled then
+  -- If destination is spilled and we haven't handled it yet, store result to stack
+  if isSpilled && !spillHandled then
     storeSpilledDst dst dstReg
 
 /-- Select instructions for a function body -/
@@ -1171,8 +1274,21 @@ def selectDecl (decl : Decl) : SelectM MachineFunction := do
     -- Calculate stack frame size
     let s ← get
     let numSpilled := s.allocState.nextStackSlot
-    -- Reserve space for spills (16-byte aligned)
-    let spillBytes := ((numSpilled * 8 + 15) / 16) * 16
+
+    -- Check if this is a boxed function to calculate correct stack size
+    let isBoxed := _params.size > Lean.closureMaxArgs && Lean.IR.ExplicitBoxing.isBoxedName f
+    let spillBytes := if isBoxed then
+      -- Boxed wrapper needs space for all args (will be unpacked from array)
+      let argBytes := _params.size * 8
+      let extra := if _params.size > 8 then _params.size - 8 else 0
+      let callStackBytes := extra * 8
+      ((argBytes + callStackBytes + 15) / 16) * 16
+    else
+      -- Normal function: space for spilled variables + parameter save area
+      -- Parameters 0-7 need extra spill slots to preserve values when registers get reused
+      let paramSaveSlots := min _params.size 8
+      let totalSlots := numSpilled + paramSaveSlots
+      ((totalSlots * 8 + 15) / 16) * 16
     modify fun st => { st with stackSpillBytes := spillBytes }
 
     -- Function prologue
@@ -1195,45 +1311,110 @@ def selectDecl (decl : Decl) : SelectM MachineFunction := do
     if numSpilled > 0 then
       emit (Instr.comment s!"Stack frame: {spillBytes} bytes ({numSpilled} spilled vars)")
 
-    -- Load arguments that were passed on the caller stack (idx ≥ 8).
-    for h : idx in [:_params.size] do
-      if hStack : idx ≥ 8 then
-        let param := _params[idx]!
-        let extra := idx - 8
-        -- After prologue: stp x29,x30,[sp,#-16]!; mov x29,sp
-        -- x29 points to saved frame record. Caller's stack args start at x29+16.
-        let stackOffset := Int.ofNat (16 + extra * 8)
+    -- Check if this is a boxed function with array-pointer calling convention
+    let isBoxed := _params.size > Lean.closureMaxArgs && Lean.IR.ExplicitBoxing.isBoxedName f
+
+    if isBoxed then
+      -- Boxed function wrapper: x0 contains pointer to argument array
+      -- This is a thin wrapper that unpacks the array and calls the non-boxed version
+      emit (Instr.comment s!"Boxed wrapper: unpacking {_params.size} args from array")
+
+      -- Stack layout (spillBytes already allocated in prologue):
+      -- [sp+0] to [sp+(extra*8-1)]: args 8+ for the call (at top for callee)
+      -- [sp+(extra*8)] to [sp+(extra*8 + params*8 - 1)]: temporary storage for all args
+      let extra := if _params.size > 8 then _params.size - 8 else 0
+      let argStorageOffset := extra * 8
+
+      -- Unpack all arguments from array to temporary storage
+      for idx in [:_params.size] do
+        let arrayOffset := Int.ofNat (idx * 8)
+        let spillOffset := Int.ofNat (argStorageOffset + idx * 8)
+        emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.x0) arrayOffset))
+        emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) spillOffset))
+
+      -- Remove "_boxed" suffix from function name
+      let baseFunc := stripBoxedSuffix f
+
+      -- Load args 0-7 into x0-x7
+      for i in [:min _params.size 8] do
+        let argReg := getArgReg i
+        let spillOffset := Int.ofNat (argStorageOffset + i * 8)
+        emit (Instr.ldr (.phys argReg) (.mem (.phys PhysReg.sp) spillOffset))
+
+      -- Copy args 8+ from temporary storage to call stack positions
+      for j in [:extra] do
+        let argIdx := j + 8
+        let srcOffset := Int.ofNat (argStorageOffset + argIdx * 8)
+        let dstOffset := Int.ofNat (j * 8)
+        emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) srcOffset))
+        emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) dstOffset))
+
+      -- Call the non-boxed version
+      emit (Instr.bl (baseFunc.mangle "_l_"))
+
+      -- Generate epilogue to properly return
+      if spillBytes > 0 then
+        emit (Instr.add (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat spillBytes)))
+
+      -- Pop callee-saved registers in reverse order
+      let calleeSavedPairs : Array (Array Reg) :=
+        #[
+          #[Reg.phys PhysReg.x27, Reg.phys PhysReg.x28],
+          #[Reg.phys PhysReg.x25, Reg.phys PhysReg.x26],
+          #[Reg.phys PhysReg.x23, Reg.phys PhysReg.x24],
+          #[Reg.phys PhysReg.x21, Reg.phys PhysReg.x22],
+          #[Reg.phys PhysReg.x19, Reg.phys PhysReg.x20]
+        ]
+      for pair in calleeSavedPairs do
+        emit (Instr.pop pair)
+
+      emit (Instr.pop #[Reg.phys PhysReg.x29, Reg.phys PhysReg.x30])
+      emit Instr.ret
+
+      -- Result is already in x0
+      -- Skip normal function body generation
+      let s ← get
+      return {
+        name := f
+        blocks := #[{ label := f.toString, instrs := s.instrs }]
+        stringLits := s.stringLitOrder
+      }
+    else
+      -- Normal function: arguments in x0-x7 and on stack
+      -- Load arguments that were passed on the caller stack (idx ≥ 8).
+      for h : idx in [:_params.size] do
+        if hStack : idx ≥ 8 then
+          let param := _params[idx]!
+          let extra := idx - 8
+          -- After prologue: stp x29,x30,[sp,#-16]!; mov x29,sp
+          -- x29 points to saved frame record. Caller's stack args start at x29+16.
+          let stackOffset := Int.ofNat (16 + extra * 8)
+          match allocState.allocation.get? param.x.idx with
+          | some allocReg =>
+            emit (Instr.comment s!"load stack param {idx}: [x29, #{stackOffset}] → {allocReg}")
+            emit (Instr.ldr (.phys allocReg) (.mem (.phys PhysReg.x29) stackOffset))
+          | none =>
+            -- Stack parameters without register allocation stay on the caller's stack.
+            -- They will be accessed via [x29, #offset] when needed.
+            emit (Instr.comment s!"stack param {idx} remains at [x29, #{stackOffset}]")
+            pure ()
+        else
+          pure ()
+
+      -- Add label for tail call optimization BEFORE parameter saves
+      -- Tail calls will put new values in x0-x7, then jump here to re-save them
+      emit (Instr.label s!".Lfn_start_{f}")
+
+      -- Save parameters from x0-x7 to their allocated registers
+      -- This happens on initial entry AND when tail calls jump to .Lfn_start
+      for i in [:min _params.size 8] do
+        let param := _params[i]!
         match allocState.allocation.get? param.x.idx with
         | some allocReg =>
-          emit (Instr.comment s!"load stack param {idx}: [x29, #{stackOffset}] → {allocReg}")
-          emit (Instr.ldr (.phys allocReg) (.mem (.phys PhysReg.x29) stackOffset))
-        | none =>
-          match allocState.stackSlots.get? param.x.idx with
-          | some slot =>
-            let slotOffset := Int.ofNat (slot * 8)
-            emit (Instr.comment s!"spill stack param {idx}: [x29, #{stackOffset}] → [sp, #{slotOffset}]")
-            let tmp := Reg.phys PhysReg.x8
-            emit (Instr.ldr tmp (.mem (.phys PhysReg.x29) stackOffset))
-            emit (Instr.str tmp (.mem (.phys PhysReg.sp) slotOffset))
-          | none =>
-            emit (Instr.comment s!"WARNING: param {idx} lacks allocation")
-      else
-        pure ()
-
-    -- Add label for tail call optimization BEFORE parameter saves
-    -- Tail calls will put new values in x0-x7, then jump here to re-save them
-    emit (Instr.label s!".Lfn_start_{f}")
-
-    -- Save parameters from x0-x7 to their allocated registers
-    -- This happens on initial entry AND when tail calls jump to .Lfn_start
-    for i in [:min _params.size 8] do
-      let param := _params[i]!
-      match allocState.allocation.get? param.x.idx with
-      | some allocReg =>
-        let argReg := getArgReg i
-        if allocReg != argReg then
-          emit (Instr.mov (.phys allocReg) (.reg (.phys argReg)))
-      | none => pure ()
+          let argReg := getArgReg i
+          if allocReg != argReg then
+            emit (Instr.mov (.phys allocReg) (.reg (.phys argReg)))
+        | none => pure ()
 
     -- Select instructions for body
     selectFnBody body
@@ -1278,7 +1459,8 @@ def compileDecl (env : Environment) (decl : Decl) : MachineFunction :=
     fnName := fnName,
     stringLitOrder := #[],
     nextStringId := 0,
-    varTypes := {}
+    varTypes := {},
+    params := params
   }
 
   -- Run instruction selection
