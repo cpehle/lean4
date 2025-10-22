@@ -86,23 +86,28 @@ def hexDigit (n : Nat) : Char :=
   | 8  => '8' | 9  => '9' | 10 => 'A' | 11 => 'B'
   | 12 => 'C' | 13 => 'D' | 14 => 'E' | _ => 'F'
 
-/-- Escape a string literal so it can be emitted via `.asciz`. -/
+/-- Escape a string literal so it can be emitted via `.asciz`.
+    This processes UTF-8 bytes, not characters, to properly handle multi-byte sequences. -/
 def escapeString (s : String) : String :=
-  let step (acc : String) (c : Char) : String :=
-    match c with
-    | '\\' => acc ++ "\\\\"
-    | '"'   => acc ++ "\\\""
-    | '\n'  => acc ++ "\\n"
-    | '\r'  => acc ++ "\\r"
-    | '\t'  => acc ++ "\\t"
-    | _     =>
-      if c.toNat < 32 || c.toNat > 126 then
-        let hi := hexDigit (c.toNat / 16)
-        let lo := hexDigit (c.toNat % 16)
-        acc ++ "\\x" ++ String.mk [hi, lo]
+  let bytes := s.toUTF8
+  let step (acc : String) (b : UInt8) : String :=
+    let byte := b.toNat
+    match byte with
+    | 92  => acc ++ "\\\\"  -- backslash
+    | 34  => acc ++ "\\\""  -- quote
+    | 10  => acc ++ "\\n"   -- newline
+    | 13  => acc ++ "\\r"   -- carriage return
+    | 9   => acc ++ "\\t"   -- tab
+    | _   =>
+      -- Only ASCII printable characters are emitted directly
+      if byte >= 32 && byte <= 126 then
+        acc.push (Char.ofNat byte)
       else
-        acc.push c
-  s.foldl step ""
+        -- Non-ASCII bytes are hex-escaped
+        let hi := hexDigit (byte / 16)
+        let lo := hexDigit (byte % 16)
+        acc ++ "\\x" ++ String.mk [hi, lo]
+  bytes.foldl step ""
 
 /-- Emit data for a gathered string literal. -/
 def emitStringLiteral (lit : StringLiteral) : EmitM Unit := do
