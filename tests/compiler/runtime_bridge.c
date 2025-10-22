@@ -52,6 +52,22 @@
 #define lean_nat_to_int lean_nat_to_int_inline
 #define lean_int_neg lean_int_neg_inline
 #define lean_nat_abs lean_nat_abs_inline
+#define lean_int_dec_lt lean_int_dec_lt_inline
+#define lean_uint16_to_nat lean_uint16_to_nat_inline
+#define lean_float_to_uint8 lean_float_to_uint8_inline
+#define lean_float_to_uint16 lean_float_to_uint16_inline
+#define lean_float_to_uint32 lean_float_to_uint32_inline
+#define lean_float_to_uint64 lean_float_to_uint64_inline
+#define lean_float_to_usize lean_float_to_usize_inline
+#define lean_uint64_to_float lean_uint64_to_float_inline
+#define lean_float_add lean_float_add_inline
+#define lean_float_sub lean_float_sub_inline
+#define lean_float_mul lean_float_mul_inline
+#define lean_float_div lean_float_div_inline
+#define lean_float_negate lean_float_negate_inline
+#define lean_float_beq lean_float_beq_inline
+#define lean_float_decLe lean_float_decLe_inline
+#define lean_float_decLt lean_float_decLt_inline
 
 #include <stdio.h>
 #include <lean/lean.h>
@@ -110,6 +126,22 @@
 #undef lean_nat_to_int
 #undef lean_int_neg
 #undef lean_nat_abs
+#undef lean_int_dec_lt
+#undef lean_uint16_to_nat
+#undef lean_float_to_uint8
+#undef lean_float_to_uint16
+#undef lean_float_to_uint32
+#undef lean_float_to_uint64
+#undef lean_float_to_usize
+#undef lean_uint64_to_float
+#undef lean_float_add
+#undef lean_float_sub
+#undef lean_float_mul
+#undef lean_float_div
+#undef lean_float_negate
+#undef lean_float_beq
+#undef lean_float_decLe
+#undef lean_float_decLt
 
 #ifdef __cplusplus
 extern "C" {
@@ -344,6 +376,72 @@ LEAN_EXPORT lean_object* lean_int_neg(lean_object* a) {
 
 LEAN_EXPORT lean_object* lean_nat_abs(lean_object* i) {
   return lean_nat_abs_inline(i);
+}
+
+LEAN_EXPORT uint8_t lean_int_dec_lt(lean_object* a1, lean_object* a2) {
+  return lean_int_dec_lt_inline(a1, a2);
+}
+
+LEAN_EXPORT lean_object* lean_uint16_to_nat(uint16_t a) {
+  return lean_uint16_to_nat_inline(a);
+}
+
+// Float conversion operations
+LEAN_EXPORT uint8_t lean_float_to_uint8(double a) {
+  return lean_float_to_uint8_inline(a);
+}
+
+LEAN_EXPORT uint16_t lean_float_to_uint16(double a) {
+  return lean_float_to_uint16_inline(a);
+}
+
+LEAN_EXPORT uint32_t lean_float_to_uint32(double a) {
+  return lean_float_to_uint32_inline(a);
+}
+
+LEAN_EXPORT uint64_t lean_float_to_uint64(double a) {
+  return lean_float_to_uint64_inline(a);
+}
+
+LEAN_EXPORT size_t lean_float_to_usize(double a) {
+  return lean_float_to_usize_inline(a);
+}
+
+LEAN_EXPORT double lean_uint64_to_float(uint64_t a) {
+  return lean_uint64_to_float_inline(a);
+}
+
+// Float arithmetic operations
+LEAN_EXPORT double lean_float_add(double a, double b) {
+  return lean_float_add_inline(a, b);
+}
+
+LEAN_EXPORT double lean_float_sub(double a, double b) {
+  return lean_float_sub_inline(a, b);
+}
+
+LEAN_EXPORT double lean_float_mul(double a, double b) {
+  return lean_float_mul_inline(a, b);
+}
+
+LEAN_EXPORT double lean_float_div(double a, double b) {
+  return lean_float_div_inline(a, b);
+}
+
+LEAN_EXPORT double lean_float_negate(double a) {
+  return lean_float_negate_inline(a);
+}
+
+LEAN_EXPORT uint8_t lean_float_beq(double a, double b) {
+  return lean_float_beq_inline(a, b);
+}
+
+LEAN_EXPORT uint8_t lean_float_decLe(double a, double b) {
+  return lean_float_decLe_inline(a, b);
+}
+
+LEAN_EXPORT uint8_t lean_float_decLt(double a, double b) {
+  return lean_float_decLt_inline(a, b);
 }
 
 #ifdef __cplusplus
