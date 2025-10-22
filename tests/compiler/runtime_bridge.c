@@ -33,6 +33,12 @@
 #define lean_array_fget_borrowed lean_array_fget_borrowed_inline
 #define lean_array_get lean_array_get_inline
 #define lean_uint8_to_nat lean_uint8_to_nat_inline
+#define lean_uint64_to_nat lean_uint64_to_nat_inline
+#define lean_uint64_of_nat lean_uint64_of_nat_inline
+#define lean_usize_to_nat lean_usize_to_nat_inline
+#define lean_array_set lean_array_set_inline
+#define lean_array_fget lean_array_fget_inline
+#define lean_array_fset lean_array_fset_inline
 
 #include <stdio.h>
 #include <lean/lean.h>
@@ -72,6 +78,12 @@
 #undef lean_array_fget_borrowed
 #undef lean_array_get
 #undef lean_uint8_to_nat
+#undef lean_uint64_to_nat
+#undef lean_uint64_of_nat
+#undef lean_usize_to_nat
+#undef lean_array_set
+#undef lean_array_fget
+#undef lean_array_fset
 
 #ifdef __cplusplus
 extern "C" {
@@ -221,6 +233,35 @@ LEAN_EXPORT lean_object* lean_array_get(lean_object* def_val, lean_object* a, le
 
 LEAN_EXPORT lean_object* lean_uint8_to_nat(uint8_t n) {
   return lean_uint8_to_nat_inline(n);
+}
+
+// Additional array operations
+LEAN_EXPORT lean_object* lean_array_fget(lean_object* a, lean_object* i) {
+  return lean_array_fget_inline(a, i);
+}
+
+LEAN_EXPORT lean_object* lean_array_fset(lean_object* a, lean_object* i, lean_object* v) {
+  return lean_array_fset_inline(a, i, v);
+}
+
+LEAN_EXPORT lean_object* lean_array_set(lean_object* a, lean_object* i, lean_object* v) {
+  return lean_array_set_inline(a, i, v);
+}
+
+// Nat/Int conversions - lean_nat_to_int and lean_uint64_to_usize are already inline in lean.h
+
+LEAN_EXPORT lean_object* lean_uint64_to_nat(uint64_t n) {
+  return lean_uint64_to_nat_inline(n);
+}
+
+LEAN_EXPORT uint64_t lean_uint64_of_nat(lean_object* n) {
+  return lean_uint64_of_nat_inline(n);
+}
+
+// Usize operations - lean_usize_dec_le, lean_usize_land, lean_usize_shift_* are already inline in lean.h
+
+LEAN_EXPORT lean_object* lean_usize_to_nat(size_t n) {
+  return lean_usize_to_nat_inline(n);
 }
 
 #ifdef __cplusplus

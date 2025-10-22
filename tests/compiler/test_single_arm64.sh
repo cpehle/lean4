@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
 EOF
 
 LIB_DIR=$(cd ../../build/release/stage1/lib/lean && pwd)
-leanc ${LEANC_OPTS-} -O3 -DNDEBUG -mmacosx-version-min=15.0 \
+leanc ${LEANC_OPTS-} -O3 -DNDEBUG -mmacosx-version-min=15.3 \
   -o "$f.arm64.out" "$f.arm64.s" "$f.arm64_shim.c" runtime_bridge.c \
   -L"$LIB_DIR" -Wl,-force_load,"$LIB_DIR"/libLean.a \
   -Wl,-force_load,"$LIB_DIR"/libleanrt.a \
