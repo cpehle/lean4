@@ -28,11 +28,16 @@
 #define lean_usize_of_nat lean_usize_of_nat_inline
 #define lean_task_spawn lean_task_spawn_inline
 #define lean_task_get_own lean_task_get_own_inline
+#define lean_thunk_get_own lean_thunk_get_own_inline
+#define lean_mk_thunk lean_mk_thunk_inline
 #define lean_nat_mod lean_nat_mod_inline
 #define lean_array_pop lean_array_pop_inline
 #define lean_array_fget_borrowed lean_array_fget_borrowed_inline
 #define lean_array_get lean_array_get_inline
 #define lean_uint8_to_nat lean_uint8_to_nat_inline
+#define lean_uint32_to_nat lean_uint32_to_nat_inline
+#define lean_uint32_of_nat lean_uint32_of_nat_inline
+#define lean_uint32_dec_eq lean_uint32_dec_eq_inline
 #define lean_uint64_to_nat lean_uint64_to_nat_inline
 #define lean_uint64_of_nat lean_uint64_of_nat_inline
 #define lean_usize_to_nat lean_usize_to_nat_inline
@@ -42,6 +47,7 @@
 #define lean_nat_shiftr lean_nat_shiftr_inline
 #define lean_string_dec_eq lean_string_dec_eq_inline
 #define lean_string_dec_lt lean_string_dec_lt_inline
+#define lean_string_utf8_byte_size lean_string_utf8_byte_size_inline
 
 #include <stdio.h>
 #include <lean/lean.h>
@@ -76,11 +82,16 @@
 #undef lean_usize_of_nat
 #undef lean_task_spawn
 #undef lean_task_get_own
+#undef lean_thunk_get_own
+#undef lean_mk_thunk
 #undef lean_nat_mod
 #undef lean_array_pop
 #undef lean_array_fget_borrowed
 #undef lean_array_get
 #undef lean_uint8_to_nat
+#undef lean_uint32_to_nat
+#undef lean_uint32_of_nat
+#undef lean_uint32_dec_eq
 #undef lean_uint64_to_nat
 #undef lean_uint64_of_nat
 #undef lean_usize_to_nat
@@ -90,6 +101,7 @@
 #undef lean_nat_shiftr
 #undef lean_string_dec_eq
 #undef lean_string_dec_lt
+#undef lean_string_utf8_byte_size
 
 #ifdef __cplusplus
 extern "C" {
@@ -212,6 +224,15 @@ LEAN_EXPORT uint8_t lean_nat_dec_lt(lean_object* a1, lean_object* a2) {
   return lean_nat_dec_lt_inline(a1, a2);
 }
 
+// Thunk operations
+LEAN_EXPORT lean_object* lean_mk_thunk(lean_object* c) {
+  return lean_mk_thunk_inline(c);
+}
+
+LEAN_EXPORT lean_object* lean_thunk_get_own(lean_object* t) {
+  return lean_thunk_get_own_inline(t);
+}
+
 // Task operations
 LEAN_EXPORT lean_object* lean_task_spawn(lean_object* c, lean_object* prio) {
   return lean_task_spawn_inline(c, prio);
@@ -239,6 +260,18 @@ LEAN_EXPORT lean_object* lean_array_get(lean_object* def_val, lean_object* a, le
 
 LEAN_EXPORT lean_object* lean_uint8_to_nat(uint8_t n) {
   return lean_uint8_to_nat_inline(n);
+}
+
+LEAN_EXPORT lean_object* lean_uint32_to_nat(uint32_t n) {
+  return lean_uint32_to_nat_inline(n);
+}
+
+LEAN_EXPORT uint32_t lean_uint32_of_nat(lean_object* n) {
+  return lean_uint32_of_nat_inline(n);
+}
+
+LEAN_EXPORT uint8_t lean_uint32_dec_eq(uint32_t a1, uint32_t a2) {
+  return lean_uint32_dec_eq_inline(a1, a2);
 }
 
 // Additional array operations
@@ -282,6 +315,10 @@ LEAN_EXPORT uint8_t lean_string_dec_eq(lean_object* a, lean_object* b) {
 
 LEAN_EXPORT uint8_t lean_string_dec_lt(lean_object* a, lean_object* b) {
   return lean_string_dec_lt_inline(a, b);
+}
+
+LEAN_EXPORT lean_object* lean_string_utf8_byte_size(lean_object* a) {
+  return lean_string_utf8_byte_size_inline(a);
 }
 
 #ifdef __cplusplus

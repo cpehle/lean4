@@ -969,9 +969,18 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
         emit (Instr.bl "lean_unsigned_to_nat_export")
         if dstReg != .phys PhysReg.x0 then
           emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
-      else
+      else if n < UInt64.size then
         loadImm64 (.phys PhysReg.x0) n
         emit (Instr.bl "lean_uint64_to_nat")
+        if dstReg != .phys PhysReg.x0 then
+          emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+      else
+        -- Numbers that do not fit in 64 bits: materialize via decimal string like the C backend
+        let decStr := toString n
+        let lit ← getStringLiteral decStr
+        emit (Instr.adrp (.phys PhysReg.x0) s!"{lit.ptrLabel}@PAGE")
+        emit (Instr.ldr (.phys PhysReg.x0) (.reg (.phys PhysReg.x0)) s!", {lit.ptrLabel}@PAGEOFF")
+        emit (Instr.bl "lean_cstr_to_nat")
         if dstReg != .phys PhysReg.x0 then
           emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
 
@@ -1323,12 +1332,10 @@ def selectDecl (decl : Decl) : SelectM MachineFunction := do
       let callStackBytes := extra * 8
       ((argBytes + callStackBytes + 15) / 16) * 16
     else
-      -- Normal function: space for spilled variables + parameter save area
-      -- Parameters 0-7 need extra spill slots to preserve values when registers get reused
-      let paramSaveSlots := min _params.size 8
-      let totalSlots := numSpilled + paramSaveSlots
-      ((totalSlots * 8 + 15) / 16) * 16
-    modify fun st => { st with stackSpillBytes := spillBytes }
+      -- Normal function: use pre-calculated stack size from register allocation
+      s.stackSpillBytes
+    if isBoxed then
+      modify fun st => { st with stackSpillBytes := spillBytes }
 
     -- Function prologue
     let allocState := s.allocState
@@ -1486,11 +1493,12 @@ def compileDecl (env : Environment) (decl : Decl) : MachineFunction :=
     | .fdecl name _ _ _ _ => name
     | _ => `unknown
 
-  -- Initialize instruction selection state
+  -- Initialize instruction selection state with temporary stack size
+  -- (will be recalculated after instruction selection based on actual usage)
   let initState : SelectState := {
     instrs := #[],
     allocState := allocState,
-    stackSpillBytes := ((allocState.nextStackSlot * 8 + 15) / 16) * 16,
+    stackSpillBytes := 0,  -- Temporary, will be set during selectDecl
     nextLabel := 0,
     jpLabels := {},
     jpParams := {},
