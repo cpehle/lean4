@@ -114,6 +114,12 @@ def getJPLabel (j : JoinPointId) : SelectM String := do
     modify fun s => { s with jpLabels := s.jpLabels.insert j.idx lbl }
     return lbl
 
+/-- Sanitize a string for use as an assembly label by replacing problematic characters -/
+def sanitizeForLabel (s : String) : String :=
+  -- Replace apostrophes with underscore to avoid ARM64 assembly syntax errors
+  -- Apostrophes have special meaning in ARM64 assembly (character literals)
+  s.replace "'" "_"
+
 /-- Get the external C name for an extern function -/
 def getExternCName (extData : ExternAttrData) : Option String :=
   match extData.entries.findSome? fun entry =>
@@ -1022,7 +1028,7 @@ partial def selectFnBody (body : FnBody) : SelectM Unit := do
           | .erased =>
             emit (Instr.mov (.phys argReg) (.imm 1))  -- lean_box(0)
         -- Branch back to function start (after prologue)
-        emit (Instr.b s!".Lfn_start_{currentFn}")
+        emit (Instr.b s!".Lfn_start_{sanitizeForLabel currentFn.toString}")
       | _ => pure () -- Should not happen based on isTailCallTo check
     else
       -- Normal variable declaration
@@ -1438,7 +1444,7 @@ def selectDecl (decl : Decl) : SelectM MachineFunction := do
 
       -- Add label for tail call optimization BEFORE parameter saves
       -- Tail calls will put new values in x0-x7, then jump here to re-save them
-      emit (Instr.label s!".Lfn_start_{f}")
+      emit (Instr.label s!".Lfn_start_{sanitizeForLabel f.toString}")
 
       -- Save parameters from x0-x7 to their allocated registers
       -- This happens on initial entry AND when tail calls jump to .Lfn_start

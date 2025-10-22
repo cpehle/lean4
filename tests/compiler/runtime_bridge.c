@@ -39,6 +39,9 @@
 #define lean_array_set lean_array_set_inline
 #define lean_array_fget lean_array_fget_inline
 #define lean_array_fset lean_array_fset_inline
+#define lean_nat_shiftr lean_nat_shiftr_inline
+#define lean_string_dec_eq lean_string_dec_eq_inline
+#define lean_string_dec_lt lean_string_dec_lt_inline
 
 #include <stdio.h>
 #include <lean/lean.h>
@@ -84,6 +87,9 @@
 #undef lean_array_set
 #undef lean_array_fget
 #undef lean_array_fset
+#undef lean_nat_shiftr
+#undef lean_string_dec_eq
+#undef lean_string_dec_lt
 
 #ifdef __cplusplus
 extern "C" {
@@ -262,6 +268,20 @@ LEAN_EXPORT uint64_t lean_uint64_of_nat(lean_object* n) {
 
 LEAN_EXPORT lean_object* lean_usize_to_nat(size_t n) {
   return lean_usize_to_nat_inline(n);
+}
+
+// Nat operations
+LEAN_EXPORT lean_object* lean_nat_shiftr(lean_object* a, lean_object* b) {
+  return lean_nat_shiftr_inline(a, b);
+}
+
+// String operations
+LEAN_EXPORT uint8_t lean_string_dec_eq(lean_object* a, lean_object* b) {
+  return lean_string_dec_eq_inline(a, b);
+}
+
+LEAN_EXPORT uint8_t lean_string_dec_lt(lean_object* a, lean_object* b) {
+  return lean_string_dec_lt_inline(a, b);
 }
 
 #ifdef __cplusplus
