@@ -942,20 +942,18 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
     let xReg ← varToReg x
     emit (Instr.comment "box")
     if ty.isScalar then
-      emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
-      emit (Instr.bl "lean_box_export")
-      if dstReg != .phys PhysReg.x0 then
-        emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+      -- Inline scalar boxing: shift left by 1 and set low bit
+      -- This marks the value as a boxed scalar (odd pointer = scalar)
+      emit (Instr.lsl dstReg xReg (.imm 1))
+      emit (Instr.orr dstReg dstReg (.imm 1))
     else
       emit (Instr.mov dstReg (.reg xReg))
 
   | .unbox x =>
     let xReg ← varToReg x
     emit (Instr.comment "unbox")
-    emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
-    emit (Instr.bl "lean_unbox_export")
-    if dstReg != .phys PhysReg.x0 then
-      emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+    -- Inline scalar unboxing: arithmetic shift right by 1 to extract value
+    emit (Instr.asr dstReg xReg (.imm 1))
 
   | .lit (.num n) =>
     if dstType.isScalar then
