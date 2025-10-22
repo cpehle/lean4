@@ -1319,23 +1319,23 @@ def selectDecl (decl : Decl) : SelectM MachineFunction := do
     for param in _params do
       modify fun st => { st with varTypes := st.varTypes.insert param.x.idx param.ty }
 
-    -- Calculate stack frame size
+    -- Get stack frame size (already calculated during initialization)
     let s ← get
     let numSpilled := s.allocState.nextStackSlot
 
-    -- Check if this is a boxed function to calculate correct stack size
+    -- Check if this is a boxed function - needs special stack layout
     let isBoxed := _params.size > Lean.closureMaxArgs && Lean.IR.ExplicitBoxing.isBoxedName f
-    let spillBytes := if isBoxed then
+    if isBoxed then
       -- Boxed wrapper needs space for all args (will be unpacked from array)
       let argBytes := _params.size * 8
       let extra := if _params.size > 8 then _params.size - 8 else 0
       let callStackBytes := extra * 8
-      ((argBytes + callStackBytes + 15) / 16) * 16
-    else
-      -- Normal function: use pre-calculated stack size from register allocation
-      s.stackSpillBytes
-    if isBoxed then
-      modify fun st => { st with stackSpillBytes := spillBytes }
+      let boxedSpillBytes := ((argBytes + callStackBytes + 15) / 16) * 16
+      modify fun st => { st with stackSpillBytes := boxedSpillBytes }
+
+    -- Get the (possibly updated) stack size
+    let s ← get
+    let spillBytes := s.stackSpillBytes
 
     -- Function prologue
     let allocState := s.allocState
@@ -1493,12 +1493,12 @@ def compileDecl (env : Environment) (decl : Decl) : MachineFunction :=
     | .fdecl name _ _ _ _ => name
     | _ => `unknown
 
-  -- Initialize instruction selection state with temporary stack size
-  -- (will be recalculated after instruction selection based on actual usage)
+  -- Initialize instruction selection state
+  -- Calculate stack size based on register allocation results
   let initState : SelectState := {
     instrs := #[],
     allocState := allocState,
-    stackSpillBytes := 0,  -- Temporary, will be set during selectDecl
+    stackSpillBytes := ((allocState.nextStackSlot * 8 + 15) / 16) * 16,
     nextLabel := 0,
     jpLabels := {},
     jpParams := {},
