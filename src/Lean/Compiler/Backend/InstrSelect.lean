@@ -623,89 +623,100 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
   | .ctor info args =>
     emit (Instr.comment s!"ctor {info.name} (tag={info.cidx}, objs={info.size}, scalar={info.ssize})")
 
-    let destSlot? := s.allocState.stackSlots.get? dst.idx
-    let stackSlotInfo? := destSlot?.map fun slot => (slot, Int.ofNat (slot * 8))
-    let pointerReg? : Option Reg := if isSpilled then none else some dstReg
+    -- Zero-sized constructors (no objects, no scalars) should be represented as boxed tags
+    if info.size == 0 && info.ssize == 0 then
+      -- Just box the tag value: (tag << 1) | 1
+      let tagVal := info.cidx * 2 + 1
+      emit (Instr.mov dstReg (.imm (Int.ofNat tagVal)))
+      if isSpilled then
+        match s.allocState.stackSlots.get? dst.idx with
+        | some slot => storeToStackSlot dstReg slot
+        | none => pure ()
+    else
+      -- Normal constructor allocation
+      let destSlot? := s.allocState.stackSlots.get? dst.idx
+      let stackSlotInfo? := destSlot?.map fun slot => (slot, Int.ofNat (slot * 8))
+      let pointerReg? : Option Reg := if isSpilled then none else some dstReg
 
-    -- CRITICAL: When we keep the constructor pointer in a register we must ensure that
-    -- arguments using the same register are preserved before runtime calls.
-    let mut conflictVar : Option VarId := none
-    match pointerReg? with
-    | some tempReg =>
-      for arg in args do
+      -- CRITICAL: When we keep the constructor pointer in a register we must ensure that
+      -- arguments using the same register are preserved before runtime calls.
+      let mut conflictVar : Option VarId := none
+      match pointerReg? with
+      | some tempReg =>
+        for arg in args do
+          match arg with
+          | .var v =>
+            let vReg ← varToReg v
+            if vReg == tempReg then
+              conflictVar := some v
+              break
+          | .erased => pure ()
+      | none => pure ()
+
+      -- If there's a conflict, save the argument value before we overwrite the register.
+      match pointerReg? with
+      | some tempReg =>
+        match conflictVar with
+        | some v =>
+          emit (Instr.comment s!"save vreg{v.idx} from {tempReg} to x9 (constructor will overwrite {tempReg})")
+          emit (Instr.mov (.phys PhysReg.x9) (.reg tempReg))
+        | none => pure ()
+      | none => pure ()
+
+      -- Call lean_alloc_ctor(tag, num_objs, scalar_sz)
+      -- Arguments: x0=tag, x1=num_objs, x2=scalar_sz
+      emit (Instr.mov (.phys PhysReg.x0) (.imm (Int.ofNat info.cidx)))
+      emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat info.size)))
+      emit (Instr.mov (.phys PhysReg.x2) (.imm (Int.ofNat info.ssize)))
+      emit (Instr.bl "lean_alloc_ctor")
+      -- lean_ctor_set can clobber caller-saved registers (x0-x18).
+      -- Keep the constructor pointer either in a callee-saved register or spill directly to stack.
+      match pointerReg? with
+      | some tempReg =>
+        emit (Instr.mov tempReg (.reg (.phys PhysReg.x0)))
+      | none =>
+        match stackSlotInfo? with
+        | some (slot, offset) =>
+          emit (Instr.comment s!"store constructor for spilled dst vreg{dst.idx} into stack slot {slot}")
+          emit (Instr.str (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) offset))
+          spillHandled := true
+        | none =>
+          emit (Instr.comment s!"ERROR: spilled constructor destination vreg{dst.idx} has no stack slot")
+
+      -- Set fields using lean_ctor_set(o, i, v)
+      for i in [:args.size] do
+        let arg := args[i]!
         match arg with
         | .var v =>
+          -- Load the argument value, using x9 if it's the saved conflict variable
           let vReg ← varToReg v
-          if vReg == tempReg then
-            conflictVar := some v
-            break
-        | .erased => pure ()
-    | none => pure ()
-
-    -- If there's a conflict, save the argument value before we overwrite the register.
-    match pointerReg? with
-    | some tempReg =>
-      match conflictVar with
-      | some v =>
-        emit (Instr.comment s!"save vreg{v.idx} from {tempReg} to x9 (constructor will overwrite {tempReg})")
-        emit (Instr.mov (.phys PhysReg.x9) (.reg tempReg))
-      | none => pure ()
-    | none => pure ()
-
-    -- Call lean_alloc_ctor(tag, num_objs, scalar_sz)
-    -- Arguments: x0=tag, x1=num_objs, x2=scalar_sz
-    emit (Instr.mov (.phys PhysReg.x0) (.imm (Int.ofNat info.cidx)))
-    emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat info.size)))
-    emit (Instr.mov (.phys PhysReg.x2) (.imm (Int.ofNat info.ssize)))
-    emit (Instr.bl "lean_alloc_ctor")
-    -- lean_ctor_set can clobber caller-saved registers (x0-x18).
-    -- Keep the constructor pointer either in a callee-saved register or spill directly to stack.
-    match pointerReg? with
-    | some tempReg =>
-      emit (Instr.mov tempReg (.reg (.phys PhysReg.x0)))
-    | none =>
-      match stackSlotInfo? with
-      | some (slot, offset) =>
-        emit (Instr.comment s!"store constructor for spilled dst vreg{dst.idx} into stack slot {slot}")
-        emit (Instr.str (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) offset))
-        spillHandled := true
-      | none =>
-        emit (Instr.comment s!"ERROR: spilled constructor destination vreg{dst.idx} has no stack slot")
-
-    -- Set fields using lean_ctor_set(o, i, v)
-    for i in [:args.size] do
-      let arg := args[i]!
-      match arg with
-      | .var v =>
-        -- Load the argument value, using x9 if it's the saved conflict variable
-        let vReg ← varToReg v
-        let actualReg := match conflictVar with
-          | some cv => if cv == v then Reg.phys PhysReg.x9 else vReg
-          | none => vReg
-        -- Load constructor from tempReg (preserved across calls since it's callee-saved)
-        match pointerReg? with
-        | some tempReg =>
-          emit (Instr.mov (.phys PhysReg.x0) (.reg tempReg))
-          -- tempReg is callee-saved, so the constructor pointer survives the call
-        | none =>
-          match stackSlotInfo? with
-          | some (_, offset) =>
-            emit (Instr.ldr (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) offset))
+          let actualReg := match conflictVar with
+            | some cv => if cv == v then Reg.phys PhysReg.x9 else vReg
+            | none => vReg
+          -- Load constructor from tempReg (preserved across calls since it's callee-saved)
+          match pointerReg? with
+          | some tempReg =>
+            emit (Instr.mov (.phys PhysReg.x0) (.reg tempReg))
+            -- tempReg is callee-saved, so the constructor pointer survives the call
           | none =>
-            emit (Instr.comment s!"ERROR: missing constructor pointer for spilled dst vreg{dst.idx}")
-        emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat i)))
-        emit (Instr.mov (.phys PhysReg.x2) (.reg actualReg))
-        emit (Instr.bl "lean_ctor_set")
-        -- tempReg is callee-saved, so still contains the constructor
-      | .erased =>
-        emit (Instr.comment s!"field {i} erased")
+            match stackSlotInfo? with
+            | some (_, offset) =>
+              emit (Instr.ldr (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) offset))
+            | none =>
+              emit (Instr.comment s!"ERROR: missing constructor pointer for spilled dst vreg{dst.idx}")
+          emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat i)))
+          emit (Instr.mov (.phys PhysReg.x2) (.reg actualReg))
+          emit (Instr.bl "lean_ctor_set")
+          -- tempReg is callee-saved, so still contains the constructor
+        | .erased =>
+          emit (Instr.comment s!"field {i} erased")
 
-    -- Move result to final destination
-    match pointerReg? with
-    | some tempReg =>
-      if tempReg != dstReg then
-        emit (Instr.mov dstReg (.reg tempReg))
-    | none => pure ()
+      -- Move result to final destination
+      match pointerReg? with
+      | some tempReg =>
+        if tempReg != dstReg then
+          emit (Instr.mov dstReg (.reg tempReg))
+      | none => pure ()
 
   | .reset n x =>
     let xReg ← varToReg x
