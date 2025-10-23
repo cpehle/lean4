@@ -33,6 +33,31 @@ def scratchCandidates : List PhysReg :=
    PhysReg.x20, PhysReg.x21, PhysReg.x22, PhysReg.x23, PhysReg.x24, PhysReg.x25, PhysReg.x26,
    PhysReg.x27, PhysReg.x28]
 
+/-- Convert IRType to FloatPrec -/
+def typeToFloatPrec (ty : IRType) : FloatPrec :=
+  match ty with
+  | .float32 => FloatPrec.single
+  | .float => FloatPrec.double
+  | _ => FloatPrec.double  -- Default to double for safety
+
+/-- Check if a physical register is a floating-point register -/
+def isPhysFPReg (r : PhysReg) : Bool :=
+  match r with
+  | .v0 | .v1 | .v2 | .v3 | .v4 | .v5 | .v6 | .v7
+  | .v8 | .v9 | .v10 | .v11 | .v12 | .v13 | .v14 | .v15
+  | .v16 | .v17 | .v18 | .v19 | .v20 | .v21 | .v22 | .v23
+  | .v24 | .v25 | .v26 | .v27 | .v28 | .v29 | .v30 | .v31 => true
+  | _ => false
+
+/-- Check if a register (physical or virtual) might be an FP register -/
+def isFPReg (r : Reg) (allocState : AllocState) : Bool :=
+  match r with
+  | .phys p => isPhysFPReg p
+  | .virt v =>
+    match allocState.allocation.get? v.idx with
+    | some p => isPhysFPReg p
+    | none => false  -- Spilled or not yet allocated
+
 /-- Test membership using only the `BEq` instance. -/
 def physMem (l : List PhysReg) (r : PhysReg) : Bool :=
   match l with
@@ -83,6 +108,8 @@ structure SelectState where
   varTypes : Std.TreeMap Index IRType (fun a b => compare a b)
   /-- Function parameters (for accessing stack parameters) -/
   params : Array Param
+  /-- Function return type (for correct register selection in returns) -/
+  returnType : IRType
 
 abbrev SelectM := StateM SelectState
 
@@ -93,6 +120,34 @@ def emit (instr : Instr) : SelectM Unit :=
 /-- Emit multiple instructions -/
 def emitAll (instrs : Array Instr) : SelectM Unit :=
   modify fun s => { s with instrs := s.instrs ++ instrs }
+
+/-- Emit a move instruction, automatically using fmov when moving between register classes -/
+def emitMove (dst : Reg) (src : Operand) : SelectM Unit := do
+  let allocState := (← get).allocState
+  match src with
+  | .reg srcReg =>
+    -- Check if we're moving between different register classes
+    -- For physical registers, check directly; for virtual registers, check allocation
+    let dstIsFP := match dst with
+      | .phys p => isPhysFPReg p
+      | .virt v => match allocState.allocation.get? v.idx with
+        | some p => isPhysFPReg p
+        | none => false
+    let srcIsFP := match srcReg with
+      | .phys p => isPhysFPReg p
+      | .virt v => match allocState.allocation.get? v.idx with
+        | some p => isPhysFPReg p
+        | none => false
+    if dstIsFP != srcIsFP then
+      -- Moving between GP and FP registers - use fmov with double precision
+      -- The assembler will infer the correct variant based on register names
+      emit (Instr.fmov FloatPrec.double dst srcReg)
+    else
+      -- Same register class - use regular mov
+      emit (Instr.mov dst src)
+  | _ =>
+    -- Immediate or memory operand - use regular mov
+    emit (Instr.mov dst src)
 
 /-- Generate a fresh label unique to this function -/
 def freshLabel (pfx : String := "L") : SelectM String := do
@@ -116,9 +171,12 @@ def getJPLabel (j : JoinPointId) : SelectM String := do
 
 /-- Sanitize a string for use as an assembly label by replacing problematic characters -/
 def sanitizeForLabel (s : String) : String :=
-  -- Replace apostrophes with underscore to avoid ARM64 assembly syntax errors
-  -- Apostrophes have special meaning in ARM64 assembly (character literals)
-  s.replace "'" "_"
+  -- Replace special characters that cause assembly syntax errors
+  -- Keep only alphanumerics, underscores, and dots
+  let chars := s.toList
+  let sanitized := chars.map fun c =>
+    if c.isAlphanum || c == '_' || c == '.' then c else '_'
+  String.mk sanitized
 
 /-- Get the external C name for an extern function -/
 def getExternCName (extData : ExternAttrData) : Option String :=
@@ -184,14 +242,25 @@ def loadSpilledVar (v : VarId) (slot : Nat) : SelectM Reg := do
   let tmpReg := Reg.phys PhysReg.x8
   let offset := getStackOffset slot
   emit (Instr.comment s!"load spilled vreg{v.idx} from stack slot {slot}")
-  emit (Instr.ldr tmpReg (.mem (.phys PhysReg.sp) offset))
+  -- Check variable type to use correct load instruction
+  let st ← get
+  match st.varTypes.get? v.idx with
+  | some IRType.uint8 =>
+    emit (Instr.ldrb tmpReg (.mem (.phys PhysReg.sp) offset))
+  | _ =>
+    emit (Instr.ldr tmpReg (.mem (.phys PhysReg.sp) offset))
   return tmpReg
 
 /-- Store a register value to a spilled variable's stack slot -/
-def storeToStackSlot (reg : Reg) (slot : Nat) : SelectM Unit := do
+def storeToStackSlot (reg : Reg) (slot : Nat) (ty : IRType) : SelectM Unit := do
   let offset := getStackOffset slot
   emit (Instr.comment s!"store to stack slot {slot}")
-  emit (Instr.str reg (.mem (.phys PhysReg.sp) offset))
+  -- Use correct store instruction based on type
+  match ty with
+  | IRType.uint8 =>
+    emit (Instr.strb reg (.mem (.phys PhysReg.sp) offset))
+  | _ =>
+    emit (Instr.str reg (.mem (.phys PhysReg.sp) offset))
 
 /-- Get or create a string literal record for the current function. -/
 def getStringLiteral (value : String) : SelectM StringLiteral := do
@@ -275,12 +344,19 @@ def loadImm64 (dst : Reg) (value : Nat) : SelectM Unit := do
   if w2 != 0 then emit (Instr.movk dst w2 32)
   if w3 != 0 then emit (Instr.movk dst w3 48)
 
-/-- Get argument register for calling convention -/
+/-- Get argument register for calling convention (general-purpose) -/
 def getArgReg (i : Nat) : PhysReg :=
   match i with
   | 0 => PhysReg.x0 | 1 => PhysReg.x1 | 2 => PhysReg.x2 | 3 => PhysReg.x3
   | 4 => PhysReg.x4 | 5 => PhysReg.x5 | 6 => PhysReg.x6 | 7 => PhysReg.x7
   | _ => PhysReg.x8  -- Fallback
+
+/-- Get FP argument register for floating-point calling convention -/
+def getFPArgReg (i : Nat) : PhysReg :=
+  match i with
+  | 0 => PhysReg.v0 | 1 => PhysReg.v1 | 2 => PhysReg.v2 | 3 => PhysReg.v3
+  | 4 => PhysReg.v4 | 5 => PhysReg.v5 | 6 => PhysReg.v6 | 7 => PhysReg.v7
+  | _ => PhysReg.v16  -- Fallback
 
 /-- Store result to spilled variable if needed -/
 def storeSpilledDst (v : VarId) (srcReg : Reg) : SelectM Unit := do
@@ -289,7 +365,8 @@ def storeSpilledDst (v : VarId) (srcReg : Reg) : SelectM Unit := do
   match s.allocState.stackSlots.get? v.idx with
   | some slot =>
     emit (Instr.comment s!"store result to spilled vreg{v.idx}")
-    storeToStackSlot srcReg slot
+    let ty := s.varTypes.get? v.idx |>.getD IRType.object
+    storeToStackSlot srcReg slot ty
   | none => pure ()  -- Not spilled, already in register
 
 /-- Inline selected Lean runtime helper calls that are provided only as C header inlines.
@@ -302,10 +379,10 @@ def tryInlineExternCall (fnName : String) (args : Array Arg) (dstReg : Reg) : Se
       | .var v =>
         let vReg ← varToReg v
         emit (Instr.comment "call lean_box_export")
-        emit (Instr.mov (.phys PhysReg.x0) (.reg vReg))
+        emitMove (.phys PhysReg.x0) (.reg vReg)
         emit (Instr.bl "lean_box_export")
         if dstReg != .phys PhysReg.x0 then
-          emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+          emitMove dstReg (.reg (.phys PhysReg.x0))
       | .erased =>
         emit (Instr.comment "lean_box(erased)")
         emit (Instr.mov dstReg (.imm 1))
@@ -319,10 +396,10 @@ def tryInlineExternCall (fnName : String) (args : Array Arg) (dstReg : Reg) : Se
       | .var v =>
         let vReg ← varToReg v
         emit (Instr.comment "call lean_unbox_export")
-        emit (Instr.mov (.phys PhysReg.x0) (.reg vReg))
+        emitMove (.phys PhysReg.x0) (.reg vReg)
         emit (Instr.bl "lean_unbox_export")
         if dstReg != .phys PhysReg.x0 then
-          emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+          emitMove dstReg (.reg (.phys PhysReg.x0))
       | .erased =>
         emit (Instr.comment "lean_unbox(erased)")
         emit (Instr.mov dstReg (.imm 0))
@@ -400,33 +477,90 @@ def tryInlineExternCall (fnName : String) (args : Array Arg) (dstReg : Reg) : Se
   | "_lean_io_result_mk_ok" =>
     if args.size == 1 then
       emit (Instr.comment "inline lean_io_result_mk_ok")
-      -- Allocate constructor: lean_alloc_ctor(0, 2, 0)
-      emit (Instr.mov (.phys PhysReg.x0) (.imm 0))
-      emit (Instr.mov (.phys PhysReg.x1) (.imm 2))
-      emit (Instr.mov (.phys PhysReg.x2) (.imm 0))
-      emit (Instr.bl "lean_alloc_ctor")
-      if dstReg != .phys PhysReg.x0 then
-        emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
-      -- Set result field 0 to argument
-      emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
-      emit (Instr.mov (.phys PhysReg.x1) (.imm 0))
+      -- Check if result value type is scalar by examining the function's return type
+      -- For initialize blocks like "initialize test : UInt64 ← pure 0",
+      -- returnType is IO.Result wrapping the actual type (UInt64)
+      let returnType := (← get).returnType
+      let isScalar := match returnType with
+        | .struct _ types | .union _ types =>
+          -- IO.Result is a struct/union with the value type as first element
+          if h : types.size > 0 then
+            types[0].isScalar
+          else
+            false
+        | ty => ty.isScalar
       match args[0]! with
       | .var v =>
-        let vReg ← varToReg v
-        emit (Instr.mov (.phys PhysReg.x2) (.reg vReg))
+        if isScalar then
+          -- Scalar result: allocate constructor with lean_alloc_ctor(0, 1, 1)
+          emit (Instr.comment "scalar result: num_objects=1, num_scalars=1")
+          emit (Instr.mov (.phys PhysReg.x0) (.imm 0))
+          emit (Instr.mov (.phys PhysReg.x1) (.imm 1))
+          emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
+          emit (Instr.bl "lean_alloc_ctor")
+          if dstReg != .phys PhysReg.x0 then
+            emitMove dstReg (.reg (.phys PhysReg.x0))
+          -- Set object field 0 to world token (lean_box(0) = 1)
+          emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
+          emit (Instr.mov (.phys PhysReg.x1) (.imm 0))
+          emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
+          emit (Instr.bl "lean_ctor_set")
+          if dstReg != .phys PhysReg.x0 then
+            emitMove dstReg (.reg (.phys PhysReg.x0))
+          -- Set scalar field 0 to result value using direct memory access
+          let vReg ← varToReg v
+          -- Scalar field offset: 8 (header) + 1 * 8 (one object field) = 16
+          emit (Instr.str vReg (.mem dstReg (Int.ofNat 16)))
+          return true
+        else
+          -- Object result: allocate constructor with lean_alloc_ctor(0, 2, 0)
+          emit (Instr.comment "object result: num_objects=2, num_scalars=0")
+          emit (Instr.mov (.phys PhysReg.x0) (.imm 0))
+          emit (Instr.mov (.phys PhysReg.x1) (.imm 2))
+          emit (Instr.mov (.phys PhysReg.x2) (.imm 0))
+          emit (Instr.bl "lean_alloc_ctor")
+          if dstReg != .phys PhysReg.x0 then
+            emitMove dstReg (.reg (.phys PhysReg.x0))
+          -- Set object field 0 to result value
+          emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
+          emit (Instr.mov (.phys PhysReg.x1) (.imm 0))
+          let vReg ← varToReg v
+          emitMove (.phys PhysReg.x2) (.reg vReg)
+          emit (Instr.bl "lean_ctor_set")
+          if dstReg != .phys PhysReg.x0 then
+            emitMove dstReg (.reg (.phys PhysReg.x0))
+          -- Set object field 1 to world token (lean_box(0) = 1)
+          emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
+          emit (Instr.mov (.phys PhysReg.x1) (.imm 1))
+          emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
+          emit (Instr.bl "lean_ctor_set")
+          if dstReg != .phys PhysReg.x0 then
+            emitMove dstReg (.reg (.phys PhysReg.x0))
+          return true
       | .erased =>
+        -- Erased result: treat as object (current behavior)
+        emit (Instr.comment "erased result: num_objects=2, num_scalars=0")
+        emit (Instr.mov (.phys PhysReg.x0) (.imm 0))
+        emit (Instr.mov (.phys PhysReg.x1) (.imm 2))
         emit (Instr.mov (.phys PhysReg.x2) (.imm 0))
-      emit (Instr.bl "lean_ctor_set")
-      if dstReg != .phys PhysReg.x0 then
-        emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
-      -- Set result field 1 to lean_box(0) = 1
-      emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
-      emit (Instr.mov (.phys PhysReg.x1) (.imm 1))
-      emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
-      emit (Instr.bl "lean_ctor_set")
-      if dstReg != .phys PhysReg.x0 then
-        emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
-      return true
+        emit (Instr.bl "lean_alloc_ctor")
+        if dstReg != .phys PhysReg.x0 then
+          emitMove dstReg (.reg (.phys PhysReg.x0))
+        -- Set object field 0 to lean_box(0) = 1
+        emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
+        emit (Instr.mov (.phys PhysReg.x1) (.imm 0))
+        emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
+        emit (Instr.bl "lean_ctor_set")
+        if dstReg != .phys PhysReg.x0 then
+          emitMove dstReg (.reg (.phys PhysReg.x0))
+        -- Set object field 1 to lean_box(0) = 1
+        emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
+        emit (Instr.mov (.phys PhysReg.x1) (.imm 1))
+        emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
+        emit (Instr.bl "lean_ctor_set")
+        if dstReg != .phys PhysReg.x0 then
+          emitMove dstReg (.reg (.phys PhysReg.x0))
+        return true
     else
       return false
 
@@ -463,7 +597,7 @@ def tryInlineExternCall (fnName : String) (args : Array Arg) (dstReg : Reg) : Se
         emit (Instr.bl "_lean_unsigned_to_nat")
         emit (Instr.bl "_lean_mk_empty_array_with_capacity")
       if dstReg != .phys PhysReg.x0 then
-        emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+        emitMove dstReg (.reg (.phys PhysReg.x0))
       return true
     else
       return false
@@ -601,6 +735,145 @@ def tryInlineExternCall (fnName : String) (args : Array Arg) (dstReg : Reg) : Se
     else
       return false
 
+  -- Floating-point arithmetic operations
+  | "lean_float_add" =>
+    if args.size == 2 then
+      match args[0]!, args[1]! with
+      | .var v1, .var v2 =>
+        let v1Reg ← varToReg v1
+        let v2Reg ← varToReg v2
+        emit (Instr.comment "inline lean_float_add")
+        -- Move from GPR to FP registers
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v16) v1Reg)
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v17) v2Reg)
+        -- Perform FP addition
+        emit (Instr.fadd FloatPrec.double (.phys PhysReg.v16) (.phys PhysReg.v16) (.phys PhysReg.v17))
+        -- Move result back to GPR
+        emit (Instr.fmov FloatPrec.double dstReg (.phys PhysReg.v16))
+        return true
+      | _, _ => return false
+    else
+      return false
+
+  | "lean_float_sub" =>
+    if args.size == 2 then
+      match args[0]!, args[1]! with
+      | .var v1, .var v2 =>
+        let v1Reg ← varToReg v1
+        let v2Reg ← varToReg v2
+        emit (Instr.comment "inline lean_float_sub")
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v16) v1Reg)
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v17) v2Reg)
+        emit (Instr.fsub FloatPrec.double (.phys PhysReg.v16) (.phys PhysReg.v16) (.phys PhysReg.v17))
+        emit (Instr.fmov FloatPrec.double dstReg (.phys PhysReg.v16))
+        return true
+      | _, _ => return false
+    else
+      return false
+
+  | "lean_float_mul" =>
+    if args.size == 2 then
+      match args[0]!, args[1]! with
+      | .var v1, .var v2 =>
+        let v1Reg ← varToReg v1
+        let v2Reg ← varToReg v2
+        emit (Instr.comment "inline lean_float_mul")
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v16) v1Reg)
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v17) v2Reg)
+        emit (Instr.fmul FloatPrec.double (.phys PhysReg.v16) (.phys PhysReg.v16) (.phys PhysReg.v17))
+        emit (Instr.fmov FloatPrec.double dstReg (.phys PhysReg.v16))
+        return true
+      | _, _ => return false
+    else
+      return false
+
+  | "lean_float_div" =>
+    if args.size == 2 then
+      match args[0]!, args[1]! with
+      | .var v1, .var v2 =>
+        let v1Reg ← varToReg v1
+        let v2Reg ← varToReg v2
+        emit (Instr.comment "inline lean_float_div")
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v16) v1Reg)
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v17) v2Reg)
+        emit (Instr.fdiv FloatPrec.double (.phys PhysReg.v16) (.phys PhysReg.v16) (.phys PhysReg.v17))
+        emit (Instr.fmov FloatPrec.double dstReg (.phys PhysReg.v16))
+        return true
+      | _, _ => return false
+    else
+      return false
+
+  | "lean_float_negate" =>
+    if args.size == 1 then
+      match args[0]! with
+      | .var v =>
+        let vReg ← varToReg v
+        emit (Instr.comment "inline lean_float_negate")
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v16) vReg)
+        emit (Instr.fneg FloatPrec.double (.phys PhysReg.v16) (.phys PhysReg.v16))
+        emit (Instr.fmov FloatPrec.double dstReg (.phys PhysReg.v16))
+        return true
+      | .erased => return false
+    else
+      return false
+
+  | "lean_float_beq" =>
+    if args.size == 2 then
+      match args[0]!, args[1]! with
+      | .var v1, .var v2 =>
+        let v1Reg ← varToReg v1
+        let v2Reg ← varToReg v2
+        emit (Instr.comment "inline lean_float_beq")
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v16) v1Reg)
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v17) v2Reg)
+        emit (Instr.fcmp FloatPrec.double (.phys PhysReg.v16) (.phys PhysReg.v17))
+        -- Set result to 1 if equal, 0 otherwise (as boxed scalar)
+        emit (Instr.mov (.phys PhysReg.x8) (.imm 1))
+        emit (Instr.csel dstReg (.phys PhysReg.x8) (.phys PhysReg.xzr) Cond.eq)
+        return true
+      | _, _ => return false
+    else
+      return false
+
+  | "lean_float_decLt" =>
+    if args.size == 2 then
+      match args[0]!, args[1]! with
+      | .var v1, .var v2 =>
+        let v1Reg ← varToReg v1
+        let v2Reg ← varToReg v2
+        emit (Instr.comment "inline lean_float_decLt")
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v16) v1Reg)
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v17) v2Reg)
+        emit (Instr.fcmp FloatPrec.double (.phys PhysReg.v16) (.phys PhysReg.v17))
+        -- Returns decidable: isTrue (boxed 0) or isFalse (boxed 1)
+        -- lt means v1 < v2, which sets the 'mi' (minus/negative) flag
+        emit (Instr.mov (.phys PhysReg.x8) (.imm 1))  -- isTrue tag = 0, boxed = 1
+        emit (Instr.mov (.phys PhysReg.x9) (.imm 3))  -- isFalse tag = 1, boxed = 3
+        emit (Instr.csel dstReg (.phys PhysReg.x8) (.phys PhysReg.x9) Cond.lt)
+        return true
+      | _, _ => return false
+    else
+      return false
+
+  | "lean_float_decLe" =>
+    if args.size == 2 then
+      match args[0]!, args[1]! with
+      | .var v1, .var v2 =>
+        let v1Reg ← varToReg v1
+        let v2Reg ← varToReg v2
+        emit (Instr.comment "inline lean_float_decLe")
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v16) v1Reg)
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v17) v2Reg)
+        emit (Instr.fcmp FloatPrec.double (.phys PhysReg.v16) (.phys PhysReg.v17))
+        -- le means v1 <= v2
+        emit (Instr.mov (.phys PhysReg.x8) (.imm 1))  -- isTrue tag = 0, boxed = 1
+        emit (Instr.mov (.phys PhysReg.x9) (.imm 3))  -- isFalse tag = 1, boxed = 3
+        emit (Instr.csel dstReg (.phys PhysReg.x8) (.phys PhysReg.x9) Cond.le)
+        return true
+      | _, _ => return false
+    else
+      return false
+
   | _ =>
     return false
 
@@ -611,9 +884,15 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
   let dstRegAndSpilled : Reg × Bool := match s.allocState.allocation.get? dst.idx with
   | some phys => (Reg.phys phys, false)
   | none =>
-    -- Destination is spilled, use temp register
+    -- Destination is spilled, use temp register based on type
     match s.allocState.stackSlots.get? dst.idx with
-    | some _ => (Reg.phys PhysReg.x8, true)
+    | some _ =>
+      -- Choose temp register based on destination type
+      let tempReg := if dstType == IRType.float || dstType == IRType.float32 then
+        Reg.phys PhysReg.v16  -- Use FP temp for float types
+      else
+        Reg.phys PhysReg.x8   -- Use GP temp for other types
+      (tempReg, true)
     | none => (Reg.virt dst, false)  -- Shouldn't happen
   let dstReg := dstRegAndSpilled.1
   let mut isSpilled := dstRegAndSpilled.2
@@ -630,7 +909,7 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
       emit (Instr.mov dstReg (.imm (Int.ofNat tagVal)))
       if isSpilled then
         match s.allocState.stackSlots.get? dst.idx with
-        | some slot => storeToStackSlot dstReg slot
+        | some slot => storeToStackSlot dstReg slot IRType.object
         | none => pure ()
     else
       -- Normal constructor allocation
@@ -686,6 +965,18 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
       -- Set fields using lean_ctor_set(o, i, v)
       for i in [:args.size] do
         let arg := args[i]!
+        -- Load constructor from tempReg (preserved across calls since it's callee-saved)
+        match pointerReg? with
+        | some tempReg =>
+          emit (Instr.mov (.phys PhysReg.x0) (.reg tempReg))
+          -- tempReg is callee-saved, so the constructor pointer survives the call
+        | none =>
+          match stackSlotInfo? with
+          | some (_, offset) =>
+            emit (Instr.ldr (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) offset))
+          | none =>
+            emit (Instr.comment s!"ERROR: missing constructor pointer for spilled dst vreg{dst.idx}")
+        emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat i)))
         match arg with
         | .var v =>
           -- Load the argument value, using x9 if it's the saved conflict variable
@@ -693,23 +984,12 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
           let actualReg := match conflictVar with
             | some cv => if cv == v then Reg.phys PhysReg.x9 else vReg
             | none => vReg
-          -- Load constructor from tempReg (preserved across calls since it's callee-saved)
-          match pointerReg? with
-          | some tempReg =>
-            emit (Instr.mov (.phys PhysReg.x0) (.reg tempReg))
-            -- tempReg is callee-saved, so the constructor pointer survives the call
-          | none =>
-            match stackSlotInfo? with
-            | some (_, offset) =>
-              emit (Instr.ldr (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) offset))
-            | none =>
-              emit (Instr.comment s!"ERROR: missing constructor pointer for spilled dst vreg{dst.idx}")
-          emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat i)))
-          emit (Instr.mov (.phys PhysReg.x2) (.reg actualReg))
-          emit (Instr.bl "lean_ctor_set")
-          -- tempReg is callee-saved, so still contains the constructor
+          emitMove (.phys PhysReg.x2) (.reg actualReg)
         | .erased =>
-          emit (Instr.comment s!"field {i} erased")
+          emit (Instr.comment s!"field {i} erased, set to lean_box(0) = 1")
+          emit (Instr.mov (.phys PhysReg.x2) (.imm 1))  -- lean_box(0) = 1
+        emit (Instr.bl "lean_ctor_set")
+        -- tempReg is callee-saved, so still contains the constructor
 
       -- Move result to final destination
       match pointerReg? with
@@ -738,12 +1018,14 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
 
   | .uproj i x =>
     let xReg ← varToReg x
-    let offset := i * 8
+    -- USize field offset: 8 (header) + i * 8 (field index)
+    let offset := 8 + i * 8
     emit (Instr.ldr dstReg (.mem xReg (Int.ofNat offset)))
 
   | .sproj n offset x =>
     let xReg ← varToReg x
-    let totalOffset := n * 8 + offset
+    -- Scalar field offset: 8 (header) + n * 8 (usize fields) + offset (scalar offset)
+    let totalOffset := 8 + n * 8 + offset
     emit (Instr.ldr dstReg (.mem xReg (Int.ofNat totalOffset)))
 
   | .fap f args =>
@@ -753,21 +1035,29 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
       let fnName ← getFunctionName f
       emit (Instr.comment s!"load global constant {fnName}")
       -- Use adrp + appropriate load instruction based on type
-      emit (Instr.adrp dstReg s!"{fnName}@PAGE")
       match dstType with
+      | .float | .float32 =>
+        -- Float constants: use temp GP register for adrp, then ldr into FP register
+        let tempReg := Reg.phys PhysReg.x16
+        emit (Instr.adrp tempReg s!"{fnName}@PAGE")
+        emit (Instr.ldr dstReg (.reg tempReg) s!", {fnName}@PAGEOFF")
       | .uint8 =>
         -- Load byte: ldrb wN, [base, offset]
+        emit (Instr.adrp dstReg s!"{fnName}@PAGE")
         emit (Instr.add dstReg dstReg (.label s!"{fnName}@PAGEOFF"))
         emit (Instr.ldrb dstReg (.mem dstReg 0))
       | .uint16 =>
         -- Load halfword: ldrh wN, [base, offset]
+        emit (Instr.adrp dstReg s!"{fnName}@PAGE")
         emit (Instr.add dstReg dstReg (.label s!"{fnName}@PAGEOFF"))
         emit (Instr.ldrh dstReg (.mem dstReg 0))
-      | .uint32 | .float32 =>
+      | .uint32 =>
         -- Load word (32-bit)
+        emit (Instr.adrp dstReg s!"{fnName}@PAGE")
         emit (Instr.ldr dstReg (.reg dstReg) s!", {fnName}@PAGEOFF")
       | _ =>
-        -- Load doubleword (64-bit) - objects, uint64, usize, float
+        -- Load doubleword (64-bit) - objects, uint64, usize
+        emit (Instr.adrp dstReg s!"{fnName}@PAGE")
         emit (Instr.ldr dstReg (.reg dstReg) s!", {fnName}@PAGEOFF")
     else
       let fnName ← getFunctionName f
@@ -776,30 +1066,60 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
       else
         -- Not inlineable, emit standard function call
         let env := (← get).env
-        let callArgs :=
+        -- Build call argument list and track parameter types
+        let (callArgs, paramTypes) :=
           match findEnvDecl env f with
           | some (.extern _ params ..) =>
             Id.run do
               let mut acc := #[]
+              let mut types := #[]
               for idx in [:args.size] do
                 let arg := args[idx]!
                 if h : idx < params.size then
                   let param := params[idx]!
                   if !param.ty.isErased then
                     acc := acc.push arg
+                    types := types.push param.ty
                 else
                   acc := acc.push arg
-              return acc
-          | _ => args
+                  types := types.push IRType.object
+              return (acc, types)
+          | some (.fdecl _ params ..) =>
+            -- Also extract parameter types from fdecl (regular Lean functions)
+            Id.run do
+              let mut acc := #[]
+              let mut types := #[]
+              for idx in [:args.size] do
+                let arg := args[idx]!
+                if h : idx < params.size then
+                  let param := params[idx]!
+                  if !param.ty.isErased then
+                    acc := acc.push arg
+                    types := types.push param.ty
+                else
+                  acc := acc.push arg
+                  types := types.push IRType.object
+              return (acc, types)
+          | _ => (args, args.map (fun _ => IRType.object))
         emit (Instr.comment s!"call {f} with {callArgs.size} runtime args")
-        -- Setup arguments in x0-x7 per ARM64 calling convention
+        -- Setup arguments using correct calling convention (FP regs for floats, GPRs for others)
         for i in [:min callArgs.size 8] do
-          let argReg := getArgReg i
+          let paramTy := if i < paramTypes.size then paramTypes[i]! else IRType.object
+          let isFloat := paramTy == IRType.float || paramTy == IRType.float32
           match callArgs[i]! with
           | .var v =>
             let vReg ← varToReg v
-            emit (Instr.mov (.phys argReg) (.reg vReg))
+            if isFloat then
+              -- Float parameter: load into FP register (d0-d7 or s0-s7)
+              let fpArgReg := getFPArgReg i
+              let prec := typeToFloatPrec paramTy
+              emit (Instr.fmov prec (.phys fpArgReg) vReg)
+            else
+              -- Non-float parameter: use general-purpose register (x0-x7)
+              let argReg := getArgReg i
+              emitMove (.phys argReg) (.reg vReg)
           | .erased =>
+            let argReg := getArgReg i
             emit (Instr.mov (.phys argReg) (.imm 1))  -- lean_box(0)
         let extra := if callArgs.size > 8 then callArgs.size - 8 else 0
         let extraBytes := extra * 8
@@ -848,9 +1168,32 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
         emit (Instr.bl fnName)
         if stackBytes > 0 then
           emit (Instr.add (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat stackBytes)))
-        -- Result is in x0
-        if dstReg != .phys PhysReg.x0 then
-          emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+        -- Get result from correct register based on return type
+        if dstType == IRType.float || dstType == IRType.float32 then
+          -- Float result is in d0/s0
+          if dstReg != .phys PhysReg.v0 then
+            let prec := typeToFloatPrec dstType
+            emit (Instr.fmov prec dstReg (.phys PhysReg.v0))
+        else if dstType == IRType.uint8 then
+          -- uint8_t result is in w0 (lower 8 bits), upper bits undefined
+          -- Zero-extend using AND with 0xFF mask (works for all cases including dstReg == x0)
+          if dstReg == .phys PhysReg.x0 then
+            -- Result stays in x0, need to zero-extend in place
+            emit (Instr.and (.phys PhysReg.x0) (.phys PhysReg.x0) (.imm 0xFF))
+          else
+            -- Moving to different register, zero-extend during move
+            emit (Instr.and dstReg (.phys PhysReg.x0) (.imm 0xFF))
+        else if dstType == IRType.uint16 then
+          -- uint16_t result is in w0 (lower 16 bits), upper bits undefined
+          -- Zero-extend using AND with 0xFFFF mask
+          if dstReg == .phys PhysReg.x0 then
+            emit (Instr.and (.phys PhysReg.x0) (.phys PhysReg.x0) (.imm 0xFFFF))
+          else
+            emit (Instr.and dstReg (.phys PhysReg.x0) (.imm 0xFFFF))
+        else
+          -- Non-float result is in x0
+          if dstReg != .phys PhysReg.x0 then
+            emitMove dstReg (.reg (.phys PhysReg.x0))
 
   | .pap f args =>
     emit (Instr.comment s!"partial application {f} with {args.size} args")
@@ -870,13 +1213,13 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
       match args[i]! with
       | .var v =>
         let vReg ← varToReg v
-        emit (Instr.mov (.phys PhysReg.x2) (.reg vReg))
+        emitMove (.phys PhysReg.x2) (.reg vReg)
       | .erased =>
         emit (Instr.mov (.phys PhysReg.x2) (.imm 0))
       emit (Instr.bl "_lean_closure_set")
     -- After all closure_set calls, save result to dstReg if needed
     if dstReg != .phys PhysReg.x0 then
-      emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+      emitMove dstReg (.reg (.phys PhysReg.x0))
 
   | .ap x args =>
     let xReg ← varToReg x
@@ -899,7 +1242,7 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
             emit (Instr.mov (.phys argReg) (.imm 1))  -- lean_box(0)
         emit (Instr.bl s!"_lean_apply_{n}")
         if dstReg != .phys PhysReg.x0 then
-          emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+          emitMove dstReg (.reg (.phys PhysReg.x0))
       else
         let argBytes := args.size * 8
         let totalBytes := ((argBytes + 15) / 16) * 16
@@ -947,12 +1290,20 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
         if totalBytes > 0 then
           emit (Instr.add (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat totalBytes)))
         if dstReg != .phys PhysReg.x0 then
-          emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+          emitMove dstReg (.reg (.phys PhysReg.x0))
 
   | .box ty x =>
     let xReg ← varToReg x
     emit (Instr.comment "box")
-    if ty.isScalar then
+    if ty == IRType.float || ty == IRType.float32 then
+      -- Float boxing: call lean_box_float(double/float) -> object*
+      -- Float is in general-purpose register, move to d0/s0 first
+      let prec := typeToFloatPrec ty
+      emit (Instr.fmov prec (.phys PhysReg.v0) xReg)
+      emit (Instr.bl "lean_box_float")
+      if dstReg != .phys PhysReg.x0 then
+        emitMove dstReg (.reg (.phys PhysReg.x0))
+    else if ty.isScalar then
       -- Inline scalar boxing: shift left by 1 and set low bit
       -- This marks the value as a boxed scalar (odd pointer = scalar)
       emit (Instr.lsl dstReg xReg (.imm 1))
@@ -963,8 +1314,16 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
   | .unbox x =>
     let xReg ← varToReg x
     emit (Instr.comment "unbox")
-    -- Inline scalar unboxing: arithmetic shift right by 1 to extract value
-    emit (Instr.asr dstReg xReg (.imm 1))
+    -- Unbox based on destination type (we know what type we're unboxing to)
+    if dstType == IRType.float || dstType == IRType.float32 then
+      -- Float unboxing: call lean_unbox_float(object*) -> double/float
+      let prec := typeToFloatPrec dstType
+      emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
+      emit (Instr.bl "lean_unbox_float")
+      emit (Instr.fmov prec dstReg (.phys PhysReg.v0))
+    else
+      -- Inline scalar unboxing: arithmetic shift right by 1 to extract value
+      emit (Instr.asr dstReg xReg (.imm 1))
 
   | .lit (.num n) =>
     if dstType.isScalar then
@@ -979,12 +1338,12 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
         loadImm64 (.phys PhysReg.x0) n
         emit (Instr.bl "lean_unsigned_to_nat_export")
         if dstReg != .phys PhysReg.x0 then
-          emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+          emitMove dstReg (.reg (.phys PhysReg.x0))
       else if n < UInt64.size then
         loadImm64 (.phys PhysReg.x0) n
         emit (Instr.bl "lean_uint64_to_nat")
         if dstReg != .phys PhysReg.x0 then
-          emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+          emitMove dstReg (.reg (.phys PhysReg.x0))
       else
         -- Numbers that do not fit in 64 bits: materialize via decimal string like the C backend
         let decStr := toString n
@@ -993,7 +1352,7 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
         emit (Instr.ldr (.phys PhysReg.x0) (.reg (.phys PhysReg.x0)) s!", {lit.ptrLabel}@PAGEOFF")
         emit (Instr.bl "lean_cstr_to_nat")
         if dstReg != .phys PhysReg.x0 then
-          emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+          emitMove dstReg (.reg (.phys PhysReg.x0))
 
   | .lit (.str s) =>
     let lit ← getStringLiteral s
@@ -1002,9 +1361,15 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
     emit (Instr.comment s!"string literal: {escapedStr}")
     emit (Instr.adrp (.phys PhysReg.x0) s!"{lit.ptrLabel}@PAGE")
     emit (Instr.ldr (.phys PhysReg.x0) (.reg (.phys PhysReg.x0)) s!", {lit.ptrLabel}@PAGEOFF")
-    emit (Instr.bl "lean_mk_string")
+    -- Calculate byte size and character count for lean_mk_string_unchecked
+    let byteSize := s.utf8ByteSize
+    let charCount := s.length
+    emit (Instr.comment s!"DEBUG: str='{escapedStr}' byteSize={byteSize} charCount={charCount}")
+    emit (Instr.mov (.phys PhysReg.x1) (.imm byteSize))
+    emit (Instr.mov (.phys PhysReg.x2) (.imm charCount))
+    emit (Instr.bl "lean_mk_string_unchecked")
     if dstReg != .phys PhysReg.x0 then
-      emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+      emitMove dstReg (.reg (.phys PhysReg.x0))
 
   | .isShared x =>
     let xReg ← varToReg x
@@ -1078,14 +1443,16 @@ partial def selectFnBody (body : FnBody) : SelectM Unit := do
   | .uset x i y rest => do
     let xReg ← varToReg x
     let yReg ← varToReg y
-    let offset := i * 8
+    -- USize field offset: 8 (header) + i * 8 (field index)
+    let offset := 8 + i * 8
     emit (Instr.str yReg (.mem xReg (Int.ofNat offset)))
     selectFnBody rest
 
   | .sset x i offset y _ rest => do
     let xReg ← varToReg x
     let yReg ← varToReg y
-    let totalOffset := i * 8 + offset
+    -- Scalar field offset: 8 (header) + i * 8 (object fields) + offset (scalar offset)
+    let totalOffset := 8 + i * 8 + offset
     emit (Instr.str yReg (.mem xReg (Int.ofNat totalOffset)))
     selectFnBody rest
 
@@ -1238,10 +1605,19 @@ partial def selectFnBody (body : FnBody) : SelectM Unit := do
 
   | .ret arg => do
     emit (Instr.comment "return")
+    let retTy := (← get).returnType
     match arg with
     | .var v =>
       let vReg ← varToReg v
-      emit (Instr.mov (.phys PhysReg.x0) (.reg vReg))
+      if retTy == IRType.float then
+        -- Float functions return in d0
+        emit (Instr.fmov FloatPrec.double (.phys PhysReg.v0) vReg)
+      else if retTy == IRType.float32 then
+        -- Float32 functions return in s0 (bottom 32 bits of v0)
+        emit (Instr.fmov FloatPrec.single (.phys PhysReg.v0) vReg)
+      else
+        -- All other types return in x0
+        emitMove (.phys PhysReg.x0) (.reg vReg)
     | .erased =>
       emit (Instr.mov (.phys PhysReg.x0) (.imm 0))
     let spillBytes := (← get).stackSpillBytes
@@ -1289,7 +1665,8 @@ partial def selectFnBody (body : FnBody) : SelectM Unit := do
               emit (Instr.mov (.phys paramReg) (.reg (.phys argReg)))
           | some argReg, _, none, some paramSlot =>
             -- Arg in register, param spilled to stack
-            storeToStackSlot (.phys argReg) paramSlot
+            let paramTy := s.varTypes.get? param.idx |>.getD IRType.object
+            storeToStackSlot (.phys argReg) paramSlot paramTy
           | none, some argSlot, some paramReg, _ =>
             -- Arg spilled, param in register
             let _ ← loadSpilledVar argVar argSlot
@@ -1298,7 +1675,8 @@ partial def selectFnBody (body : FnBody) : SelectM Unit := do
             -- Both spilled to stack
             if argSlot != paramSlot then
               let _ ← loadSpilledVar argVar argSlot
-              storeToStackSlot (.phys PhysReg.x8) paramSlot
+              let paramTy := s.varTypes.get? param.idx |>.getD IRType.object
+              storeToStackSlot (.phys PhysReg.x8) paramSlot paramTy
           | _, _, _, _ =>
             emit (Instr.comment s!"ERROR: phi arg vreg{argVar.idx} or param vreg{param.idx} not allocated!")
         | .erased =>
@@ -1310,7 +1688,8 @@ partial def selectFnBody (body : FnBody) : SelectM Unit := do
             emit (Instr.mov (.phys paramReg) (.imm 0))
           | none, some paramSlot =>
             emit (Instr.mov (.phys PhysReg.x8) (.imm 0))
-            storeToStackSlot (.phys PhysReg.x8) paramSlot
+            let paramTy := s.varTypes.get? param.idx |>.getD IRType.object
+            storeToStackSlot (.phys PhysReg.x8) paramSlot paramTy
           | _, _ =>
             emit (Instr.comment s!"ERROR: phi param vreg{param.idx} not allocated!")
       let label ← getJPLabel j
@@ -1323,7 +1702,7 @@ partial def selectFnBody (body : FnBody) : SelectM Unit := do
 /-- Select instructions for a function declaration -/
 def selectDecl (decl : Decl) : SelectM MachineFunction := do
   match decl with
-  | .fdecl f _params _ body _ =>
+  | .fdecl f _params retTy body _ =>
     emit (Instr.comment s!"Function: {f}")
 
     -- Register parameter types in varTypes map for proper scalar handling
@@ -1462,15 +1841,25 @@ def selectDecl (decl : Decl) : SelectM MachineFunction := do
       -- Tail calls will put new values in x0-x7, then jump here to re-save them
       emit (Instr.label s!".Lfn_start_{sanitizeForLabel f.toString}")
 
-      -- Save parameters from x0-x7 to their allocated registers
+      -- Save parameters from argument registers to their allocated registers
       -- This happens on initial entry AND when tail calls jump to .Lfn_start
       for i in [:min _params.size 8] do
         let param := _params[i]!
         match allocState.allocation.get? param.x.idx with
         | some allocReg =>
-          let argReg := getArgReg i
-          if allocReg != argReg then
-            emit (Instr.mov (.phys allocReg) (.reg (.phys argReg)))
+          -- Check if parameter is float type - use FP registers if so
+          let isFloat := param.ty == IRType.float || param.ty == IRType.float32
+          if isFloat then
+            -- Float parameter comes in d0-d7 (or s0-s7 for float32)
+            let fpArgReg := getFPArgReg i
+            if allocReg != fpArgReg then
+              let prec := typeToFloatPrec param.ty
+              emit (Instr.fmov prec (.phys allocReg) (.phys fpArgReg))
+          else
+            -- Non-float parameter comes in x0-x7
+            let argReg := getArgReg i
+            if allocReg != argReg then
+              emitMove (.phys allocReg) (.reg (.phys argReg))
         | none => pure ()
 
     -- Select instructions for body
@@ -1486,18 +1875,46 @@ def selectDecl (decl : Decl) : SelectM MachineFunction := do
   | .extern f _ _ _ =>
     return { name := f, blocks := #[], stringLits := #[] }
 
+/-- Collect variable types from IR body for register allocation -/
+partial def collectVarTypes (body : FnBody) (params : Array Param) : Std.TreeMap Index IRType (fun a b => compare a b) :=
+  let rec collect (b : FnBody) (acc : Std.TreeMap Index IRType (fun a b => compare a b)) : Std.TreeMap Index IRType (fun a b => compare a b) :=
+    match b with
+    | .vdecl x ty _ rest => collect rest (acc.insert x.idx ty)
+    | .jdecl _ jparams _ rest =>
+      let acc := jparams.foldl (fun m p => m.insert p.x.idx p.ty) acc
+      collect rest acc
+    | .case _ _ _ alts =>
+      alts.foldl (fun m alt => collect alt.body m) acc
+    | .set _ _ _ rest | .uset _ _ _ rest | .sset _ _ _ _ _ rest
+    | .setTag _ _ rest | .inc _ _ _ _ rest | .dec _ _ _ _ rest | .del _ rest => collect rest acc
+    | .ret _ | .jmp _ _ | .unreachable => acc
+  -- Start with parameter types
+  let initMap := params.foldl (fun m p => m.insert p.x.idx p.ty) {}
+  collect body initMap
+
 /-- Compile a declaration to ARM64 machine code -/
 def compileDecl (env : Environment) (decl : Decl) : MachineFunction :=
-  -- First convert to SSA form
-  let ssaDecl := Lean.IR.SSA.convertDecl decl
+  -- Don't convert to SSA form - work with original IR like C backend does
+  -- SSA conversion transforms multi-scalar constructors into nested single-scalar
+  -- constructors, which breaks float field handling and creates inefficient code
+  let ssaDecl := decl  -- Use original IR, not SSA
 
-  -- Extract body and parameters for analysis
-  let (params, body) := match ssaDecl with
-    | .fdecl _ ps _ b _ => (ps, b)
-    | _ => (#[], FnBody.unreachable)
+  -- Extract body, parameters, and return type for analysis
+  let (params, body, retTy) := match ssaDecl with
+    | .fdecl _ ps ty b _ => (ps, b, ty)
+    | _ => (#[], FnBody.unreachable, IRType.object)
+
+  -- Pre-collect variable types for register allocation
+  let varTypes := collectVarTypes body params
+
+  -- Check if function uses floating-point types (in params, return type, or local variables)
+  let usesFloat :=
+    params.any (fun p => p.ty == IRType.float || p.ty == IRType.float32) ||
+    retTy == IRType.float || retTy == IRType.float32 ||
+    varTypes.any (fun _ ty => ty == IRType.float || ty == IRType.float32)
 
   -- Perform register allocation
-  let allocState := allocateRegisters params body
+  let allocState := allocateRegisters params body varTypes usesFloat
 
   -- Get function name
   let fnName := match ssaDecl with
@@ -1518,7 +1935,8 @@ def compileDecl (env : Environment) (decl : Decl) : MachineFunction :=
     stringLitOrder := #[],
     nextStringId := 0,
     varTypes := {},
-    params := params
+    params := params,
+    returnType := retTy
   }
 
   -- Run instruction selection

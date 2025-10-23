@@ -1396,16 +1396,16 @@ _l_testBox:
   mov x2, #0
   bl _lean_alloc_ctor
   mov x28, x0
-  mov x0, x28
-  mov x1, #0
   // load spilled vreg14 from stack slot 10
   ldr x8, [sp, #80]
+  mov x0, x28
+  mov x1, #0
   mov x2, x8
   bl _lean_ctor_set
-  mov x0, x28
-  mov x1, #1
   // load spilled vreg15 from stack slot 11
   ldr x8, [sp, #88]
+  mov x0, x28
+  mov x1, #1
   mov x2, x8
   bl _lean_ctor_set
   // return
@@ -1587,7 +1587,7 @@ __init_l_testBox___closed__4:
   mov x1, #1
   mov x2, x27
   bl _lean_ctor_set
-  str x22, [x23, #24]
+  str x22, [x23, #16]
   // return
   mov x0, x23
   ldp x27, x28, [sp], #16
@@ -2036,16 +2036,16 @@ _l_testLit:
   mov x2, #0
   bl _lean_alloc_ctor
   mov x28, x0
-  mov x0, x28
-  mov x1, #0
   // load spilled vreg14 from stack slot 10
   ldr x8, [sp, #80]
+  mov x0, x28
+  mov x1, #0
   mov x2, x8
   bl _lean_ctor_set
-  mov x0, x28
-  mov x1, #1
   // load spilled vreg15 from stack slot 11
   ldr x8, [sp, #88]
+  mov x0, x28
+  mov x1, #1
   mov x2, x8
   bl _lean_ctor_set
   // return
@@ -2658,16 +2658,16 @@ _l_testCase:
   mov x2, #0
   bl _lean_alloc_ctor
   mov x28, x0
-  mov x0, x28
-  mov x1, #0
   // load spilled vreg14 from stack slot 10
   ldr x8, [sp, #80]
+  mov x0, x28
+  mov x1, #0
   mov x2, x8
   bl _lean_ctor_set
-  mov x0, x28
-  mov x1, #1
   // load spilled vreg15 from stack slot 11
   ldr x8, [sp, #88]
+  mov x0, x28
+  mov x1, #1
   mov x2, x8
   bl _lean_ctor_set
   // return
@@ -2849,7 +2849,7 @@ __init_l_testCase___closed__16:
   mov x1, #1
   mov x2, x27
   bl _lean_ctor_set
-  str x22, [x23, #24]
+  str x22, [x23, #16]
   // return
   mov x0, x23
   ldp x27, x28, [sp], #16
@@ -3756,16 +3756,16 @@ _l_testProj:
   mov x2, #0
   bl _lean_alloc_ctor
   mov x28, x0
-  mov x0, x28
-  mov x1, #0
   // load spilled vreg14 from stack slot 10
   ldr x8, [sp, #80]
+  mov x0, x28
+  mov x1, #0
   mov x2, x8
   bl _lean_ctor_set
-  mov x0, x28
-  mov x1, #1
   // load spilled vreg15 from stack slot 11
   ldr x8, [sp, #88]
+  mov x0, x28
+  mov x1, #1
   mov x2, x8
   bl _lean_ctor_set
   // return
@@ -4353,16 +4353,16 @@ _l_testCtor:
   mov x2, #0
   bl _lean_alloc_ctor
   mov x28, x0
-  mov x0, x28
-  mov x1, #0
   // load spilled vreg14 from stack slot 10
   ldr x8, [sp, #80]
+  mov x0, x28
+  mov x1, #0
   mov x2, x8
   bl _lean_ctor_set
-  mov x0, x28
-  mov x1, #1
   // load spilled vreg15 from stack slot 11
   ldr x8, [sp, #88]
+  mov x0, x28
+  mov x1, #1
   mov x2, x8
   bl _lean_ctor_set
   // return
@@ -5042,16 +5042,16 @@ _l_testReturn:
   mov x2, #0
   bl _lean_alloc_ctor
   mov x28, x0
-  mov x0, x28
-  mov x1, #0
   // load spilled vreg14 from stack slot 10
   ldr x8, [sp, #80]
+  mov x0, x28
+  mov x1, #0
   mov x2, x8
   bl _lean_ctor_set
-  mov x0, x28
-  mov x1, #1
   // load spilled vreg15 from stack slot 11
   ldr x8, [sp, #88]
+  mov x0, x28
+  mov x1, #1
   mov x2, x8
   bl _lean_ctor_set
   // return
@@ -5607,16 +5607,16 @@ _l_testAdd:
   mov x2, #0
   bl _lean_alloc_ctor
   mov x28, x0
-  mov x0, x28
-  mov x1, #0
   // load spilled vreg14 from stack slot 10
   ldr x8, [sp, #80]
+  mov x0, x28
+  mov x1, #0
   mov x2, x8
   bl _lean_ctor_set
-  mov x0, x28
-  mov x1, #1
   // load spilled vreg15 from stack slot 11
   ldr x8, [sp, #88]
+  mov x0, x28
+  mov x1, #1
   mov x2, x8
   bl _lean_ctor_set
   // return
@@ -5869,7 +5869,7 @@ __init_l_testAdd___closed__15:
   mov x1, #1
   mov x2, x27
   bl _lean_ctor_set
-  str x22, [x23, #24]
+  str x22, [x23, #16]
   // return
   mov x0, x23
   ldp x27, x28, [sp], #16
@@ -5912,7 +5912,7 @@ __init_l_testAdd___closed__14:
   mov x1, #1
   mov x2, x27
   bl _lean_ctor_set
-  str x22, [x23, #24]
+  str x22, [x23, #16]
   // return
   mov x0, x23
   ldp x27, x28, [sp], #16
@@ -6531,16 +6531,16 @@ _l_emitAsm:
   bl _lean_alloc_ctor
   // store constructor for spilled dst vreg11 into stack slot 4
   str x0, [sp, #32]
-  ldr x0, [sp, #32]
-  mov x1, #0
   // load spilled vreg10 from stack slot 3
   ldr x8, [sp, #24]
+  ldr x0, [sp, #32]
+  mov x1, #0
   mov x2, x8
   bl _lean_ctor_set
-  ldr x0, [sp, #32]
-  mov x1, #1
   // load spilled vreg9 from stack slot 2
   ldr x8, [sp, #16]
+  ldr x0, [sp, #32]
+  mov x1, #1
   mov x2, x8
   bl _lean_ctor_set
   // return
@@ -6625,16 +6625,16 @@ _l_emitAsm:
   mov x2, #0
   bl _lean_alloc_ctor
   mov x28, x0
-  mov x0, x28
-  mov x1, #0
   // load spilled vreg13 from stack slot 6
   ldr x8, [sp, #48]
+  mov x0, x28
+  mov x1, #0
   mov x2, x8
   bl _lean_ctor_set
-  mov x0, x28
-  mov x1, #1
   // load spilled vreg14 from stack slot 7
   ldr x8, [sp, #56]
+  mov x0, x28
+  mov x1, #1
   mov x2, x8
   bl _lean_ctor_set
   // return
@@ -6739,7 +6739,7 @@ _initialize_arm64__basic:
   str w8, [x19]
 .Linit_dec_done_3:
 
-  // Initialize all declarations
+  // Initialize closed constants and 0-param defs
   // Initialize _l_testAdd___closed__0
   bl __init_l_testAdd___closed__0
   adrp x8, _l_testAdd___closed__0@PAGE

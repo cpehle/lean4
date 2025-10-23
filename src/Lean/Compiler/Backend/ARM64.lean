@@ -16,6 +16,17 @@ public section
 namespace Lean.Compiler.Backend
 namespace ARM64
 
+/-- Floating-point precision for FP operations -/
+inductive FloatPrec where
+  | single  -- 32-bit float (s0-s31 register view)
+  | double  -- 64-bit double (d0-d31 register view)
+  deriving Inhabited, BEq, DecidableEq, Repr
+
+instance : ToString FloatPrec where
+  toString
+    | .single => "s"
+    | .double => "d"
+
 /-- ARM64 physical registers. -/
 inductive PhysReg where
   -- General purpose registers (X0-X30)
@@ -140,6 +151,8 @@ inductive Instr where
   | mul (dst : Reg) (src1 : Reg) (src2 : Reg)
   | sdiv (dst : Reg) (src1 : Reg) (src2 : Reg)
   | udiv (dst : Reg) (src1 : Reg) (src2 : Reg)
+  | uxtb (dst : Reg) (src : Reg)  -- zero-extend byte (8 bits) to 64 bits
+  | uxth (dst : Reg) (src : Reg)  -- zero-extend halfword (16 bits) to 64 bits
 
   -- Logical instructions
   | and (dst : Reg) (src1 : Reg) (src2 : Operand)
@@ -187,11 +200,17 @@ inductive Instr where
   | pop (regs : Array Reg)
 
   -- Floating point
-  | fadd (dst : Reg) (src1 : Reg) (src2 : Reg)
-  | fsub (dst : Reg) (src1 : Reg) (src2 : Reg)
-  | fmul (dst : Reg) (src1 : Reg) (src2 : Reg)
-  | fdiv (dst : Reg) (src1 : Reg) (src2 : Reg)
-  | fcmp (src1 : Reg) (src2 : Reg)
+  | fadd (prec : FloatPrec) (dst : Reg) (src1 : Reg) (src2 : Reg)
+  | fsub (prec : FloatPrec) (dst : Reg) (src1 : Reg) (src2 : Reg)
+  | fmul (prec : FloatPrec) (dst : Reg) (src1 : Reg) (src2 : Reg)
+  | fdiv (prec : FloatPrec) (dst : Reg) (src1 : Reg) (src2 : Reg)
+  | fneg (prec : FloatPrec) (dst : Reg) (src : Reg)
+  | fcmp (prec : FloatPrec) (src1 : Reg) (src2 : Reg)
+  | fmov (prec : FloatPrec) (dst : Reg) (src : Reg)
+  | scvtf (prec : FloatPrec) (dst : Reg) (src : Reg)  -- signed int to float
+  | ucvtf (prec : FloatPrec) (dst : Reg) (src : Reg)  -- unsigned int to float
+  | fcvtzs (prec : FloatPrec) (dst : Reg) (src : Reg) -- float to signed int
+  | fcvtzu (prec : FloatPrec) (dst : Reg) (src : Reg) -- float to unsigned int
 
   -- Misc
   | label (name : String)
@@ -207,6 +226,8 @@ def toString : Instr → String
   | mul dst src1 src2 => s!"mul {dst}, {src1}, {src2}"
   | sdiv dst src1 src2 => s!"sdiv {dst}, {src1}, {src2}"
   | udiv dst src1 src2 => s!"udiv {dst}, {src1}, {src2}"
+  | uxtb dst src => s!"uxtb {dst}, {src}"
+  | uxth dst src => s!"uxth {dst}, {src}"
   | and dst src1 src2 => s!"and {dst}, {src1}, {src2}"
   | orr dst src1 src2 => s!"orr {dst}, {src1}, {src2}"
   | eor dst src1 src2 => s!"eor {dst}, {src1}, {src2}"
@@ -246,11 +267,17 @@ def toString : Instr → String
   | bCond cond lbl => s!"b.{cond} {lbl}"
   | push _ => "stp ..." -- TODO: pretty print stack ops if needed
   | pop _ => "ldp ..."
-  | fadd dst src1 src2 => s!"fadd {dst}, {src1}, {src2}"
-  | fsub dst src1 src2 => s!"fsub {dst}, {src1}, {src2}"
-  | fmul dst src1 src2 => s!"fmul {dst}, {src1}, {src2}"
-  | fdiv dst src1 src2 => s!"fdiv {dst}, {src1}, {src2}"
-  | fcmp src1 src2 => s!"fcmp {src1}, {src2}"
+  | fadd prec dst src1 src2 => s!"fadd.{prec} {dst}, {src1}, {src2}"
+  | fsub prec dst src1 src2 => s!"fsub.{prec} {dst}, {src1}, {src2}"
+  | fmul prec dst src1 src2 => s!"fmul.{prec} {dst}, {src1}, {src2}"
+  | fdiv prec dst src1 src2 => s!"fdiv.{prec} {dst}, {src1}, {src2}"
+  | fneg prec dst src => s!"fneg.{prec} {dst}, {src}"
+  | fcmp prec src1 src2 => s!"fcmp.{prec} {src1}, {src2}"
+  | fmov prec dst src => s!"fmov.{prec} {dst}, {src}"
+  | scvtf prec dst src => s!"scvtf.{prec} {dst}, {src}"
+  | ucvtf prec dst src => s!"ucvtf.{prec} {dst}, {src}"
+  | fcvtzs prec dst src => s!"fcvtzs.{prec} {dst}, {src}"
+  | fcvtzu prec dst src => s!"fcvtzu.{prec} {dst}, {src}"
   | label name => s!"{name}:"
   | comment text => s!"// {text}"
 

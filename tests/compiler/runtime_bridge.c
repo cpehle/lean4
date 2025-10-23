@@ -11,6 +11,7 @@
 #define lean_box lean_box_inline
 #define lean_unbox lean_unbox_inline
 #define lean_unbox_uint32 lean_unbox_uint32_inline
+#define lean_unbox_uint64 lean_unbox_uint64_inline
 #define lean_io_mk_world lean_io_mk_world_inline
 #define lean_io_result_is_ok lean_io_result_is_ok_inline
 #define lean_io_result_get_value lean_io_result_get_value_inline
@@ -68,6 +69,20 @@
 #define lean_float_beq lean_float_beq_inline
 #define lean_float_decLe lean_float_decLe_inline
 #define lean_float_decLt lean_float_decLt_inline
+#define lean_box_float lean_box_float_inline
+#define lean_unbox_float lean_unbox_float_inline
+#define lean_uint64_to_usize lean_uint64_to_usize_inline
+#define lean_usize_dec_le lean_usize_dec_le_inline
+#define lean_usize_land lean_usize_land_inline
+#define lean_usize_shift_left lean_usize_shift_left_inline
+#define lean_usize_shift_right lean_usize_shift_right_inline
+#define lean_int_add lean_int_add_inline
+#define lean_int_dec_eq lean_int_dec_eq_inline
+#define lean_int_ediv lean_int_ediv_inline
+#define lean_int_emod lean_int_emod_inline
+#define lean_int_mul lean_int_mul_inline
+#define lean_strict_and lean_strict_and_inline
+#define lean_strict_or lean_strict_or_inline
 
 #include <stdio.h>
 #include <lean/lean.h>
@@ -85,6 +100,7 @@
 #undef lean_box
 #undef lean_unbox
 #undef lean_unbox_uint32
+#undef lean_unbox_uint64
 #undef lean_io_mk_world
 #undef lean_io_result_is_ok
 #undef lean_io_result_get_value
@@ -142,6 +158,20 @@
 #undef lean_float_beq
 #undef lean_float_decLe
 #undef lean_float_decLt
+#undef lean_box_float
+#undef lean_unbox_float
+#undef lean_uint64_to_usize
+#undef lean_usize_dec_le
+#undef lean_usize_land
+#undef lean_usize_shift_left
+#undef lean_usize_shift_right
+#undef lean_int_add
+#undef lean_int_dec_eq
+#undef lean_int_ediv
+#undef lean_int_emod
+#undef lean_int_mul
+#undef lean_strict_and
+#undef lean_strict_or
 
 #ifdef __cplusplus
 extern "C" {
@@ -198,6 +228,10 @@ LEAN_EXPORT size_t lean_unbox(lean_object* o) {
 
 LEAN_EXPORT uint32_t lean_unbox_uint32(lean_object* o) {
   return lean_unbox_uint32_inline(o);
+}
+
+LEAN_EXPORT uint64_t lean_unbox_uint64(lean_object* o) {
+  return lean_unbox_uint64_inline(o);
 }
 
 LEAN_EXPORT lean_object* lean_io_mk_world(void) {
@@ -442,6 +476,65 @@ LEAN_EXPORT uint8_t lean_float_decLe(double a, double b) {
 
 LEAN_EXPORT uint8_t lean_float_decLt(double a, double b) {
   return lean_float_decLt_inline(a, b);
+}
+
+LEAN_EXPORT lean_object* lean_box_float(double f) {
+  return lean_box_float_inline(f);
+}
+
+LEAN_EXPORT double lean_unbox_float(lean_object* o) {
+  return lean_unbox_float_inline(o);
+}
+
+// Usize operations
+LEAN_EXPORT size_t lean_uint64_to_usize(uint64_t a) {
+  return (size_t)a;
+}
+
+LEAN_EXPORT uint8_t lean_usize_dec_le(size_t a, size_t b) {
+  return a <= b;
+}
+
+LEAN_EXPORT size_t lean_usize_land(size_t a, size_t b) {
+  return a & b;
+}
+
+LEAN_EXPORT size_t lean_usize_shift_left(size_t a, size_t b) {
+  return a << b;
+}
+
+LEAN_EXPORT size_t lean_usize_shift_right(size_t a, size_t b) {
+  return a >> b;
+}
+
+// Int operations - these operate on lean_object* (bignum) types
+LEAN_EXPORT lean_object* lean_int_add(lean_object* a, lean_object* b) {
+  return lean_int_add_inline(a, b);
+}
+
+LEAN_EXPORT uint8_t lean_int_dec_eq(lean_object* a, lean_object* b) {
+  return lean_int_dec_eq_inline(a, b);
+}
+
+LEAN_EXPORT lean_object* lean_int_ediv(lean_object* a, lean_object* b) {
+  return lean_int_ediv_inline(a, b);
+}
+
+LEAN_EXPORT lean_object* lean_int_emod(lean_object* a, lean_object* b) {
+  return lean_int_emod_inline(a, b);
+}
+
+LEAN_EXPORT lean_object* lean_int_mul(lean_object* a, lean_object* b) {
+  return lean_int_mul_inline(a, b);
+}
+
+// Strict boolean operations
+LEAN_EXPORT uint8_t lean_strict_and(uint8_t a, uint8_t b) {
+  return a && b;
+}
+
+LEAN_EXPORT uint8_t lean_strict_or(uint8_t a, uint8_t b) {
+  return a || b;
 }
 
 #ifdef __cplusplus

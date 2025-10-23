@@ -1,0 +1,6 @@
+Starting...
+listSum called with [1]
+  recursive case: head=1
+listSum called with []
+  base case
+Result: 1

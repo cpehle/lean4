@@ -26,14 +26,17 @@ structure LiveInterval where
   var : VarId
   start : Nat
   end_ : Nat
+  ty : IRType
   deriving Inhabited, BEq, Repr
 
 /-- Register allocation state -/
 structure AllocState where
   /-- Mapping from virtual registers to physical registers -/
   allocation : Std.TreeMap Index PhysReg (fun a b => compare a b)
-  /-- Free physical registers -/
-  freeRegs : Array PhysReg
+  /-- Free general-purpose registers -/
+  freeGPRegs : Array PhysReg
+  /-- Free floating-point registers -/
+  freeFPRegs : Array PhysReg
   /-- Active intervals (sorted by end point) -/
   active : Array LiveInterval
   /-- Spilled variables -/
@@ -68,9 +71,9 @@ def getArgReg (i : Nat) : PhysReg :=
 
 /-- Initialize allocation state with available registers -/
 def initAllocState (usesFloat : Bool := false) : AllocState :=
-  let freeRegs := if usesFloat then allocatableGPRegs ++ allocatableFPRegs else allocatableGPRegs
   { allocation := {}
-  , freeRegs := freeRegs
+  , freeGPRegs := allocatableGPRegs
+  , freeFPRegs := if usesFloat then allocatableFPRegs else #[]
   , active := #[]
   , spilled := #[]
   , stackSlots := {}
@@ -78,21 +81,42 @@ def initAllocState (usesFloat : Bool := false) : AllocState :=
   }
 
 /-- Allocate a physical register for a virtual register -/
-def allocReg (v : VarId) (interval : LiveInterval) : M (Option PhysReg) := do
+def allocReg (v : VarId) (interval : LiveInterval) (ty : IRType) : M (Option PhysReg) := do
   let s ← get
-  match s.freeRegs.back? with
+  -- Choose register pool based on type
+  let (pool, isFloat) := match ty with
+    | .float | .float32 => (s.freeFPRegs, true)
+    | _ => (s.freeGPRegs, false)
+
+  match pool.back? with
   | none =>
-    -- No free registers, need to spill
+    -- No free registers of the required type, need to spill
     return none
   | some reg =>
-    let freeRegs := s.freeRegs.pop
+    let newPool := pool.pop
     modify fun s =>
-      { s with
-        allocation := s.allocation.insert v.idx reg,
-        freeRegs := freeRegs,
-        active := s.active.push interval
-      }
+      if isFloat then
+        { s with
+          allocation := s.allocation.insert v.idx reg,
+          freeFPRegs := newPool,
+          active := s.active.push interval
+        }
+      else
+        { s with
+          allocation := s.allocation.insert v.idx reg,
+          freeGPRegs := newPool,
+          active := s.active.push interval
+        }
     return some reg
+
+/-- Check if a physical register is a floating-point register -/
+def isFPReg (reg : PhysReg) : Bool :=
+  match reg with
+  | .v0 | .v1 | .v2 | .v3 | .v4 | .v5 | .v6 | .v7
+  | .v8 | .v9 | .v10 | .v11 | .v12 | .v13 | .v14 | .v15
+  | .v16 | .v17 | .v18 | .v19 | .v20 | .v21 | .v22 | .v23
+  | .v24 | .v25 | .v26 | .v27 | .v28 | .v29 | .v30 | .v31 => true
+  | _ => false
 
 /-- Free a register when its live range ends -/
 def freeReg (v : VarId) : M Unit := do
@@ -101,11 +125,18 @@ def freeReg (v : VarId) : M Unit := do
   | none => return ()
   | some reg =>
     modify fun s =>
-      { s with
-        allocation := s.allocation.erase v.idx,
-        freeRegs := s.freeRegs.push reg,
-        active := s.active.filter (fun iv => iv.var != v)
-      }
+      if isFPReg reg then
+        { s with
+          allocation := s.allocation.erase v.idx,
+          freeFPRegs := s.freeFPRegs.push reg,
+          active := s.active.filter (fun iv => iv.var != v)
+        }
+      else
+        { s with
+          allocation := s.allocation.erase v.idx,
+          freeGPRegs := s.freeGPRegs.push reg,
+          active := s.active.filter (fun iv => iv.var != v)
+        }
 
 /-- Assign a stack slot for a spilled variable -/
 def spillVar (v : VarId) : M Nat := do
@@ -140,7 +171,7 @@ def linearScanAlloc (intervals : Array LiveInterval) : M Unit := do
     expireOldIntervals interval.start
 
     -- Try to allocate a register
-    match ← allocReg interval.var interval with
+    match ← allocReg interval.var interval interval.ty with
     | some _ => pure ()
     | none =>
       -- Need to spill - for now just spill current variable
@@ -148,7 +179,7 @@ def linearScanAlloc (intervals : Array LiveInterval) : M Unit := do
       pure ()
 
 /-- Simple live interval computation (conservative approximation) -/
-partial def computeLiveIntervals (body : FnBody) : Array LiveInterval :=
+partial def computeLiveIntervals (body : FnBody) (varTypes : Std.TreeMap Index IRType (fun a b => compare a b)) : Array LiveInterval :=
   -- Conservative: all variables live throughout the function
   let rec collectAllVars (b : FnBody) : Array VarId :=
     match b with
@@ -174,42 +205,65 @@ partial def computeLiveIntervals (body : FnBody) : Array LiveInterval :=
   let allVars := collectAllVars body
   -- Conservative: each variable is live from 0 to end
   let maxPos := 1000
-  allVars.map fun v => { var := v, start := 0, end_ := maxPos }
+  allVars.map fun v =>
+    let ty := varTypes.get? v.idx |>.getD IRType.object  -- Default to object if type unknown
+    { var := v, start := 0, end_ := maxPos, ty := ty }
 
 /-- Allocate registers for a function body in SSA form -/
-def allocateRegisters (params : Array Param) (body : FnBody) (usesFloat : Bool := false) : AllocState :=
-  let intervals := computeLiveIntervals body
+def allocateRegisters (params : Array Param) (body : FnBody) (varTypes : Std.TreeMap Index IRType (fun a b => compare a b)) (usesFloat : Bool := false) : AllocState :=
+  -- Build type map including parameter types
+  let varTypesWithParams := params.foldl (fun types param =>
+    types.insert param.x.idx param.ty) varTypes
+
+  let intervals := computeLiveIntervals body varTypesWithParams
   let initState := initAllocState usesFloat
 
   -- Pre-assign function parameters to callee-saved registers
   -- ARM64 ABI: x0-x7 are caller-saved (clobbered by calls), so we must save
-  -- parameters to callee-saved registers (x19-x28) if they're used after calls
-  -- We'll generate prologue code to move x0-x7 → callee-saved regs
-  let calleeSavedRegs :=
+  -- parameters to callee-saved registers (x19-x28 for GP, v8-v15 for FP) if they're used after calls
+  -- We'll generate prologue code to move x0-x7 / d0-d7 → callee-saved regs
+  let calleeSavedGPRegs :=
     #[ARM64.PhysReg.x19, ARM64.PhysReg.x20, ARM64.PhysReg.x21, ARM64.PhysReg.x22,
       ARM64.PhysReg.x23, ARM64.PhysReg.x24, ARM64.PhysReg.x25, ARM64.PhysReg.x26,
       ARM64.PhysReg.x27, ARM64.PhysReg.x28]
 
-  -- Pre-allocate specific registers for first 10 parameters to use callee-saved regs
+  let calleeSavedFPRegs :=
+    #[ARM64.PhysReg.v8, ARM64.PhysReg.v9, ARM64.PhysReg.v10, ARM64.PhysReg.v11,
+      ARM64.PhysReg.v12, ARM64.PhysReg.v13, ARM64.PhysReg.v14, ARM64.PhysReg.v15]
+
+  -- Pre-allocate specific registers for parameters
   let stateWithParams := Id.run do
     let mut state := initState
-    for h : i in [:min params.size calleeSavedRegs.size] do
-      if hp : i < params.size then
-        let param := params[i]
-        if hr : i < calleeSavedRegs.size then
-          let targetReg := calleeSavedRegs[i]
-          -- Create an interval for this parameter to mark the register as busy
-          let paramInterval : LiveInterval := { var := param.x, start := 0, end_ := 1000 }
-          -- Pre-assign this register, remove from free, and add to active
+    let mut gpIdx := 0
+    let mut fpIdx := 0
+
+    for param in params do
+      let isFloat := param.ty == IRType.float || param.ty == IRType.float32
+      if isFloat then
+        if fpIdx < calleeSavedFPRegs.size then
+          let targetReg := calleeSavedFPRegs[fpIdx]!
+          let paramInterval : LiveInterval := { var := param.x, start := 0, end_ := 1000, ty := param.ty }
           state := {
             state with
               allocation := state.allocation.insert param.x.idx targetReg
-              freeRegs := state.freeRegs.filter (· != targetReg)
+              freeFPRegs := state.freeFPRegs.filter (· != targetReg)
               active := state.active.push paramInterval
           }
-    -- Parameters 10+ stay on the caller's stack. Reserve stack slot numbers to prevent
-    -- local variable spills from using conflicting offsets.
-    let numStackParams := if params.size > calleeSavedRegs.size then params.size - calleeSavedRegs.size else 0
+          fpIdx := fpIdx + 1
+      else
+        if gpIdx < calleeSavedGPRegs.size then
+          let targetReg := calleeSavedGPRegs[gpIdx]!
+          let paramInterval : LiveInterval := { var := param.x, start := 0, end_ := 1000, ty := param.ty }
+          state := {
+            state with
+              allocation := state.allocation.insert param.x.idx targetReg
+              freeGPRegs := state.freeGPRegs.filter (· != targetReg)
+              active := state.active.push paramInterval
+          }
+          gpIdx := gpIdx + 1
+
+    -- Parameters that don't fit in registers stay on the caller's stack
+    let numStackParams := (max (gpIdx - calleeSavedGPRegs.size) 0) + (max (fpIdx - calleeSavedFPRegs.size) 0)
     state := { state with nextStackSlot := state.nextStackSlot + numStackParams }
     return state
 

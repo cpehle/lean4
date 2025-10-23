@@ -12,6 +12,7 @@ public import Lean.Compiler.IR.Basic
 public import Lean.Compiler.IR.CompilerM
 public import Lean.Compiler.NameMangling
 public import Lean.Compiler.ClosedTermCache
+public import Lean.Compiler.InitAttr
 public import Lean.Runtime
 
 public section
@@ -147,6 +148,12 @@ def emitInstr (instr : Instr) : EmitM Unit := do
   | .udiv dst src1 src2 =>
     emitLn s!"  udiv {dst}, {src1}, {src2}"
 
+  | .uxtb dst src =>
+    emitLn s!"  uxtb {dst}, {src}"
+
+  | .uxth dst src =>
+    emitLn s!"  uxth {dst}, {src}"
+
   | .and dst src1 src2 =>
     emitLn s!"  and {dst}, {src1}, {emitOperand src2}"
 
@@ -178,10 +185,14 @@ def emitInstr (instr : Instr) : EmitM Unit := do
     emitLn s!"  adrp {dst}, {lbl}"
 
   | .ldr dst src suffix =>
+    -- Detect if dst is FP register and render appropriately
+    let dstStr := match dst with
+      | .phys r => if isFPReg r then fpReg FloatPrec.double dst else toString dst
+      | _ => toString dst
     if suffix.isEmpty then
-      emitLn s!"  ldr {dst}, {emitOperand src}"
+      emitLn s!"  ldr {dstStr}, {emitOperand src}"
     else
-      emitLn s!"  ldr {dst}, [{dst}{suffix}]"
+      emitLn s!"  ldr {dstStr}, [{emitOperand src}{suffix}]"
 
   | .ldrb dst src =>
     emitLn s!"  ldrb {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
@@ -190,7 +201,11 @@ def emitInstr (instr : Instr) : EmitM Unit := do
     emitLn s!"  ldrh {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
 
   | .str src dst =>
-    emitLn s!"  str {src}, {emitOperand dst}"
+    -- Detect if src is FP register and render appropriately
+    let srcStr := match src with
+      | .phys r => if isFPReg r then fpReg FloatPrec.double src else toString src
+      | _ => toString src
+    emitLn s!"  str {srcStr}, {emitOperand dst}"
 
   | .strb src dst =>
     emitLn s!"  strb {ARM64.Reg.toGPR32String src}, {emitOperand dst}"
@@ -255,20 +270,56 @@ def emitInstr (instr : Instr) : EmitM Unit := do
     if i < regs.size then
       emitLn s!"  ldr {regs[i]!}, [sp], #8"
 
-  | .fadd dst src1 src2 =>
-    emitLn s!"  fadd {dst}, {src1}, {src2}"
+  | .fadd prec dst src1 src2 =>
+    emitLn s!"  fadd {fpReg prec dst}, {fpReg prec src1}, {fpReg prec src2}"
 
-  | .fsub dst src1 src2 =>
-    emitLn s!"  fsub {dst}, {src1}, {src2}"
+  | .fsub prec dst src1 src2 =>
+    emitLn s!"  fsub {fpReg prec dst}, {fpReg prec src1}, {fpReg prec src2}"
 
-  | .fmul dst src1 src2 =>
-    emitLn s!"  fmul {dst}, {src1}, {src2}"
+  | .fmul prec dst src1 src2 =>
+    emitLn s!"  fmul {fpReg prec dst}, {fpReg prec src1}, {fpReg prec src2}"
 
-  | .fdiv dst src1 src2 =>
-    emitLn s!"  fdiv {dst}, {src1}, {src2}"
+  | .fdiv prec dst src1 src2 =>
+    emitLn s!"  fdiv {fpReg prec dst}, {fpReg prec src1}, {fpReg prec src2}"
 
-  | .fcmp src1 src2 =>
-    emitLn s!"  fcmp {src1}, {src2}"
+  | .fneg prec dst src =>
+    emitLn s!"  fneg {fpReg prec dst}, {fpReg prec src}"
+
+  | .fcmp prec src1 src2 =>
+    emitLn s!"  fcmp {fpReg prec src1}, {fpReg prec src2}"
+
+  | .fmov prec dst src =>
+    -- fmov can move between FP registers or between GP and FP registers
+    -- At emission time, all registers must be physical
+    match dst, src with
+    | .phys dstP, .phys srcP =>
+      if isFPReg dstP && isFPReg srcP then
+        -- FP to FP: use precision-based register names
+        emitLn s!"  fmov {fpReg prec dst}, {fpReg prec src}"
+      else if isFPReg dstP && !isFPReg srcP then
+        -- GP to FP: use d register for dst and x register for src
+        emitLn s!"  fmov {fpReg FloatPrec.double dst}, {src}"
+      else if !isFPReg dstP && isFPReg srcP then
+        -- FP to GP: use x register for dst and d register for src
+        emitLn s!"  fmov {dst}, {fpReg FloatPrec.double src}"
+      else
+        -- Both GP - this is an error, should use mov instead
+        panic! s!"fmov between two GP registers: {dst}, {src}"
+    | _, _ =>
+      -- Virtual registers should not exist at emission time
+      panic! s!"fmov with virtual registers at emission time: {dst}, {src}"
+
+  | .scvtf prec dst src =>
+    emitLn s!"  scvtf {fpReg prec dst}, {src}"
+
+  | .ucvtf prec dst src =>
+    emitLn s!"  ucvtf {fpReg prec dst}, {src}"
+
+  | .fcvtzs prec dst src =>
+    emitLn s!"  fcvtzs {dst}, {fpReg prec src}"
+
+  | .fcvtzu prec dst src =>
+    emitLn s!"  fcvtzu {dst}, {fpReg prec src}"
 
   | .label name =>
     emitLn s!"{name}:"
@@ -282,6 +333,36 @@ where
     | .eq => "eq" | .ne => "ne" | .lt => "lt" | .le => "le"
     | .gt => "gt" | .ge => "ge" | .lo => "lo" | .ls => "ls"
     | .hi => "hi" | .hs => "hs"
+
+  -- Check if a physical register is a floating-point register
+  isFPReg (r : PhysReg) : Bool :=
+    match r with
+    | .v0 | .v1 | .v2 | .v3 | .v4 | .v5 | .v6 | .v7
+    | .v8 | .v9 | .v10 | .v11 | .v12 | .v13 | .v14 | .v15
+    | .v16 | .v17 | .v18 | .v19 | .v20 | .v21 | .v22 | .v23
+    | .v24 | .v25 | .v26 | .v27 | .v28 | .v29 | .v30 | .v31 => true
+    | _ => false
+
+  -- Render FP register based on precision (s0-s31 for single, d0-d31 for double)
+  fpReg (prec : FloatPrec) (r : Reg) : String :=
+    match prec, r with
+    | .single, .phys PhysReg.v0 => "s0" | .single, .phys PhysReg.v1 => "s1" | .single, .phys PhysReg.v2 => "s2" | .single, .phys PhysReg.v3 => "s3"
+    | .single, .phys PhysReg.v4 => "s4" | .single, .phys PhysReg.v5 => "s5" | .single, .phys PhysReg.v6 => "s6" | .single, .phys PhysReg.v7 => "s7"
+    | .single, .phys PhysReg.v8 => "s8" | .single, .phys PhysReg.v9 => "s9" | .single, .phys PhysReg.v10 => "s10" | .single, .phys PhysReg.v11 => "s11"
+    | .single, .phys PhysReg.v12 => "s12" | .single, .phys PhysReg.v13 => "s13" | .single, .phys PhysReg.v14 => "s14" | .single, .phys PhysReg.v15 => "s15"
+    | .single, .phys PhysReg.v16 => "s16" | .single, .phys PhysReg.v17 => "s17" | .single, .phys PhysReg.v18 => "s18" | .single, .phys PhysReg.v19 => "s19"
+    | .single, .phys PhysReg.v20 => "s20" | .single, .phys PhysReg.v21 => "s21" | .single, .phys PhysReg.v22 => "s22" | .single, .phys PhysReg.v23 => "s23"
+    | .single, .phys PhysReg.v24 => "s24" | .single, .phys PhysReg.v25 => "s25" | .single, .phys PhysReg.v26 => "s26" | .single, .phys PhysReg.v27 => "s27"
+    | .single, .phys PhysReg.v28 => "s28" | .single, .phys PhysReg.v29 => "s29" | .single, .phys PhysReg.v30 => "s30" | .single, .phys PhysReg.v31 => "s31"
+    | .double, .phys PhysReg.v0 => "d0" | .double, .phys PhysReg.v1 => "d1" | .double, .phys PhysReg.v2 => "d2" | .double, .phys PhysReg.v3 => "d3"
+    | .double, .phys PhysReg.v4 => "d4" | .double, .phys PhysReg.v5 => "d5" | .double, .phys PhysReg.v6 => "d6" | .double, .phys PhysReg.v7 => "d7"
+    | .double, .phys PhysReg.v8 => "d8" | .double, .phys PhysReg.v9 => "d9" | .double, .phys PhysReg.v10 => "d10" | .double, .phys PhysReg.v11 => "d11"
+    | .double, .phys PhysReg.v12 => "d12" | .double, .phys PhysReg.v13 => "d13" | .double, .phys PhysReg.v14 => "d14" | .double, .phys PhysReg.v15 => "d15"
+    | .double, .phys PhysReg.v16 => "d16" | .double, .phys PhysReg.v17 => "d17" | .double, .phys PhysReg.v18 => "d18" | .double, .phys PhysReg.v19 => "d19"
+    | .double, .phys PhysReg.v20 => "d20" | .double, .phys PhysReg.v21 => "d21" | .double, .phys PhysReg.v22 => "d22" | .double, .phys PhysReg.v23 => "d23"
+    | .double, .phys PhysReg.v24 => "d24" | .double, .phys PhysReg.v25 => "d25" | .double, .phys PhysReg.v26 => "d26" | .double, .phys PhysReg.v27 => "d27"
+    | .double, .phys PhysReg.v28 => "d28" | .double, .phys PhysReg.v29 => "d29" | .double, .phys PhysReg.v30 => "d30" | .double, .phys PhysReg.v31 => "d31"
+    | _, r => toString r  -- For general-purpose registers in conversion instructions
 
 /-- Emit a basic block -/
 def emitBasicBlock (bb : BasicBlock) : EmitM Unit := do
@@ -448,7 +529,8 @@ def emitInitFunction (env : Environment) (modName : Name) (decls : Array IR.Decl
     let impInitFn := "_" ++ Lean.mkModuleInitializationFunctionName imp.module
     emitLn s!"  // Initialize {imp.module}"
     emitLn "  mov x0, #1  // builtin"
-    emitLn "  mov x1, #1  // lean_io_mk_world() inlined"
+    emitLn "  bl _lean_io_mk_world  // Get real IO world object for external init"
+    emitLn "  mov x1, x0  // Pass world as second argument"
     emitLn s!"  bl {impInitFn}"
     emitLn "  mov x19, x0"
     emitLn "  // Check for error (inline lean_io_result_is_ok)"
@@ -463,37 +545,111 @@ def emitInitFunction (env : Environment) (modName : Name) (decls : Array IR.Decl
     emitLn s!"{decDoneLabel}:"
     emitLn ""
 
-  -- Initialize closed constants and 0-param defs by calling their init functions
-  emitLn "  // Initialize closed constants and 0-param defs"
+  -- Process all declarations for initialization
+  emitLn "  // Initialize all declarations"
   for decl in decls.toList.reverse do
     match decl with
-    | .fdecl name params ty _ _ =>
-      if params.isEmpty then
-        let constName := "_" ++ name.mangle
-        let initName := "__init_" ++ name.mangle  -- Double underscore for C-exported function
-        emitLn s!"  // Initialize {constName}"
-        emitLn s!"  bl {initName}"
-        emitLn s!"  adrp x8, {constName}@PAGE"
-        -- Use appropriate store instruction based on type
-        match ty with
-        | .uint8 =>
-          emitLn s!"  add x8, x8, {constName}@PAGEOFF"
-          emitLn "  strb w0, [x8]"
-        | .uint16 =>
-          emitLn s!"  add x8, x8, {constName}@PAGEOFF"
-          emitLn "  strh w0, [x8]"
-        | .uint32 | .float32 =>
-          emitLn s!"  str w0, [x8, {constName}@PAGEOFF]"
-        | _ =>
-          emitLn s!"  str x0, [x8, {constName}@PAGEOFF]"
-        if ty.isObj then
-          emitLn "  // Mark persistent"
-          emitLn s!"  adrp x8, {constName}@PAGE"
-          emitLn s!"  ldr x0, [x8, {constName}@PAGEOFF]"
-          emitLn "  bl _lean_mark_persistent"
+    | .fdecl name params ty body _ =>
+      -- Check if this is an IO Unit initialize block (declaration itself is the initFn)
+      if isIOUnitInitFn env name then
+        let funcName := "_" ++ name.mangle
+        emitLn s!"  // Initialize IO Unit block {name}"
+        emitLn s!"  mov x0, #1  // lean_io_mk_world() inlined as lean_box(0)"
+        emitLn s!"  bl {funcName}"
+        emitLn "  mov x19, x0  // Save IO result"
+        emitLn "  ldrb w8, [x19, #7]  // Load m_tag from IO result"
+        emitLn "  cbnz w8, .Linit_error  // If tag != 0, error"
+        emitLn "  // Dec ref IO result"
+        emitLn "  mov x0, x19"
+        emitLn "  bl _lean_dec_ref"
         emitLn ""
-      else
-        pure ()
+      -- Check if this is a 0-param declaration with a separate initFn
+      else if params.isEmpty then
+        match getInitFnNameFor? env name with
+        | some initFnName =>
+          -- Named initialize block (e.g., initialize ref : IO.Ref Nat ← ...)
+          let constName := "_" ++ name.mangle
+          let initFnMangledName := "_" ++ initFnName.mangle
+          emitLn s!"  // Initialize {name} via initFn {initFnName}"
+          emitLn s!"  mov x0, #1  // lean_io_mk_world() inlined as lean_box(0)"
+          emitLn s!"  bl {initFnMangledName}"
+          emitLn "  mov x19, x0  // Save IO result"
+          emitLn "  ldrb w8, [x19, #7]  // Load m_tag from IO result"
+          emitLn "  cbnz w8, .Linit_error  // If tag != 0, error"
+          emitLn s!"  // Extract value from IO result and store in {constName}"
+          emitLn "  ldr x0, [x19, #8]  // Get field 0 (the value)"
+          -- For scalar types, unbox the value; for objects, inc ref and mark persistent
+          if ty.isScalar then
+            -- Unbox scalar value based on type
+            match ty with
+            | .uint8 | .uint16 | .uint32 | .usize =>
+              emitLn "  bl _lean_unbox  // Unbox scalar to native integer"
+            | .uint64 =>
+              emitLn "  bl _lean_unbox_uint64  // Unbox to uint64"
+            | .float =>
+              emitLn "  bl _lean_unbox_float  // Unbox to float"
+            | _ =>
+              emitLn "  bl _lean_unbox  // Default unbox"
+            -- Store the unboxed scalar value
+            emitLn s!"  adrp x8, {constName}@PAGE"
+            emitLn s!"  add x8, x8, {constName}@PAGEOFF"
+            match ty with
+            | .uint8 =>
+              emitLn "  strb w0, [x8]"
+            | .uint16 =>
+              emitLn "  strh w0, [x8]"
+            | .uint32 =>
+              emitLn "  str w0, [x8]"
+            | .float =>
+              emitLn "  str d0, [x8]  // Float returns in d0"
+            | _ =>
+              emitLn "  str x0, [x8]"
+          else
+            -- Object type: inc ref count and mark persistent
+            emitLn "  bl _lean_inc  // Inc ref count before storing"
+            emitLn s!"  adrp x8, {constName}@PAGE"
+            emitLn s!"  add x8, x8, {constName}@PAGEOFF"
+            emitLn "  str x0, [x8]"
+            if ty.isObj then
+              emitLn "  // Mark persistent"
+              emitLn "  bl _lean_mark_persistent"
+          emitLn "  // Dec ref IO result"
+          emitLn "  mov x0, x19"
+          emitLn "  bl _lean_dec_ref"
+          emitLn ""
+        | none =>
+          -- Regular closed constant
+          match body with
+          | .unreachable =>
+            -- Unreachable but no initFn - skip it
+            pure ()
+          | _ =>
+            let constName := "_" ++ name.mangle
+            let initName := "__init_" ++ name.mangle
+            emitLn s!"  // Initialize {constName}"
+            emitLn s!"  bl {initName}"
+            emitLn s!"  adrp x8, {constName}@PAGE"
+            emitLn s!"  add x8, x8, {constName}@PAGEOFF"
+            match ty with
+            | .uint8 =>
+              emitLn "  strb w0, [x8]"
+            | .uint16 =>
+              emitLn "  strh w0, [x8]"
+            | .uint32 =>
+              emitLn "  str w0, [x8]"
+            | .float32 =>
+              emitLn "  str s0, [x8]"
+            | .float =>
+              emitLn "  str d0, [x8]"
+            | _ =>
+              emitLn "  str x0, [x8]"
+            if ty.isObj then
+              emitLn "  // Mark persistent"
+              emitLn s!"  adrp x8, {constName}@PAGE"
+              emitLn s!"  add x8, x8, {constName}@PAGEOFF"
+              emitLn "  ldr x0, [x8]"
+              emitLn "  bl _lean_mark_persistent"
+            emitLn ""
     | _ => pure ()
 
   emitLn ".Lalready_initialized:"
@@ -669,12 +825,18 @@ def emitDecls (env : Environment) (modName : Name) (decls : Array IR.Decl) : Str
     -- Emit all function declarations
     for decl in decls do
       match decl with
-      | .fdecl name params _ _ _ =>
+      | .fdecl name params _ body _ =>
         -- For 0-param functions, emit init functions with double underscore prefix
+        -- but skip those with unreachable bodies (IO initializers)
         if params.isEmpty then
-          let initFnName := "__init_" ++ name.mangle
-          let machineFunc := InstrSelect.compileDecl env decl
-          emitMachineFunction machineFunc (some initFnName)
+          match body with
+          | .unreachable =>
+            -- Skip unreachable 0-param functions (they are IO refs initialized by initFn calls)
+            pure ()
+          | _ =>
+            let initFnName := "__init_" ++ name.mangle
+            let machineFunc := InstrSelect.compileDecl env decl
+            emitMachineFunction machineFunc (some initFnName)
         else
           let machineFunc := InstrSelect.compileDecl env decl
           emitMachineFunction machineFunc

@@ -1,0 +1,3 @@
+process launch --stop-at-entry
+image list -o -f str.lean.arm64.out
+quit
