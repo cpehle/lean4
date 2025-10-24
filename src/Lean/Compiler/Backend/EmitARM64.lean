@@ -194,6 +194,9 @@ def emitInstr (instr : Instr) : EmitM Unit := do
     else
       emitLn s!"  ldr {dstStr}, [{emitOperand src}{suffix}]"
 
+  | .ldrw dst src =>
+    emitLn s!"  ldr {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
+
   | .ldrb dst src =>
     emitLn s!"  ldrb {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
 
@@ -581,13 +584,18 @@ def emitInitFunction (env : Environment) (modName : Name) (decls : Array IR.Decl
           -- For scalar types, unbox the value; for objects, inc ref and mark persistent
           if ty.isScalar then
             -- Unbox scalar value based on type
+            -- Note: uint64, usize, float, float32 are heap-allocated; uint8/16/32 are inline boxed
             match ty with
-            | .uint8 | .uint16 | .uint32 | .usize =>
-              emitLn "  bl _lean_unbox  // Unbox scalar to native integer"
+            | .uint8 | .uint16 | .uint32 =>
+              emitLn "  bl _lean_unbox  // Unbox inline scalar to native integer"
             | .uint64 =>
-              emitLn "  bl _lean_unbox_uint64  // Unbox to uint64"
+              emitLn "  bl _lean_unbox_uint64  // Unbox heap-allocated uint64"
+            | .usize =>
+              emitLn "  bl _lean_unbox_usize  // Unbox heap-allocated usize"
             | .float =>
-              emitLn "  bl _lean_unbox_float  // Unbox to float"
+              emitLn "  bl _lean_unbox_float  // Unbox heap-allocated float"
+            | .float32 =>
+              emitLn "  bl _lean_unbox_float32  // Unbox heap-allocated float32"
             | _ =>
               emitLn "  bl _lean_unbox  // Default unbox"
             -- Store the unboxed scalar value

@@ -121,7 +121,7 @@ def emit (instr : Instr) : SelectM Unit :=
 def emitAll (instrs : Array Instr) : SelectM Unit :=
   modify fun s => { s with instrs := s.instrs ++ instrs }
 
-/-- Emit a move instruction, automatically using fmov when moving between register classes -/
+/-- Emit a move instruction, automatically using fmov when needed -/
 def emitMove (dst : Reg) (src : Operand) : SelectM Unit := do
   let allocState := (← get).allocState
   match src with
@@ -138,12 +138,14 @@ def emitMove (dst : Reg) (src : Operand) : SelectM Unit := do
       | .virt v => match allocState.allocation.get? v.idx with
         | some p => isPhysFPReg p
         | none => false
-    if dstIsFP != srcIsFP then
+    if dstIsFP && srcIsFP then
+      -- Both are FP registers - use fmov for scalar FP moves
+      emit (Instr.fmov FloatPrec.double dst srcReg)
+    else if dstIsFP != srcIsFP then
       -- Moving between GP and FP registers - use fmov with double precision
-      -- The assembler will infer the correct variant based on register names
       emit (Instr.fmov FloatPrec.double dst srcReg)
     else
-      -- Same register class - use regular mov
+      -- Both are GP registers - use regular mov
       emit (Instr.mov dst src)
   | _ =>
     -- Immediate or memory operand - use regular mov
@@ -460,109 +462,11 @@ def tryInlineExternCall (fnName : String) (args : Array Arg) (dstReg : Reg) : Se
     else
       return false
 
-  | "_lean_io_result_get_value" =>
-    if args.size == 1 then
-      match args[0]! with
-      | .var v =>
-        let vReg ← varToReg v
-        emit (Instr.comment "inline lean_io_result_get_value")
-        emit (Instr.ldr dstReg (.mem vReg 8))
-      | .erased =>
-        emit (Instr.comment "inline lean_io_result_get_value(erased)")
-        emit (Instr.mov dstReg (.imm 0))
-      return true
-    else
-      return false
+  -- Don't inline lean_io_result_get_value - let it call the runtime function
+  -- The runtime handles both scalar and object IO.Result correctly
 
-  | "_lean_io_result_mk_ok" =>
-    if args.size == 1 then
-      emit (Instr.comment "inline lean_io_result_mk_ok")
-      -- Check if result value type is scalar by examining the function's return type
-      -- For initialize blocks like "initialize test : UInt64 ← pure 0",
-      -- returnType is IO.Result wrapping the actual type (UInt64)
-      let returnType := (← get).returnType
-      let isScalar := match returnType with
-        | .struct _ types | .union _ types =>
-          -- IO.Result is a struct/union with the value type as first element
-          if h : types.size > 0 then
-            types[0].isScalar
-          else
-            false
-        | ty => ty.isScalar
-      match args[0]! with
-      | .var v =>
-        if isScalar then
-          -- Scalar result: allocate constructor with lean_alloc_ctor(0, 1, 1)
-          emit (Instr.comment "scalar result: num_objects=1, num_scalars=1")
-          emit (Instr.mov (.phys PhysReg.x0) (.imm 0))
-          emit (Instr.mov (.phys PhysReg.x1) (.imm 1))
-          emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
-          emit (Instr.bl "lean_alloc_ctor")
-          if dstReg != .phys PhysReg.x0 then
-            emitMove dstReg (.reg (.phys PhysReg.x0))
-          -- Set object field 0 to world token (lean_box(0) = 1)
-          emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
-          emit (Instr.mov (.phys PhysReg.x1) (.imm 0))
-          emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
-          emit (Instr.bl "lean_ctor_set")
-          if dstReg != .phys PhysReg.x0 then
-            emitMove dstReg (.reg (.phys PhysReg.x0))
-          -- Set scalar field 0 to result value using direct memory access
-          let vReg ← varToReg v
-          -- Scalar field offset: 8 (header) + 1 * 8 (one object field) = 16
-          emit (Instr.str vReg (.mem dstReg (Int.ofNat 16)))
-          return true
-        else
-          -- Object result: allocate constructor with lean_alloc_ctor(0, 2, 0)
-          emit (Instr.comment "object result: num_objects=2, num_scalars=0")
-          emit (Instr.mov (.phys PhysReg.x0) (.imm 0))
-          emit (Instr.mov (.phys PhysReg.x1) (.imm 2))
-          emit (Instr.mov (.phys PhysReg.x2) (.imm 0))
-          emit (Instr.bl "lean_alloc_ctor")
-          if dstReg != .phys PhysReg.x0 then
-            emitMove dstReg (.reg (.phys PhysReg.x0))
-          -- Set object field 0 to result value
-          emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
-          emit (Instr.mov (.phys PhysReg.x1) (.imm 0))
-          let vReg ← varToReg v
-          emitMove (.phys PhysReg.x2) (.reg vReg)
-          emit (Instr.bl "lean_ctor_set")
-          if dstReg != .phys PhysReg.x0 then
-            emitMove dstReg (.reg (.phys PhysReg.x0))
-          -- Set object field 1 to world token (lean_box(0) = 1)
-          emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
-          emit (Instr.mov (.phys PhysReg.x1) (.imm 1))
-          emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
-          emit (Instr.bl "lean_ctor_set")
-          if dstReg != .phys PhysReg.x0 then
-            emitMove dstReg (.reg (.phys PhysReg.x0))
-          return true
-      | .erased =>
-        -- Erased result: treat as object (current behavior)
-        emit (Instr.comment "erased result: num_objects=2, num_scalars=0")
-        emit (Instr.mov (.phys PhysReg.x0) (.imm 0))
-        emit (Instr.mov (.phys PhysReg.x1) (.imm 2))
-        emit (Instr.mov (.phys PhysReg.x2) (.imm 0))
-        emit (Instr.bl "lean_alloc_ctor")
-        if dstReg != .phys PhysReg.x0 then
-          emitMove dstReg (.reg (.phys PhysReg.x0))
-        -- Set object field 0 to lean_box(0) = 1
-        emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
-        emit (Instr.mov (.phys PhysReg.x1) (.imm 0))
-        emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
-        emit (Instr.bl "lean_ctor_set")
-        if dstReg != .phys PhysReg.x0 then
-          emitMove dstReg (.reg (.phys PhysReg.x0))
-        -- Set object field 1 to lean_box(0) = 1
-        emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
-        emit (Instr.mov (.phys PhysReg.x1) (.imm 1))
-        emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
-        emit (Instr.bl "lean_ctor_set")
-        if dstReg != .phys PhysReg.x0 then
-          emitMove dstReg (.reg (.phys PhysReg.x0))
-        return true
-    else
-      return false
+  -- Don't inline lean_io_result_mk_ok - let it call the runtime function
+  -- The C runtime has the correct implementation for both scalar and object results
 
   | "_lean_mk_empty_array_with_capacity" =>
     if args.size == 2 then
@@ -1074,9 +978,10 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
         emit (Instr.add dstReg dstReg (.label s!"{fnName}@PAGEOFF"))
         emit (Instr.ldrh dstReg (.mem dstReg 0))
       | .uint32 =>
-        -- Load word (32-bit)
+        -- Load word (32-bit): must use explicit add + ldrw to load only 32 bits
         emit (Instr.adrp dstReg s!"{fnName}@PAGE")
-        emit (Instr.ldr dstReg (.reg dstReg) s!", {fnName}@PAGEOFF")
+        emit (Instr.add dstReg dstReg (.label s!"{fnName}@PAGEOFF"))
+        emit (Instr.ldrw dstReg (.mem dstReg 0))
       | _ =>
         -- Load doubleword (64-bit) - objects, uint64, usize
         emit (Instr.adrp dstReg s!"{fnName}@PAGE")
@@ -1317,34 +1222,75 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
   | .box ty x =>
     let xReg ← varToReg x
     emit (Instr.comment "box")
-    if ty == IRType.float || ty == IRType.float32 then
-      -- Float boxing: call lean_box_float(double/float) -> object*
-      -- Float is in general-purpose register, move to d0/s0 first
-      let prec := typeToFloatPrec ty
-      emit (Instr.fmov prec (.phys PhysReg.v0) xReg)
-      emit (Instr.bl "lean_box_float")
+    -- Match C backend boxing behavior: on 64-bit ARM64, only uint8/uint16/uint32 use inline boxing
+    -- uint64, usize, float, float32 all require heap allocation
+    match ty with
+    | IRType.uint64 =>
+      -- Call lean_box_uint64: allocates heap object with 8-byte scalar storage
+      emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
+      emit (Instr.bl "_lean_box_uint64")
       if dstReg != .phys PhysReg.x0 then
         emitMove dstReg (.reg (.phys PhysReg.x0))
-    else if ty.isScalar then
-      -- Inline scalar boxing: shift left by 1 and set low bit
-      -- This marks the value as a boxed scalar (odd pointer = scalar)
+    | IRType.usize =>
+      -- Call lean_box_usize: allocates heap object with sizeof(size_t) scalar storage
+      emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
+      emit (Instr.bl "_lean_box_usize")
+      if dstReg != .phys PhysReg.x0 then
+        emitMove dstReg (.reg (.phys PhysReg.x0))
+    | IRType.float =>
+      -- Call lean_box_float: takes double in d0, returns object* in x0
+      emitMove (.phys PhysReg.v0) (.reg xReg)
+      emit (Instr.bl "_lean_box_float")
+      if dstReg != .phys PhysReg.x0 then
+        emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+    | IRType.float32 =>
+      -- Call lean_box_float32: takes float in s0, returns object* in x0
+      emitMove (.phys PhysReg.v0) (.reg xReg)
+      emit (Instr.bl "_lean_box_float32")
+      if dstReg != .phys PhysReg.x0 then
+        emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+    | IRType.uint8 | IRType.uint16 | IRType.uint32 =>
+      -- Inline scalar boxing: shift left by 1 and set low bit (fits in 63 bits on 64-bit)
       emit (Instr.lsl dstReg xReg (.imm 1))
       emit (Instr.orr dstReg dstReg (.imm 1))
-    else
+    | _ =>
+      -- For non-scalar types (object, tagged, irrelevant), just move
       emit (Instr.mov dstReg (.reg xReg))
 
   | .unbox x =>
     let xReg ← varToReg x
     emit (Instr.comment "unbox")
-    -- Unbox based on destination type (we know what type we're unboxing to)
-    if dstType == IRType.float || dstType == IRType.float32 then
-      -- Float unboxing: call lean_unbox_float(object*) -> double/float
-      let prec := typeToFloatPrec dstType
+    -- Match C backend unboxing behavior
+    match dstType with
+    | IRType.uint64 =>
+      -- Call lean_unbox_uint64: takes object* in x0, returns uint64_t in x0
       emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
-      emit (Instr.bl "lean_unbox_float")
-      emit (Instr.fmov prec dstReg (.phys PhysReg.v0))
-    else
+      emit (Instr.bl "_lean_unbox_uint64")
+      if dstReg != .phys PhysReg.x0 then
+        emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+    | IRType.usize =>
+      -- Call lean_unbox_usize: takes object* in x0, returns size_t in x0
+      emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
+      emit (Instr.bl "_lean_unbox_usize")
+      if dstReg != .phys PhysReg.x0 then
+        emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+    | IRType.float =>
+      -- Call lean_unbox_float: takes object* in x0, returns double in d0
+      emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
+      emit (Instr.bl "_lean_unbox_float")
+      if dstReg != .phys PhysReg.v0 then
+        emitMove dstReg (.reg (.phys PhysReg.v0))
+    | IRType.float32 =>
+      -- Call lean_unbox_float32: takes object* in x0, returns float in s0
+      emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
+      emit (Instr.bl "_lean_unbox_float32")
+      if dstReg != .phys PhysReg.v0 then
+        emitMove dstReg (.reg (.phys PhysReg.v0))
+    | IRType.uint8 | IRType.uint16 | IRType.uint32 =>
       -- Inline scalar unboxing: arithmetic shift right by 1 to extract value
+      emit (Instr.asr dstReg xReg (.imm 1))
+    | _ =>
+      -- For non-scalar types, shouldn't happen but handle gracefully
       emit (Instr.asr dstReg xReg (.imm 1))
 
   | .lit (.num n) =>

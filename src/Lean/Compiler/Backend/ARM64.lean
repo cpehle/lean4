@@ -170,6 +170,7 @@ inductive Instr where
 
   -- Load / store instructions
   | ldr (dst : Reg) (src : Operand) (suffix : String := "")
+  | ldrw (dst : Reg) (src : Operand)  -- Load word (32-bit) - renders dst as w register
   | ldrb (dst : Reg) (src : Operand)
   | ldrh (dst : Reg) (src : Operand)
   | str (src : Reg) (dst : Operand)
@@ -241,6 +242,9 @@ def toString : Instr → String
   | ldr dst src suffix =>
     if suffix.isEmpty then s!"ldr {dst}, {src}"
     else s!"ldr {dst}, {src}{suffix}"
+  | ldrw dst src =>
+    let dstStr := Reg.toGPR32String dst
+    s!"ldr {dstStr}, {src}"
   | ldrb dst src =>
     let dstStr := Reg.toGPR32String dst
     s!"ldrb {dstStr}, {src}"

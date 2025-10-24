@@ -71,6 +71,11 @@
 #define lean_float_decLt lean_float_decLt_inline
 #define lean_box_float lean_box_float_inline
 #define lean_unbox_float lean_unbox_float_inline
+#define lean_box_float32 lean_box_float32_inline
+#define lean_unbox_float32 lean_unbox_float32_inline
+#define lean_box_uint64 lean_box_uint64_inline
+#define lean_box_usize lean_box_usize_inline
+#define lean_unbox_usize lean_unbox_usize_inline
 #define lean_uint64_to_usize lean_uint64_to_usize_inline
 #define lean_usize_dec_le lean_usize_dec_le_inline
 #define lean_usize_land lean_usize_land_inline
@@ -160,6 +165,11 @@
 #undef lean_float_decLt
 #undef lean_box_float
 #undef lean_unbox_float
+#undef lean_box_float32
+#undef lean_unbox_float32
+#undef lean_box_uint64
+#undef lean_box_usize
+#undef lean_unbox_usize
 #undef lean_uint64_to_usize
 #undef lean_usize_dec_le
 #undef lean_usize_land
@@ -484,6 +494,26 @@ LEAN_EXPORT lean_object* lean_box_float(double f) {
 
 LEAN_EXPORT double lean_unbox_float(lean_object* o) {
   return lean_unbox_float_inline(o);
+}
+
+LEAN_EXPORT lean_object* lean_box_float32(float f) {
+  return lean_box_float32_inline(f);
+}
+
+LEAN_EXPORT float lean_unbox_float32(lean_object* o) {
+  return lean_unbox_float32_inline(o);
+}
+
+LEAN_EXPORT lean_object* lean_box_uint64(uint64_t v) {
+  return lean_box_uint64_inline(v);
+}
+
+LEAN_EXPORT lean_object* lean_box_usize(size_t v) {
+  return lean_box_usize_inline(v);
+}
+
+LEAN_EXPORT size_t lean_unbox_usize(lean_object* o) {
+  return lean_unbox_usize_inline(o);
 }
 
 // Usize operations
