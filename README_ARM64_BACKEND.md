@@ -171,20 +171,76 @@ less test.s
 
 ### Test Suite
 
-Run the test suite (after building Lean):
+Run the compiler test suite (after building Lean):
 
 ```bash
-cd build/release
-make test ARGS="-R arm64"
+cd build/release/stage1
+ctest -R "comptest" -j4 --output-on-failure
 ```
 
-On Apple Silicon or other AArch64 hosts the compiler tests prefixed with `arm64_`
-now also emit and execute ARM64 assembly during `ctest`, ensuring the native backend stays
-buildable as part of the regular pipeline.
+Alternatively, from the build/release directory:
+
+```bash
+make test ARGS="-R comptest -j4"
+```
+
+On Apple Silicon or other AArch64 hosts, the compiler tests compile and execute both C and ARM64 backends, ensuring the native backend stays functional as part of the regular CI pipeline.
+
+### Test Results (as of October 2025)
+
+**Overall Compiler Tests:**
+- Total: 88 tests
+- Passing: 78 tests (89%)
+- Failing: 10 tests (11%)
+
+**ARM64-Specific Tests:**
+- Total: 23 tests (prefixed with `arm64_`)
+- Passing: 21 tests (91%)
+- Failing: 2 tests
+
+**Passing ARM64 Tests:**
+- arm64_arithmetic.lean - Basic arithmetic operations
+- arm64_array.lean - Array operations
+- arm64_case.lean - Pattern matching and case statements
+- arm64_closure.lean - Closure creation and application
+- arm64_constructors.lean - Constructor allocation
+- arm64_countdown_simple.lean - Simple countdown recursion
+- arm64_eq_test.lean - Equality testing
+- arm64_factorial_debug.lean - Factorial with debug info
+- arm64_factorial_only.lean - Factorial function
+- arm64_listsum_debug.lean - List sum with debug info
+- arm64_listsum_simple.lean - List sum function
+- arm64_lit_test.lean - Literal values
+- arm64_many_args.lean - Functions with many arguments
+- arm64_partial_apply.lean - Partial application
+- arm64_recursion.lean - Recursive functions
+- arm64_simple.lean - Simple function compilation
+- arm64_simple_rec.lean - Simple recursion
+- arm64_string.lean - String operations
+- arm64_sumto.lean - Sum to N
+- arm64_test.lean - General tests
+- arm64_uint32_arith.lean - 32-bit unsigned integer arithmetic
+
+**Known Failing Tests:**
+1. **arm64_basic.lean** - Assembly format differences (not a runtime failure; expected output needs update)
+2. **arm64_uint64_arith.lean** - Incorrect 64-bit unsigned integer arithmetic results
+3. **expr.lean** - Crashes with uncaught exception (initialization issue)
+4. **initUnboxed.lean** - Segmentation fault
+5. **phashmap.lean** - Incorrect persistent hash map behavior
+6. **phashmap2.lean** - Hash map test failure
+7. **phashmap3.lean** - Hash map test failure
+8. **rbmap_library.lean** - Red-black map library test failure
+9. **str.lean** - String operations test failure
+10. **uint_fold.lean** - UInt fold operations failure
+
+The majority of ARM64-specific tests pass successfully, demonstrating that basic functionality, closures, recursion, pattern matching, and most data structures work correctly. The failing tests indicate issues with:
+- 64-bit unsigned integer operations
+- Certain library data structures (hash maps, red-black trees)
+- Runtime initialization in some contexts
 
 ### Example Tests
 
-See `tests/lean/run/arm64_backend_simple.lean` for a working example that can be compiled and executed using the ARM64 backend.
+See `tests/compiler/arm64_*.lean` for working examples that demonstrate various features of the ARM64 backend.
 
 ## Implementation Details
 

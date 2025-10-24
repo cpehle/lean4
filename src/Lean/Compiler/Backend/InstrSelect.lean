@@ -608,6 +608,14 @@ def tryInlineExternCall (fnName : String) (args : Array Arg) (dstReg : Reg) : Se
         match args[0]! with
         | .var v => varToReg v
         | .erased => pure (Reg.phys PhysReg.xzr)
+      -- If lhs was loaded into x8 (spilled), save it to x10 before loading rhs
+      -- which might also use x8
+      let safeLhsReg ← do
+        if lhsReg == .phys PhysReg.x8 then
+          emit (Instr.mov (.phys PhysReg.x10) (.reg lhsReg))
+          pure (.phys PhysReg.x10)
+        else
+          pure lhsReg
       let rhsOp ←
         match args[1]! with
         | .var v => do
@@ -615,7 +623,7 @@ def tryInlineExternCall (fnName : String) (args : Array Arg) (dstReg : Reg) : Se
           pure (Operand.reg r)
         | .erased => pure (Operand.reg (Reg.phys PhysReg.xzr))
       emit (Instr.comment "inline lean_uint64_add")
-      emit (Instr.add dstReg lhsReg rhsOp)
+      emit (Instr.add dstReg safeLhsReg rhsOp)
       return true
     else
       return false
@@ -626,6 +634,13 @@ def tryInlineExternCall (fnName : String) (args : Array Arg) (dstReg : Reg) : Se
         match args[0]! with
         | .var v => varToReg v
         | .erased => pure (Reg.phys PhysReg.xzr)
+      -- Save lhs if it's in x8 to avoid clobbering when loading rhs
+      let safeLhsReg ← do
+        if lhsReg == .phys PhysReg.x8 then
+          emit (Instr.mov (.phys PhysReg.x10) (.reg lhsReg))
+          pure (.phys PhysReg.x10)
+        else
+          pure lhsReg
       let rhsOp ←
         match args[1]! with
         | .var v => do
@@ -633,7 +648,7 @@ def tryInlineExternCall (fnName : String) (args : Array Arg) (dstReg : Reg) : Se
           pure (Operand.reg r)
         | .erased => pure (Operand.reg (Reg.phys PhysReg.xzr))
       emit (Instr.comment "inline lean_uint64_sub")
-      emit (Instr.sub dstReg lhsReg rhsOp)
+      emit (Instr.sub dstReg safeLhsReg rhsOp)
       return true
     else
       return false
@@ -644,12 +659,19 @@ def tryInlineExternCall (fnName : String) (args : Array Arg) (dstReg : Reg) : Se
         match args[0]! with
         | .var v => varToReg v
         | .erased => pure (Reg.phys PhysReg.xzr)
+      -- Save lhs if it's in x8 to avoid clobbering when loading rhs
+      let safeLhsReg ← do
+        if lhsReg == .phys PhysReg.x8 then
+          emit (Instr.mov (.phys PhysReg.x10) (.reg lhsReg))
+          pure (.phys PhysReg.x10)
+        else
+          pure lhsReg
       let rhsReg ←
         match args[1]! with
         | .var v => varToReg v
         | .erased => pure (Reg.phys PhysReg.xzr)
       emit (Instr.comment "inline lean_uint64_mul")
-      emit (Instr.mul dstReg lhsReg rhsReg)
+      emit (Instr.mul dstReg safeLhsReg rhsReg)
       return true
     else
       return false
