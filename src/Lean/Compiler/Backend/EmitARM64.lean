@@ -110,13 +110,23 @@ def escapeString (s : String) : String :=
         acc ++ "\\x" ++ String.mk [hi, lo]
   bytes.foldl step ""
 
-/-- Emit data for a gathered string literal. -/
+/-- Emit data for a gathered string literal using .byte directives.
+    We use .byte instead of .asciz with \xhh escapes because the macOS assembler
+    doesn't correctly parse consecutive hex escapes like "\xCE\xB1" (it treats
+    \xB1 as \xB followed by literal '1'). -/
 def emitStringLiteral (lit : StringLiteral) : EmitM Unit := do
   emitLn "  .align 3"
   emitLn s!"{lit.ptrLabel}:"
   emitLn s!"  .quad {lit.dataLabel}"
   emitLn s!"{lit.dataLabel}:"
-  emitLn s!"  .asciz \"{escapeString lit.value}\""
+  -- Emit string as individual bytes
+  let bytes := lit.value.toUTF8.toList
+  if bytes.isEmpty then
+    emitLn "  .byte 0x00  // empty string (null terminator only)"
+  else
+    let byteStrs := bytes.map fun b => s!"0x{hexDigit (b.toNat / 16)}{hexDigit (b.toNat % 16)}"
+    let bytesLine := ", ".intercalate byteStrs
+    emitLn s!"  .byte {bytesLine}, 0x00  // null terminator"
 
 /-- Emit an operand as assembly text -/
 def emitOperand (op : Operand) : String :=

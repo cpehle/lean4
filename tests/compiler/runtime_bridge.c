@@ -88,6 +88,7 @@
 #define lean_int_mul lean_int_mul_inline
 #define lean_strict_and lean_strict_and_inline
 #define lean_strict_or lean_strict_or_inline
+#define lean_byte_array_get lean_byte_array_get_inline
 
 #include <stdio.h>
 #include <lean/lean.h>
@@ -182,6 +183,7 @@
 #undef lean_int_mul
 #undef lean_strict_and
 #undef lean_strict_or
+#undef lean_byte_array_get
 
 #ifdef __cplusplus
 extern "C" {
@@ -514,6 +516,10 @@ LEAN_EXPORT lean_object* lean_box_usize(size_t v) {
 
 LEAN_EXPORT size_t lean_unbox_usize(lean_object* o) {
   return lean_unbox_usize_inline(o);
+}
+
+LEAN_EXPORT uint8_t lean_byte_array_get(b_lean_obj_arg a, b_lean_obj_arg i) {
+  return lean_byte_array_get_inline(a, i);
 }
 
 // Usize operations
