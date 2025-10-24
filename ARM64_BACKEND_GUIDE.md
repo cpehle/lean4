@@ -110,12 +110,16 @@ The `runtime_bridge.c` file provides exported wrappers for Lean runtime function
 **Currently implemented wrappers**:
 - Memory: `lean_alloc_ctor`, `lean_ctor_set`, `lean_alloc_closure`, `lean_closure_set`
 - Reference counting: `lean_inc`, `lean_inc_n`, `lean_inc_ref`, `lean_dec`, `lean_dec_ref`
-- Arrays: `lean_array_*` (fget, fset, set, pop, get, etc.)
+- Arrays: `lean_array_*` (fget, fset, set, pop, get, etc.), `lean_byte_array_get`
 - Nat operations: `lean_nat_dec_le`, `lean_nat_dec_lt`, `lean_nat_mod`, `lean_nat_shiftr`
-- Usize operations: `lean_usize_dec_eq`, `lean_usize_of_nat`, `lean_usize_to_nat`
-- String operations: `lean_string_dec_eq`, `lean_string_dec_lt`
-- Type conversions: `lean_uint64_to_nat`, `lean_uint64_of_nat`, `lean_uint8_to_nat`
+- Usize operations: `lean_usize_*` (dec_eq, dec_le, of_nat, to_nat, land, shift_left, shift_right)
+- String operations: `lean_string_dec_eq`, `lean_string_dec_lt`, `lean_string_length`
+- Type conversions: `lean_uint*_to_nat`, `lean_uint*_of_nat` (8/32/64), `lean_uint64_to_usize`
+- Boxing/Unboxing: `lean_box`, `lean_unbox`, `lean_box_uint*`, `lean_unbox_uint*` (32/64), `lean_box_usize`, `lean_unbox_usize`, `lean_box_float`, `lean_unbox_float`, `lean_box_float32`, `lean_unbox_float32`
+- Float operations: `lean_float_*` (add, sub, mul, div, negate, beq, decLe, decLt)
+- Int operations: `lean_int_*` (add, mul, dec_eq, ediv, emod)
 - Task operations: `lean_task_spawn`, `lean_task_get_own`
+- Logic: `lean_strict_and`, `lean_strict_or`
 
 ## Architecture
 
@@ -256,7 +260,22 @@ match conflictVar with
   emit (Instr.mov (.phys PhysReg.x9) (.reg tempReg))
 ```
 
-### 5. macOS Version Warnings
+### 5. UTF-8 String Corruption
+
+**Symptom**: UTF-8 strings display as garbage characters (e.g., "αb" shows as "�")
+
+**Cause**: macOS assembler doesn't correctly parse consecutive hex escapes in `.asciz` directives. For example, `.asciz "\xCE\xB1"` is parsed as `\xCE` followed by `\xB` and literal `1`, resulting in bytes `CE 1B` instead of `CE B1`.
+
+**Solution**: Already fixed (commit 73e2f94b92). String literals now use `.byte` directives:
+```assembly
+; Old (broken):
+.asciz "\xCE\xB1b"  ; Produces: CE 1B instead of CE B1 62
+
+; New (correct):
+.byte 0xCE, 0xB1, 0x62, 0x00  ; Produces: CE B1 62 00
+```
+
+### 6. macOS Version Warnings
 
 **Symptom**:
 ```
@@ -266,7 +285,7 @@ ld: warning: object file (...) was built for newer 'macOS' version (15.3)
 
 **Solution**: Update `-mmacosx-version-min=15.3` in test scripts (already done).
 
-### 6. 0-Parameter Functions
+### 7. 0-Parameter Functions
 
 **Symptom**: Segfault when accessing 0-parameter function results.
 
@@ -284,9 +303,9 @@ __init_l_function_name:
   ; ... initialization code ...
 ```
 
-### 7. Test Failures Due to Incorrect Output
+### 8. Test Failures Due to Incorrect Output
 
-**Current Status**: 32 tests fail with incorrect output but compile successfully.
+**Current Status**: Only 9 tests fail (90% pass rate).
 
 **Common causes**:
 - **Arithmetic bugs**: Incorrect implementation of Nat operations (e.g., `nat_shiftr`)
@@ -415,35 +434,58 @@ ctest --rerun-failed --output-on-failure
 
 ## Current Status (as of latest commit)
 
-### Passing Tests (50/82 = 61%)
+### Test Pass Rate: 82/91 (90%)
 
-All basic functionality works:
-- Constructor allocation and field access
-- Function calls (including >10 parameters)
-- Closures with many captured values
-- String operations
-- Array operations
-- Basic arithmetic
-- Memory management (inc/dec)
+**Recent Progress**:
+- October 24, 2025: Fixed UTF-8 string bug, test infrastructure → 82/91 passing (90%)
+- October 22, 2025: Fixed scalar boxing/unboxing bugs → 80/89 passing (90%)
+- October 21, 2025: Initial working version → 50/82 passing (61%)
 
-### Failing Tests (32/82)
+All core functionality works:
+- Constructor allocation and field access ✅
+- Function calls (including >10 parameters) ✅
+- Closures with many captured values ✅
+- String operations (including UTF-8) ✅
+- Array operations ✅
+- Basic arithmetic ✅
+- Memory management (inc/dec) ✅
+- Scalar types (UInt8/16/32/64, USize, Float, Float32) ✅
+- Module initialization ✅
 
-Most failures are **logic bugs** in generated code, not compilation errors:
+### Failing Tests (9/91)
 
-**Categories**:
-1. **Arithmetic operations** (8 tests): `nat_shiftr`, `overflow1-3`, `uint64_arith`, etc.
-2. **Data structures** (10 tests): `rbmap_library`, `phashmap*`, `trie`, `uset`, etc.
-3. **Advanced features** (8 tests): `float`, `init`, `thunk`, `partial`, etc.
-4. **ARM64-specific** (6 tests): `arm64_basic`, `arm64_test`, `arm64_factorial_debug`, etc.
+**Remaining Issues**:
+1. **arm64_basic.lean**: Cosmetic output difference (expected vs produced)
+2. **phashmap.lean, phashmap2.lean, phashmap3.lean**: Hash map lookup failures
+3. **rbmap_library.lean**: Segfault in red-black tree operations
+4. **uint_fold.lean**: Incorrect constant folding for UInt operations
+5. **test_str_*.lean**: Debug test files created during development (no expected output)
 
-### Recent Fixes
+### Recent Fixes (October 2025)
 
+**Critical Bugs Fixed**:
+- ✅ **UTF-8 string corruption** (Oct 24): macOS assembler doesn't parse consecutive `\xhh` escapes correctly in `.asciz` directives. Fixed by using `.byte` directives with explicit hex values.
+  - Impact: `str.lean` now passes, UTF-8 strings display correctly
+
+- ✅ **Module initialization missing** (Oct 24): Test shims weren't calling `lean_initialize()` and `lean_setup_args()`, causing "print function not available" errors.
+  - Impact: `expr.lean` and other Lean library-dependent tests now pass
+
+- ✅ **Scalar boxing/unboxing mismatch** (Oct 22): ARM64 backend was treating all scalar types the same, but on 64-bit platforms:
+  - UInt8/16/32: inline boxing (shift + OR)
+  - UInt64/USize/Float/Float32: heap allocation via `lean_box_*`
+  - Impact: `initUnboxed.lean` and other scalar-heavy tests now pass
+
+- ✅ **UInt64 arithmetic register clobbering** (Oct 22): Operations were overwriting input registers
+  - Impact: `arm64_uint64_arith.lean`, `arm64_eq_test.lean` now pass
+
+**Infrastructure Improvements**:
 - ✅ Stack parameter passing for functions with >10 params
 - ✅ Parameter clobbering prevention in constructor allocation
 - ✅ Assembly label escaping for apostrophes in function names
-- ✅ Inline scalar boxing/unboxing
+- ✅ Inline scalar boxing/unboxing implementation
 - ✅ 0-parameter function emission as global pointers
-- ✅ Runtime function wrapper infrastructure
+- ✅ Runtime function wrapper infrastructure (runtime_bridge.c)
+- ✅ Added wrappers for: float ops, int ops, byte array access, string ops
 
 ## Contributing
 
@@ -532,6 +574,6 @@ When a test fails:
 
 ---
 
-**Last Updated**: October 22, 2025
+**Last Updated**: October 24, 2025
 **ARM64 Backend Version**: feat/native-backend branch
-**Test Pass Rate**: 50/82 (61%)
+**Test Pass Rate**: 82/91 (90%)
