@@ -25,6 +25,8 @@ void lean_init_task_manager();
 void lean_io_mark_end_initialization();
 void lean_set_panic_messages(bool);
 void lean_io_result_show_error(lean_object*);
+void lean_initialize();
+char** lean_setup_args(int argc, char** argv);
 
 extern lean_object* lean_main(lean_object*);
 extern lean_object* ${module_name}(uint8_t, lean_object*);
@@ -32,7 +34,8 @@ extern lean_object* ${module_name}(uint8_t, lean_object*);
 int main(int argc, char** argv) {
     lean_object* res;
 
-    lean_initialize_runtime_module();
+    argv = lean_setup_args(argc, argv);
+    lean_initialize();
     lean_set_panic_messages(false);
 
     res = ${module_name}(1, lean_io_mk_world());
