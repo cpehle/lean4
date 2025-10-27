@@ -27,11 +27,11 @@ open Lean.Compiler.Backend.ARM64
 open Lean.Compiler.Backend.RegisterAlloc
 open Lean.IR
 
-/-- Prefer caller-saved temporaries for scratch work while lowering ref-count ops. -/
+/-- Prefer caller-saved temporaries for scratch work while lowering ref-count ops.
+    IMPORTANT: Only use caller-saved registers (x9-x15) to avoid clobbering allocated values
+    in callee-saved registers (x19-x28). -/
 def scratchCandidates : List PhysReg :=
-  [PhysReg.x9, PhysReg.x10, PhysReg.x11, PhysReg.x12, PhysReg.x13, PhysReg.x14, PhysReg.x15,
-   PhysReg.x20, PhysReg.x21, PhysReg.x22, PhysReg.x23, PhysReg.x24, PhysReg.x25, PhysReg.x26,
-   PhysReg.x27, PhysReg.x28]
+  [PhysReg.x9, PhysReg.x10, PhysReg.x11, PhysReg.x12, PhysReg.x13, PhysReg.x14, PhysReg.x15]
 
 /-- Convert IRType to FloatPrec -/
 def typeToFloatPrec (ty : IRType) : FloatPrec :=
@@ -929,10 +929,113 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
     emit (Instr.comment s!"reset {n}")
     emit (Instr.mov dstReg (.reg xReg))
 
-  | .reuse x info _ _args =>
+  | .reuse x info updtHeader args =>
     let xReg ← varToReg x
     emit (Instr.comment s!"reuse {info.name}")
-    emit (Instr.mov dstReg (.reg xReg))
+
+    -- Zero-sized constructors don't need field updates, just copy the pointer
+    if info.size == 0 && info.ssize == 0 then
+      emit (Instr.mov dstReg (.reg xReg))
+      if isSpilled then
+        match s.allocState.stackSlots.get? dst.idx with
+        | some slot => storeToStackSlot dstReg slot IRType.object
+        | none => pure ()
+    else
+      -- Handle similar to .ctor: keep pointer in dstReg if not spilled, else use stack
+      let destSlot? := s.allocState.stackSlots.get? dst.idx
+      let stackSlotInfo? := destSlot?.map fun slot => (slot, Int.ofNat (slot * 8))
+      let pointerReg? : Option Reg := if isSpilled then none else some dstReg
+
+      -- Check for conflicts: if any arg uses dstReg, save it first
+      let mut conflictVar : Option VarId := none
+      match pointerReg? with
+      | some tempReg =>
+        for arg in args do
+          match arg with
+          | .var v =>
+            let vReg ← varToReg v
+            if vReg == tempReg then
+              conflictVar := some v
+              break
+          | .erased => pure ()
+      | none => pure ()
+
+      -- Save conflicting argument before overwriting
+      match pointerReg? with
+      | some tempReg =>
+        match conflictVar with
+        | some v =>
+          emit (Instr.comment s!"save vreg{v.idx} from {tempReg} to x9 (reuse will overwrite {tempReg})")
+          emit (Instr.mov (.phys PhysReg.x9) (.reg tempReg))
+        | none => pure ()
+      | none => pure ()
+
+      -- Copy the reused pointer to destination
+      match pointerReg? with
+      | some tempReg =>
+        emit (Instr.mov tempReg (.reg xReg))
+      | none =>
+        match stackSlotInfo? with
+        | some (slot, offset) =>
+          emit (Instr.comment s!"store reused object for spilled dst vreg{dst.idx} into stack slot {slot}")
+          emit (Instr.mov (.phys PhysReg.x8) (.reg xReg))
+          emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
+          spillHandled := true
+        | none =>
+          emit (Instr.comment s!"ERROR: spilled reuse destination vreg{dst.idx} has no stack slot")
+
+      -- Update tag if needed (tag is at offset 4 in object header, 32-bit value)
+      if updtHeader then
+        emit (Instr.comment s!"update tag to {info.cidx}")
+        -- Use lean_ctor_set_tag runtime function instead of direct memory write
+        match pointerReg? with
+        | some tempReg =>
+          emit (Instr.mov (.phys PhysReg.x0) (.reg tempReg))
+          emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat info.cidx)))
+          emit (Instr.bl "lean_ctor_set_tag")
+        | none =>
+          match stackSlotInfo? with
+          | some (_, offset) =>
+            emit (Instr.ldr (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) offset))
+            emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat info.cidx)))
+            emit (Instr.bl "lean_ctor_set_tag")
+          | none =>
+            emit (Instr.comment s!"ERROR: missing object pointer for tag update")
+
+      -- Set fields using lean_ctor_set(o, i, v) - same as .ctor case
+      for i in [:args.size] do
+        let arg := args[i]!
+        -- Load object pointer before each lean_ctor_set call
+        match pointerReg? with
+        | some tempReg =>
+          emit (Instr.mov (.phys PhysReg.x0) (.reg tempReg))
+          -- tempReg is callee-saved, so survives the call
+        | none =>
+          match stackSlotInfo? with
+          | some (_, offset) =>
+            emit (Instr.ldr (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) offset))
+          | none =>
+            emit (Instr.comment s!"ERROR: missing object pointer for spilled dst vreg{dst.idx}")
+        emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat i)))
+        match arg with
+        | .var v =>
+          let vReg ← varToReg v
+          let actualReg := match conflictVar with
+            | some cv => if cv == v then Reg.phys PhysReg.x9 else vReg
+            | none => vReg
+          emitMove (.phys PhysReg.x2) (.reg actualReg)
+        | .erased =>
+          emit (Instr.comment s!"field {i} erased, set to lean_box(0) = 1")
+          emit (Instr.mov (.phys PhysReg.x2) (.imm 1))  -- lean_box(0) = 1
+        emit (Instr.bl "lean_ctor_set")
+        -- tempReg/stack pointer is preserved across calls
+
+      -- Move result to final destination if needed
+      match pointerReg? with
+      | some tempReg =>
+        if tempReg != dstReg then
+          emit (Instr.mov dstReg (.reg tempReg))
+      | none => pure ()
 
   | .proj i x =>
     let xReg ← varToReg x
