@@ -910,7 +910,36 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
           let actualReg := match conflictVar with
             | some cv => if cv == v then Reg.phys PhysReg.x9 else vReg
             | none => vReg
-          emitMove (.phys PhysReg.x2) (.reg actualReg)
+          -- Check if the variable needs boxing (scalar → object conversion)
+          let s ← get
+          let vType := s.varTypes.get? v.idx |>.getD IRType.object
+          if vType.isScalar then
+            -- Box scalar to object
+            emit (Instr.comment s!"box {vType} field {i}")
+            emit (Instr.mov (.phys PhysReg.x0) (.reg actualReg))
+            match vType with
+            | IRType.usize =>
+              emit (Instr.bl "_lean_box_usize")
+            | IRType.uint64 =>
+              emit (Instr.bl "_lean_box_uint64")
+            | IRType.uint8 | IRType.uint16 | IRType.uint32 =>
+              -- Inline box for small uints
+              emit (Instr.lsl (.phys PhysReg.x0) (.phys PhysReg.x0) (.imm 1))
+              emit (Instr.orr (.phys PhysReg.x0) (.phys PhysReg.x0) (.imm 1))
+            | IRType.float =>
+              emitMove (.phys PhysReg.v0) (.reg actualReg)
+              emit (Instr.bl "_lean_box_float")
+            | IRType.float32 =>
+              emitMove (.phys PhysReg.v0) (.reg actualReg)
+              emit (Instr.bl "_lean_box_float32")
+            | _ =>
+              -- Unknown scalar type, inline box as fallback
+              emit (Instr.lsl (.phys PhysReg.x0) (.phys PhysReg.x0) (.imm 1))
+              emit (Instr.orr (.phys PhysReg.x0) (.phys PhysReg.x0) (.imm 1))
+            emit (Instr.mov (.phys PhysReg.x2) (.reg (.phys PhysReg.x0)))
+          else
+            -- Already an object or other type, just move
+            emitMove (.phys PhysReg.x2) (.reg actualReg)
         | .erased =>
           emit (Instr.comment s!"field {i} erased, set to lean_box(0) = 1")
           emit (Instr.mov (.phys PhysReg.x2) (.imm 1))  -- lean_box(0) = 1
@@ -1334,12 +1363,6 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
       emit (Instr.bl "_lean_box_uint64")
       if dstReg != .phys PhysReg.x0 then
         emitMove dstReg (.reg (.phys PhysReg.x0))
-    | IRType.usize =>
-      -- Call lean_box_usize: allocates heap object with sizeof(size_t) scalar storage
-      emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
-      emit (Instr.bl "_lean_box_usize")
-      if dstReg != .phys PhysReg.x0 then
-        emitMove dstReg (.reg (.phys PhysReg.x0))
     | IRType.float =>
       -- Call lean_box_float: takes double in d0, returns object* in x0
       emitMove (.phys PhysReg.v0) (.reg xReg)
@@ -1350,6 +1373,12 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
       -- Call lean_box_float32: takes float in s0, returns object* in x0
       emitMove (.phys PhysReg.v0) (.reg xReg)
       emit (Instr.bl "_lean_box_float32")
+      if dstReg != .phys PhysReg.x0 then
+        emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
+    | IRType.usize =>
+      -- Call lean_box_usize: handles both tagged (small) and heap (large) Nat values
+      emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
+      emit (Instr.bl "_lean_box_usize")
       if dstReg != .phys PhysReg.x0 then
         emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
     | IRType.uint8 | IRType.uint16 | IRType.uint32 =>
@@ -1371,12 +1400,6 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
       emit (Instr.bl "_lean_unbox_uint64")
       if dstReg != .phys PhysReg.x0 then
         emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
-    | IRType.usize =>
-      -- Call lean_unbox_usize: takes object* in x0, returns size_t in x0
-      emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
-      emit (Instr.bl "_lean_unbox_usize")
-      if dstReg != .phys PhysReg.x0 then
-        emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
     | IRType.float =>
       -- Call lean_unbox_float: takes object* in x0, returns double in d0
       emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
@@ -1389,6 +1412,12 @@ def selectExpr (dst : VarId) (dstType : IRType) (e : IR.Expr) : SelectM Unit := 
       emit (Instr.bl "_lean_unbox_float32")
       if dstReg != .phys PhysReg.v0 then
         emitMove dstReg (.reg (.phys PhysReg.v0))
+    | IRType.usize =>
+      -- Call lean_unbox_usize: handles both tagged (small) and heap (large) Nat values
+      emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
+      emit (Instr.bl "_lean_unbox_usize")
+      if dstReg != .phys PhysReg.x0 then
+        emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
     | IRType.uint8 | IRType.uint16 | IRType.uint32 =>
       -- Inline scalar unboxing: arithmetic shift right by 1 to extract value
       emit (Instr.asr dstReg xReg (.imm 1))
