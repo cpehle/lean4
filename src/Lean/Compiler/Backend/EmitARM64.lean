@@ -29,15 +29,27 @@ private def startsWithList : List Char → List Char → Bool
   | _ :: _, [] => false
   | c1 :: rest1, c2 :: rest2 => c1 = c2 && startsWithList rest1 rest2
 
+/-- Split a string on a separator character into a list of strings -/
+private def splitOnChar (s : String) (sep : Char) : List String :=
+  let rec go (chars : List Char) (acc : List Char) (result : List String) : List String :=
+    match chars with
+    | [] => (result ++ [String.ofList acc.reverse]).reverse
+    | c :: rest =>
+      if c == sep then
+        go rest [] (String.ofList acc.reverse :: result)
+      else
+        go rest (c :: acc) result
+  go s.toList [] []
+
 /-- Simple substring check implemented via a sliding window on the underlying
     character lists. -/
 def containsSubstr (s sub : String) : Bool :=
-  let target := sub.data
+  let target := sub.toList
   let rec loop : List Char → Bool
     | [] => target.isEmpty
     | xs@( _ :: tail ) =>
         if startsWithList target xs then true else loop tail
-  loop s.data
+  loop s.toList
 
 /-- Determine whether a declaration corresponds to a closed constant that must be
     materialized in the data section. Besides the standard closed-term cache,
@@ -66,7 +78,7 @@ def mangleStringName (name : String) : String :=
   else
     -- Treat as Lean function name - convert to Name and mangle
     -- This handles cases like "String.append" passed as string
-    let parts := name.split (· == '.')
+    let parts := splitOnChar name '.'
     let leanName := parts.foldl (fun n s => Name.str n s) Name.anonymous
     mangleName leanName
 
@@ -107,19 +119,20 @@ def escapeString (s : String) : String :=
         -- Non-ASCII bytes are hex-escaped
         let hi := hexDigit (byte / 16)
         let lo := hexDigit (byte % 16)
-        acc ++ "\\x" ++ String.mk [hi, lo]
+        acc ++ "\\x" ++ String.ofList [hi, lo]
   bytes.foldl step ""
 
 /-- Emit data for a gathered string literal using .byte directives.
     We use .byte instead of .asciz with \xhh escapes because the macOS assembler
     doesn't correctly parse consecutive hex escapes like "\xCE\xB1" (it treats
-    \xB1 as \xB followed by literal '1'). -/
+    \xB1 as \xB followed by literal '1').
+
+    String literals are just raw C string data - they get converted to Lean string
+    objects at runtime via lean_mk_string_unchecked. -/
 def emitStringLiteral (lit : StringLiteral) : EmitM Unit := do
   emitLn "  .align 3"
-  emitLn s!"{lit.ptrLabel}:"
-  emitLn s!"  .quad {lit.dataLabel}"
   emitLn s!"{lit.dataLabel}:"
-  -- Emit string as individual bytes
+  -- Emit string as individual bytes (raw C string data for lean_mk_string_unchecked)
   let bytes := lit.value.toUTF8.toList
   if bytes.isEmpty then
     emitLn "  .byte 0x00  // empty string (null terminator only)"
@@ -140,242 +153,166 @@ def emitOperand (op : Operand) : String :=
       s!"[{base}, #{offset}]"
   | .label name => name
 
-/-- Emit an instruction as assembly text -/
-def emitInstr (instr : Instr) : EmitM Unit := do
+/-- Check if a physical register is a floating-point register -/
+private def isFPReg (r : PhysReg) : Bool := r.isFP
+
+/-- Convert condition code to string -/
+private def condToString (c : Cond) : String :=
+  match c with
+  | .eq => "eq" | .ne => "ne" | .lt => "lt" | .le => "le"
+  | .gt => "gt" | .ge => "ge" | .lo => "lo" | .ls => "ls"
+  | .hi => "hi" | .hs => "hs"
+
+/-- Render FP register based on precision (s0-s31 for single, d0-d31 for double) -/
+private def fpReg (prec : FloatPrec) (r : Reg) : String :=
+  match r with
+  | .phys p =>
+    if p.isFP then
+      let idx := p.toNat - 32  -- v0 is 32, so subtract to get 0-31
+      match prec with
+      | .single => s!"s{idx}"
+      | .double => s!"d{idx}"
+    else
+      toString r
+  | _ => toString r
+
+/-- Emit arithmetic instruction -/
+private def emitArithInstr (instr : Instr) : EmitM Unit := do
   match instr with
-  | .add dst src1 src2 =>
-    emitLn s!"  add {dst}, {src1}, {emitOperand src2}"
+  | .add dst src1 src2 => emitLn s!"  add {dst}, {src1}, {emitOperand src2}"
+  | .sub dst src1 src2 => emitLn s!"  sub {dst}, {src1}, {emitOperand src2}"
+  | .mul dst src1 src2 => emitLn s!"  mul {dst}, {src1}, {src2}"
+  | .sdiv dst src1 src2 => emitLn s!"  sdiv {dst}, {src1}, {src2}"
+  | .udiv dst src1 src2 => emitLn s!"  udiv {dst}, {src1}, {src2}"
+  | .uxtb dst src => emitLn s!"  uxtb {dst}, {src}"
+  | .uxth dst src => emitLn s!"  uxth {dst}, {src}"
+  | .and dst src1 src2 => emitLn s!"  and {dst}, {src1}, {emitOperand src2}"
+  | .orr dst src1 src2 => emitLn s!"  orr {dst}, {src1}, {emitOperand src2}"
+  | .eor dst src1 src2 => emitLn s!"  eor {dst}, {src1}, {emitOperand src2}"
+  | .lsl dst src shift => emitLn s!"  lsl {dst}, {src}, {emitOperand shift}"
+  | .lsr dst src shift => emitLn s!"  lsr {dst}, {src}, {emitOperand shift}"
+  | .asr dst src shift => emitLn s!"  asr {dst}, {src}, {emitOperand shift}"
+  | _ => pure ()
 
-  | .sub dst src1 src2 =>
-    emitLn s!"  sub {dst}, {src1}, {emitOperand src2}"
+/-- Emit move instruction -/
+private def emitMoveInstr (instr : Instr) : EmitM Unit := do
+  match instr with
+  | .mov dst src => emitLn s!"  mov {dst}, {emitOperand src}"
+  | .movz dst imm shift => emitLn s!"  movz {dst}, #{imm}, lsl #{shift}"
+  | .movk dst imm shift => emitLn s!"  movk {dst}, #{imm}, lsl #{shift}"
+  | .adrp dst lbl => emitLn s!"  adrp {dst}, {lbl}"
+  | _ => pure ()
 
-  | .mul dst src1 src2 =>
-    emitLn s!"  mul {dst}, {src1}, {src2}"
-
-  | .sdiv dst src1 src2 =>
-    emitLn s!"  sdiv {dst}, {src1}, {src2}"
-
-  | .udiv dst src1 src2 =>
-    emitLn s!"  udiv {dst}, {src1}, {src2}"
-
-  | .uxtb dst src =>
-    emitLn s!"  uxtb {dst}, {src}"
-
-  | .uxth dst src =>
-    emitLn s!"  uxth {dst}, {src}"
-
-  | .and dst src1 src2 =>
-    emitLn s!"  and {dst}, {src1}, {emitOperand src2}"
-
-  | .orr dst src1 src2 =>
-    emitLn s!"  orr {dst}, {src1}, {emitOperand src2}"
-
-  | .eor dst src1 src2 =>
-    emitLn s!"  eor {dst}, {src1}, {emitOperand src2}"
-
-  | .lsl dst src shift =>
-    emitLn s!"  lsl {dst}, {src}, {emitOperand shift}"
-
-  | .lsr dst src shift =>
-    emitLn s!"  lsr {dst}, {src}, {emitOperand shift}"
-
-  | .asr dst src shift =>
-    emitLn s!"  asr {dst}, {src}, {emitOperand shift}"
-
-  | .mov dst src =>
-    emitLn s!"  mov {dst}, {emitOperand src}"
-
-  | .movz dst imm shift =>
-    emitLn s!"  movz {dst}, #{imm}, lsl #{shift}"
-
-  | .movk dst imm shift =>
-    emitLn s!"  movk {dst}, #{imm}, lsl #{shift}"
-
-  | .adrp dst lbl =>
-    emitLn s!"  adrp {dst}, {lbl}"
-
+/-- Emit load/store instruction -/
+private def emitMemInstr (instr : Instr) : EmitM Unit := do
+  match instr with
   | .ldr dst src suffix =>
-    -- Detect if dst is FP register and render appropriately
     let dstStr := match dst with
       | .phys r => if isFPReg r then fpReg FloatPrec.double dst else toString dst
       | _ => toString dst
-    if suffix.isEmpty then
-      emitLn s!"  ldr {dstStr}, {emitOperand src}"
-    else
-      emitLn s!"  ldr {dstStr}, [{emitOperand src}{suffix}]"
-
-  | .ldrw dst src =>
-    emitLn s!"  ldr {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
-
-  | .ldrb dst src =>
-    emitLn s!"  ldrb {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
-
-  | .ldrh dst src =>
-    emitLn s!"  ldrh {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
-
+    if suffix.isEmpty then emitLn s!"  ldr {dstStr}, {emitOperand src}"
+    else emitLn s!"  ldr {dstStr}, [{emitOperand src}{suffix}]"
+  | .ldrw dst src => emitLn s!"  ldr {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
+  | .ldrb dst src => emitLn s!"  ldrb {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
+  | .ldrh dst src => emitLn s!"  ldrh {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
   | .str src dst =>
-    -- Detect if src is FP register and render appropriately
     let srcStr := match src with
       | .phys r => if isFPReg r then fpReg FloatPrec.double src else toString src
       | _ => toString src
     emitLn s!"  str {srcStr}, {emitOperand dst}"
-
-  | .strb src dst =>
-    emitLn s!"  strb {ARM64.Reg.toGPR32String src}, {emitOperand dst}"
-
-  | .strh src dst =>
-    emitLn s!"  strh {ARM64.Reg.toGPR32String src}, {emitOperand dst}"
-
+  | .strb src dst => emitLn s!"  strb {ARM64.Reg.toGPR32String src}, {emitOperand dst}"
+  | .strh src dst => emitLn s!"  strh {ARM64.Reg.toGPR32String src}, {emitOperand dst}"
+  | .strw src dst => emitLn s!"  str {ARM64.Reg.toGPR32String src}, {emitOperand dst}"
   | .ldp dst1 dst2 base offset =>
-    if offset = 0 then
-      emitLn s!"  ldp {dst1}, {dst2}, [{base}]"
-    else
-      emitLn s!"  ldp {dst1}, {dst2}, [{base}, #{offset}]"
-
+    if offset = 0 then emitLn s!"  ldp {dst1}, {dst2}, [{base}]"
+    else emitLn s!"  ldp {dst1}, {dst2}, [{base}, #{offset}]"
   | .stp src1 src2 base offset =>
-    if offset = 0 then
-      emitLn s!"  stp {src1}, {src2}, [{base}]"
-    else
-      emitLn s!"  stp {src1}, {src2}, [{base}, #{offset}]"
+    if offset = 0 then emitLn s!"  stp {src1}, {src2}, [{base}]"
+    else emitLn s!"  stp {src1}, {src2}, [{base}, #{offset}]"
+  | _ => pure ()
 
-  | .cmp src1 src2 =>
-    emitLn s!"  cmp {src1}, {emitOperand src2}"
+/-- Emit comparison/select instruction -/
+private def emitCmpInstr (instr : Instr) : EmitM Unit := do
+  match instr with
+  | .cmp src1 src2 => emitLn s!"  cmp {src1}, {emitOperand src2}"
+  | .tst src1 src2 => emitLn s!"  tst {src1}, {emitOperand src2}"
+  | .csel dst src1 src2 cond => emitLn s!"  csel {dst}, {src1}, {src2}, {condToString cond}"
+  | .cset dst cond => emitLn s!"  cset {dst}, {condToString cond}"
+  | _ => pure ()
 
-  | .tst src1 src2 =>
-    emitLn s!"  tst {src1}, {emitOperand src2}"
+/-- Emit branch instruction -/
+private def emitBranchInstr (instr : Instr) : EmitM Unit := do
+  match instr with
+  | .b label => emitLn s!"  b {label}"
+  | .bl fn => emitLn s!"  bl {mangleStringName fn}"
+  | .br reg => emitLn s!"  br {reg}"
+  | .blr reg => emitLn s!"  blr {reg}"
+  | .ret => emitLn "  ret"
+  | .bCond cond label => emitLn s!"  b.{condToString cond} {label}"
+  | _ => pure ()
 
-  | .csel dst src1 src2 cond =>
-    emitLn s!"  csel {dst}, {src1}, {src2}, {condToString cond}"
-
-  | .b label =>
-    emitLn s!"  b {label}"
-
-  | .bl fn =>
-    emitLn s!"  bl {mangleStringName fn}"
-
-  | .br reg =>
-    emitLn s!"  br {reg}"
-
-  | .blr reg =>
-    emitLn s!"  blr {reg}"
-
-  | .ret =>
-    emitLn "  ret"
-
-  | .bCond cond label =>
-    emitLn s!"  b.{condToString cond} {label}"
-
+/-- Emit push/pop instruction -/
+private def emitStackInstr (instr : Instr) : EmitM Unit := do
+  match instr with
   | .push regs =>
-    -- Emit individual stp instructions for pairs
     let mut i := 0
     while i + 1 < regs.size do
       emitLn s!"  stp {regs[i]!}, {regs[i+1]!}, [sp, #-16]!"
       i := i + 2
-    if i < regs.size then
-      emitLn s!"  str {regs[i]!}, [sp, #-8]!"
-
+    if i < regs.size then emitLn s!"  str {regs[i]!}, [sp, #-8]!"
   | .pop regs =>
-    -- Emit individual ldp instructions for pairs
     let mut i := 0
     while i + 1 < regs.size do
       emitLn s!"  ldp {regs[i]!}, {regs[i+1]!}, [sp], #16"
       i := i + 2
-    if i < regs.size then
-      emitLn s!"  ldr {regs[i]!}, [sp], #8"
+    if i < regs.size then emitLn s!"  ldr {regs[i]!}, [sp], #8"
+  | _ => pure ()
 
-  | .fadd prec dst src1 src2 =>
-    emitLn s!"  fadd {fpReg prec dst}, {fpReg prec src1}, {fpReg prec src2}"
-
-  | .fsub prec dst src1 src2 =>
-    emitLn s!"  fsub {fpReg prec dst}, {fpReg prec src1}, {fpReg prec src2}"
-
-  | .fmul prec dst src1 src2 =>
-    emitLn s!"  fmul {fpReg prec dst}, {fpReg prec src1}, {fpReg prec src2}"
-
-  | .fdiv prec dst src1 src2 =>
-    emitLn s!"  fdiv {fpReg prec dst}, {fpReg prec src1}, {fpReg prec src2}"
-
-  | .fneg prec dst src =>
-    emitLn s!"  fneg {fpReg prec dst}, {fpReg prec src}"
-
-  | .fcmp prec src1 src2 =>
-    emitLn s!"  fcmp {fpReg prec src1}, {fpReg prec src2}"
-
+/-- Emit floating-point instruction -/
+private def emitFPInstr (instr : Instr) : EmitM Unit := do
+  match instr with
+  | .fadd prec dst src1 src2 => emitLn s!"  fadd {fpReg prec dst}, {fpReg prec src1}, {fpReg prec src2}"
+  | .fsub prec dst src1 src2 => emitLn s!"  fsub {fpReg prec dst}, {fpReg prec src1}, {fpReg prec src2}"
+  | .fmul prec dst src1 src2 => emitLn s!"  fmul {fpReg prec dst}, {fpReg prec src1}, {fpReg prec src2}"
+  | .fdiv prec dst src1 src2 => emitLn s!"  fdiv {fpReg prec dst}, {fpReg prec src1}, {fpReg prec src2}"
+  | .fneg prec dst src => emitLn s!"  fneg {fpReg prec dst}, {fpReg prec src}"
+  | .fcmp prec src1 src2 => emitLn s!"  fcmp {fpReg prec src1}, {fpReg prec src2}"
   | .fmov prec dst src =>
-    -- fmov can move between FP registers or between GP and FP registers
-    -- At emission time, all registers must be physical
     match dst, src with
     | .phys dstP, .phys srcP =>
       if isFPReg dstP && isFPReg srcP then
-        -- FP to FP: use precision-based register names
         emitLn s!"  fmov {fpReg prec dst}, {fpReg prec src}"
       else if isFPReg dstP && !isFPReg srcP then
-        -- GP to FP: use d register for dst and x register for src
         emitLn s!"  fmov {fpReg FloatPrec.double dst}, {src}"
       else if !isFPReg dstP && isFPReg srcP then
-        -- FP to GP: use x register for dst and d register for src
         emitLn s!"  fmov {dst}, {fpReg FloatPrec.double src}"
       else
-        -- Both GP - this is an error, should use mov instead
         panic! s!"fmov between two GP registers: {dst}, {src}"
-    | _, _ =>
-      -- Virtual registers should not exist at emission time
-      panic! s!"fmov with virtual registers at emission time: {dst}, {src}"
+    | _, _ => panic! s!"fmov with virtual registers at emission time: {dst}, {src}"
+  | .scvtf prec dst src => emitLn s!"  scvtf {fpReg prec dst}, {src}"
+  | .ucvtf prec dst src => emitLn s!"  ucvtf {fpReg prec dst}, {src}"
+  | .fcvtzs prec dst src => emitLn s!"  fcvtzs {dst}, {fpReg prec src}"
+  | .fcvtzu prec dst src => emitLn s!"  fcvtzu {dst}, {fpReg prec src}"
+  | _ => pure ()
 
-  | .scvtf prec dst src =>
-    emitLn s!"  scvtf {fpReg prec dst}, {src}"
+/-- Emit misc instruction -/
+private def emitMiscInstr (instr : Instr) : EmitM Unit := do
+  match instr with
+  | .label name => emitLn s!"{name}:"
+  | .comment text => emitLn s!"  // {text}"
+  | _ => pure ()
 
-  | .ucvtf prec dst src =>
-    emitLn s!"  ucvtf {fpReg prec dst}, {src}"
-
-  | .fcvtzs prec dst src =>
-    emitLn s!"  fcvtzs {dst}, {fpReg prec src}"
-
-  | .fcvtzu prec dst src =>
-    emitLn s!"  fcvtzu {dst}, {fpReg prec src}"
-
-  | .label name =>
-    emitLn s!"{name}:"
-
-  | .comment text =>
-    emitLn s!"  // {text}"
-
-where
-  condToString (c : Cond) : String :=
-    match c with
-    | .eq => "eq" | .ne => "ne" | .lt => "lt" | .le => "le"
-    | .gt => "gt" | .ge => "ge" | .lo => "lo" | .ls => "ls"
-    | .hi => "hi" | .hs => "hs"
-
-  -- Check if a physical register is a floating-point register
-  isFPReg (r : PhysReg) : Bool :=
-    match r with
-    | .v0 | .v1 | .v2 | .v3 | .v4 | .v5 | .v6 | .v7
-    | .v8 | .v9 | .v10 | .v11 | .v12 | .v13 | .v14 | .v15
-    | .v16 | .v17 | .v18 | .v19 | .v20 | .v21 | .v22 | .v23
-    | .v24 | .v25 | .v26 | .v27 | .v28 | .v29 | .v30 | .v31 => true
-    | _ => false
-
-  -- Render FP register based on precision (s0-s31 for single, d0-d31 for double)
-  fpReg (prec : FloatPrec) (r : Reg) : String :=
-    match prec, r with
-    | .single, .phys PhysReg.v0 => "s0" | .single, .phys PhysReg.v1 => "s1" | .single, .phys PhysReg.v2 => "s2" | .single, .phys PhysReg.v3 => "s3"
-    | .single, .phys PhysReg.v4 => "s4" | .single, .phys PhysReg.v5 => "s5" | .single, .phys PhysReg.v6 => "s6" | .single, .phys PhysReg.v7 => "s7"
-    | .single, .phys PhysReg.v8 => "s8" | .single, .phys PhysReg.v9 => "s9" | .single, .phys PhysReg.v10 => "s10" | .single, .phys PhysReg.v11 => "s11"
-    | .single, .phys PhysReg.v12 => "s12" | .single, .phys PhysReg.v13 => "s13" | .single, .phys PhysReg.v14 => "s14" | .single, .phys PhysReg.v15 => "s15"
-    | .single, .phys PhysReg.v16 => "s16" | .single, .phys PhysReg.v17 => "s17" | .single, .phys PhysReg.v18 => "s18" | .single, .phys PhysReg.v19 => "s19"
-    | .single, .phys PhysReg.v20 => "s20" | .single, .phys PhysReg.v21 => "s21" | .single, .phys PhysReg.v22 => "s22" | .single, .phys PhysReg.v23 => "s23"
-    | .single, .phys PhysReg.v24 => "s24" | .single, .phys PhysReg.v25 => "s25" | .single, .phys PhysReg.v26 => "s26" | .single, .phys PhysReg.v27 => "s27"
-    | .single, .phys PhysReg.v28 => "s28" | .single, .phys PhysReg.v29 => "s29" | .single, .phys PhysReg.v30 => "s30" | .single, .phys PhysReg.v31 => "s31"
-    | .double, .phys PhysReg.v0 => "d0" | .double, .phys PhysReg.v1 => "d1" | .double, .phys PhysReg.v2 => "d2" | .double, .phys PhysReg.v3 => "d3"
-    | .double, .phys PhysReg.v4 => "d4" | .double, .phys PhysReg.v5 => "d5" | .double, .phys PhysReg.v6 => "d6" | .double, .phys PhysReg.v7 => "d7"
-    | .double, .phys PhysReg.v8 => "d8" | .double, .phys PhysReg.v9 => "d9" | .double, .phys PhysReg.v10 => "d10" | .double, .phys PhysReg.v11 => "d11"
-    | .double, .phys PhysReg.v12 => "d12" | .double, .phys PhysReg.v13 => "d13" | .double, .phys PhysReg.v14 => "d14" | .double, .phys PhysReg.v15 => "d15"
-    | .double, .phys PhysReg.v16 => "d16" | .double, .phys PhysReg.v17 => "d17" | .double, .phys PhysReg.v18 => "d18" | .double, .phys PhysReg.v19 => "d19"
-    | .double, .phys PhysReg.v20 => "d20" | .double, .phys PhysReg.v21 => "d21" | .double, .phys PhysReg.v22 => "d22" | .double, .phys PhysReg.v23 => "d23"
-    | .double, .phys PhysReg.v24 => "d24" | .double, .phys PhysReg.v25 => "d25" | .double, .phys PhysReg.v26 => "d26" | .double, .phys PhysReg.v27 => "d27"
-    | .double, .phys PhysReg.v28 => "d28" | .double, .phys PhysReg.v29 => "d29" | .double, .phys PhysReg.v30 => "d30" | .double, .phys PhysReg.v31 => "d31"
-    | _, r => toString r  -- For general-purpose registers in conversion instructions
+/-- Emit an instruction as assembly text -/
+def emitInstr (instr : Instr) : EmitM Unit := do
+  -- Try each category of instruction
+  emitArithInstr instr
+  emitMoveInstr instr
+  emitMemInstr instr
+  emitCmpInstr instr
+  emitBranchInstr instr
+  emitStackInstr instr
+  emitFPInstr instr
+  emitMiscInstr instr
 
 /-- Emit a basic block -/
 def emitBasicBlock (bb : BasicBlock) : EmitM Unit := do
@@ -410,11 +347,11 @@ def emitMachineFunction (fn : MachineFunction) (customName? : Option String := n
 /-- Extract trailing numeric suffix from a name, defaulting to `0` if absent. -/
 def trailingNumber (n : Name) : Nat :=
   let s := n.toString
-  let digits := (s.data.reverse.takeWhile Char.isDigit).reverse
+  let digits := (s.toList.reverse.takeWhile Char.isDigit).reverse
   if digits.isEmpty then
     0
   else
-    match String.mk digits |>.toNat? with
+    match String.ofList digits |>.toNat? with
     | some v => v
     | none => 0
 
@@ -444,6 +381,7 @@ def emitExternals : EmitM Unit := do
   emitLn "  .extern _lean_task_spawn"
   emitLn "  .extern _lean_task_get_own"
   emitLn "  .extern _lean_mk_string"
+  emitLn "  .extern _lean_mk_string_unchecked"
   for i in [:Lean.closureMaxArgs] do
     let idx := i + 1
     emitLn s!"  .extern _lean_apply_{idx}"
@@ -542,8 +480,7 @@ def emitInitFunction (env : Environment) (modName : Name) (decls : Array IR.Decl
     let impInitFn := "_" ++ Lean.mkModuleInitializationFunctionName imp.module
     emitLn s!"  // Initialize {imp.module}"
     emitLn "  mov x0, #1  // builtin"
-    emitLn "  bl _lean_io_mk_world  // Get real IO world object for external init"
-    emitLn "  mov x1, x0  // Pass world as second argument"
+    -- NOTE: Import init functions take only uint8_t builtin, not a world object
     emitLn s!"  bl {impInitFn}"
     emitLn "  mov x19, x0"
     emitLn "  // Check for error (inline lean_io_result_is_ok)"
