@@ -10,6 +10,8 @@ public import Lean.Compiler.Backend.ARM64
 public import Lean.Compiler.Backend.InstrSelect
 public import Lean.Compiler.IR.Basic
 public import Lean.Compiler.IR.CompilerM
+public import Lean.Compiler.ExportAttr
+public import Lean.Compiler.ModPkgExt
 public import Lean.Compiler.NameMangling
 public import Lean.Compiler.ClosedTermCache
 public import Lean.Compiler.InitAttr
@@ -81,6 +83,29 @@ def mangleStringName (name : String) : String :=
     let parts := splitOnChar name '.'
     let leanName := parts.foldl (fun n s => Name.str n s) Name.anonymous
     mangleName leanName
+
+/-- Ensure a symbol name has the macOS underscore prefix. -/
+private def withSymbolPrefix (name : String) : String :=
+  if name.startsWith "_" then name else s!"_{name}"
+
+/-- Get the export symbol name for a declaration, if any. -/
+private def exportSymbolName? (env : Environment) (name : Name) : Option String :=
+  match Lean.getExportNameFor? env name with
+  | some (.str .anonymous s) => some (withSymbolPrefix s)
+  | some _ => panic! s!"invalid export name '{name}'"
+  | none => none
+
+/-- Base symbol stem for a declaration, including any package prefix. -/
+private def symbolStem (env : Environment) (name : Name) : String :=
+  Lean.getSymbolStem env name
+
+/-- Compute the symbol name for a declaration, respecting @[export]. -/
+private def symbolName (env : Environment) (name : Name) : String :=
+  match exportSymbolName? env name with
+  | some s => s
+  | none =>
+    if name == `main then "_lean_main"
+    else withSymbolPrefix (symbolStem env name)
 
 /-- Emit a string to the output -/
 def emit (s : String) : EmitM Unit :=
@@ -213,6 +238,11 @@ private def emitMemInstr (instr : Instr) : EmitM Unit := do
     if suffix.isEmpty then emitLn s!"  ldr {dstStr}, {emitOperand src}"
     else emitLn s!"  ldr {dstStr}, [{emitOperand src}{suffix}]"
   | .ldrw dst src => emitLn s!"  ldr {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
+  | .ldrs dst src =>
+    let dstStr := match dst with
+      | .phys r => if isFPReg r then fpReg FloatPrec.single dst else toString dst
+      | _ => toString dst
+    emitLn s!"  ldr {dstStr}, {emitOperand src}"
   | .ldrb dst src => emitLn s!"  ldrb {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
   | .ldrh dst src => emitLn s!"  ldrh {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
   | .str src dst =>
@@ -223,6 +253,11 @@ private def emitMemInstr (instr : Instr) : EmitM Unit := do
   | .strb src dst => emitLn s!"  strb {ARM64.Reg.toGPR32String src}, {emitOperand dst}"
   | .strh src dst => emitLn s!"  strh {ARM64.Reg.toGPR32String src}, {emitOperand dst}"
   | .strw src dst => emitLn s!"  str {ARM64.Reg.toGPR32String src}, {emitOperand dst}"
+  | .strs src dst =>
+    let srcStr := match src with
+      | .phys r => if isFPReg r then fpReg FloatPrec.single src else toString src
+      | _ => toString src
+    emitLn s!"  str {srcStr}, {emitOperand dst}"
   | .ldp dst1 dst2 base offset =>
     if offset = 0 then emitLn s!"  ldp {dst1}, {dst2}, [{base}]"
     else emitLn s!"  ldp {dst1}, {dst2}, [{base}, #{offset}]"
@@ -253,19 +288,31 @@ private def emitBranchInstr (instr : Instr) : EmitM Unit := do
 
 /-- Emit push/pop instruction -/
 private def emitStackInstr (instr : Instr) : EmitM Unit := do
+  let stackReg (r : Reg) : String :=
+    match r with
+    | .phys p => if p.isFP then fpReg FloatPrec.double r else toString r
+    | _ => toString r
   match instr with
   | .push regs =>
     let mut i := 0
     while i + 1 < regs.size do
-      emitLn s!"  stp {regs[i]!}, {regs[i+1]!}, [sp, #-16]!"
+      let r1 := regs[i]!
+      let r2 := regs[i+1]!
+      emitLn s!"  stp {stackReg r1}, {stackReg r2}, [sp, #-16]!"
       i := i + 2
-    if i < regs.size then emitLn s!"  str {regs[i]!}, [sp, #-8]!"
+    if i < regs.size then
+      let r := regs[i]!
+      emitLn s!"  str {stackReg r}, [sp, #-8]!"
   | .pop regs =>
     let mut i := 0
     while i + 1 < regs.size do
-      emitLn s!"  ldp {regs[i]!}, {regs[i+1]!}, [sp], #16"
+      let r1 := regs[i]!
+      let r2 := regs[i+1]!
+      emitLn s!"  ldp {stackReg r1}, {stackReg r2}, [sp], #16"
       i := i + 2
-    if i < regs.size then emitLn s!"  ldr {regs[i]!}, [sp], #8"
+    if i < regs.size then
+      let r := regs[i]!
+      emitLn s!"  ldr {stackReg r}, [sp], #8"
   | _ => pure ()
 
 /-- Emit floating-point instruction -/
@@ -372,6 +419,7 @@ def emitExternals : EmitM Unit := do
   emitLn "  .extern _lean_dec_ref"
   emitLn "  .extern _lean_mark_persistent"
   emitLn "  .extern _lean_is_shared"
+  emitLn "  .extern _lean_internal_panic_unreachable"
   emitLn "  .extern _lean_setup_args"
   emitLn "  .extern _lean_initialize_runtime_module"
   emitLn "  .extern _lean_io_mark_end_initialization"
@@ -410,7 +458,7 @@ def emitDataSection (env : Environment) (decls : Array IR.Decl) : EmitM Unit := 
     match decl with
     | .fdecl name params retType _ _ =>
       if params.isEmpty then
-        let mangledName := "_" ++ name.mangle
+        let mangledName := symbolName env name
         -- Add alignment before each global constant
         match retType with
         | .uint8 => emitLn "  .align 0  // byte alignment"
@@ -434,7 +482,15 @@ def emitDataSection (env : Environment) (decls : Array IR.Decl) : EmitM Unit := 
 def emitDecl (env : Environment) (decl : IR.Decl) : String :=
   let machineFunc := InstrSelect.compileDecl env decl
   let initState : EmitState := { output := "" }
-  let (_result, finalState) := (emitMachineFunction machineFunc).run initState
+  let customName? :=
+    match decl with
+    | .fdecl name params _ _ _ =>
+      if params.isEmpty then
+        some ("__init_" ++ symbolStem env name)
+      else
+        some (symbolName env name)
+    | _ => none
+  let (_result, finalState) := (emitMachineFunction machineFunc customName?).run initState
   finalState.output
 
 /-- Check if declarations contain a main function -/
@@ -443,13 +499,18 @@ def hasMainFn (decls : List IR.Decl) : Bool :=
 
 /-- Emit module initialization function -/
 def emitInitFunction (env : Environment) (modName : Name) (decls : Array IR.Decl) : EmitM Unit := do
-  let initFnName := "_" ++ Lean.mkModuleInitializationFunctionName modName
+  let pkg? := env.getModulePackage?
+  let initFnName := withSymbolPrefix (Lean.mkModuleInitializationFunctionName modName pkg?)
 
   emitLn ""
   emitLn "  // Module initialization function"
   -- Declare imported module initializers as extern
   for imp in env.imports do
-    let impInitFn := "_" ++ Lean.mkModuleInitializationFunctionName imp.module
+    let impPkg? :=
+      match env.getModuleIdxFor? imp.module with
+      | some idx => env.getModulePackageByIdx? idx
+      | none => none
+    let impInitFn := withSymbolPrefix (Lean.mkModuleInitializationFunctionName imp.module impPkg?)
     emitLn s!"  .extern {impInitFn}"
 
   emitLn s!"  .globl {initFnName}"
@@ -477,7 +538,11 @@ def emitInitFunction (env : Environment) (modName : Name) (decls : Array IR.Decl
   for h : idx in [:env.imports.size] do
     let imp := env.imports[idx]!
     let decDoneLabel := s!".Linit_dec_done_{idx}"
-    let impInitFn := "_" ++ Lean.mkModuleInitializationFunctionName imp.module
+    let impPkg? :=
+      match env.getModuleIdxFor? imp.module with
+      | some idx => env.getModulePackageByIdx? idx
+      | none => none
+    let impInitFn := withSymbolPrefix (Lean.mkModuleInitializationFunctionName imp.module impPkg?)
     emitLn s!"  // Initialize {imp.module}"
     emitLn "  mov x0, #1  // builtin"
     -- NOTE: Import init functions take only uint8_t builtin, not a world object
@@ -502,7 +567,7 @@ def emitInitFunction (env : Environment) (modName : Name) (decls : Array IR.Decl
     | .fdecl name params ty body _ =>
       -- Check if this is an IO Unit initialize block (declaration itself is the initFn)
       if isIOUnitInitFn env name then
-        let funcName := "_" ++ name.mangle
+        let funcName := symbolName env name
         emitLn s!"  // Initialize IO Unit block {name}"
         emitLn s!"  mov x0, #1  // lean_io_mk_world() inlined as lean_box(0)"
         emitLn s!"  bl {funcName}"
@@ -518,8 +583,8 @@ def emitInitFunction (env : Environment) (modName : Name) (decls : Array IR.Decl
         match getInitFnNameFor? env name with
         | some initFnName =>
           -- Named initialize block (e.g., initialize ref : IO.Ref Nat ← ...)
-          let constName := "_" ++ name.mangle
-          let initFnMangledName := "_" ++ initFnName.mangle
+          let constName := symbolName env name
+          let initFnMangledName := symbolName env initFnName
           emitLn s!"  // Initialize {name} via initFn {initFnName}"
           emitLn s!"  mov x0, #1  // lean_io_mk_world() inlined as lean_box(0)"
           emitLn s!"  bl {initFnMangledName}"
@@ -579,8 +644,8 @@ def emitInitFunction (env : Environment) (modName : Name) (decls : Array IR.Decl
             -- Unreachable but no initFn - skip it
             pure ()
           | _ =>
-            let constName := "_" ++ name.mangle
-            let initName := "__init_" ++ name.mangle
+            let constName := symbolName env name
+            let initName := "__init_" ++ symbolStem env name
             emitLn s!"  // Initialize {constName}"
             emitLn s!"  bl {initName}"
             emitLn s!"  adrp x8, {constName}@PAGE"
@@ -665,7 +730,8 @@ def emitMainFn (modName : Name) (env : Environment) : EmitM Unit := do
     emitLn "  // Call module initializer"
     emitLn "  mov x0, #1  // builtin flag"
     emitLn "  bl _lean_io_mk_world"
-    let initFnName := "_" ++ Lean.mkModuleInitializationFunctionName modName
+    let initPkg? := env.getModulePackage?
+    let initFnName := withSymbolPrefix (Lean.mkModuleInitializationFunctionName modName initPkg?)
     emitLn s!"  bl {initFnName}"
     emitLn "  mov x19, x0  // Save init result"
     emitLn ""
@@ -789,12 +855,12 @@ def emitDecls (env : Environment) (modName : Name) (decls : Array IR.Decl) : Str
             -- Skip unreachable 0-param functions (they are IO refs initialized by initFn calls)
             pure ()
           | _ =>
-            let initFnName := "__init_" ++ name.mangle
+            let initFnName := "__init_" ++ symbolStem env name
             let machineFunc := InstrSelect.compileDecl env decl
             emitMachineFunction machineFunc (some initFnName)
         else
           let machineFunc := InstrSelect.compileDecl env decl
-          emitMachineFunction machineFunc
+          emitMachineFunction machineFunc (some (symbolName env name))
       | _ => pure ()
 
     -- Emit module initialization routine

@@ -52,8 +52,12 @@ structure SelectContext where
   varTypes : Std.TreeMap Index IRType (fun a b => compare a b)
   /-- Stack spill bytes (aligned) -/
   spillBytes : Nat := 0
+  /-- Optional temporary stack slot offset (bytes from sp) for lowering helpers. -/
+  tempSlotOffset : Option Int := none
   /-- Callee-saved GP registers that are actually used (for dynamic save/restore) -/
   usedCalleeSavedGP : Array PhysReg := #[]
+  /-- Callee-saved FP registers that are actually used (for dynamic save/restore) -/
+  usedCalleeSavedFP : Array PhysReg := #[]
   /-- Whether this is a boxed wrapper function (needs all callee-saved regs) -/
   isBoxed : Bool := false
 
@@ -83,6 +87,10 @@ structure ScratchPool where
   available : Array PhysReg := RegClass.scratch
   /-- Currently in-use scratch registers -/
   inUse : Array PhysReg := #[]
+  /-- Available FP scratch registers -/
+  availableFP : Array PhysReg := RegClass.fpScratch
+  /-- Currently in-use FP scratch registers -/
+  inUseFP : Array PhysReg := #[]
   deriving Inhabited
 
 /-- Combined state for instruction selection -/
@@ -136,8 +144,14 @@ def getAllocResult : SelectM AllocState := (·.allocResult) <$> read
 /-- Get spill bytes -/
 def getSpillBytes : SelectM Nat := (·.spillBytes) <$> read
 
+/-- Get optional temp stack slot offset. -/
+def getTempSlotOffset : SelectM (Option Int) := (·.tempSlotOffset) <$> read
+
 /-- Get used callee-saved GP registers -/
 def getUsedCalleeSavedGP : SelectM (Array PhysReg) := (·.usedCalleeSavedGP) <$> read
+
+/-- Get used callee-saved FP registers -/
+def getUsedCalleeSavedFP : SelectM (Array PhysReg) := (·.usedCalleeSavedFP) <$> read
 
 /-- Check if this is a boxed wrapper function -/
 def getIsBoxed : SelectM Bool := (·.isBoxed) <$> read
@@ -153,6 +167,20 @@ def getCalleeSavedPairs (usedGP : Array PhysReg) : Array (Array Reg) :=
   ]
   pairs.filterMap fun (r1, r2) =>
     if usedGP.contains r1 || usedGP.contains r2 then
+      some #[Reg.phys r1, Reg.phys r2]
+    else
+      none
+
+/-- Get pairs of callee-saved FP registers to save/restore based on which are used. -/
+def getCalleeSavedFPPairs (usedFP : Array PhysReg) : Array (Array Reg) :=
+  let pairs := #[
+    (PhysReg.v8, PhysReg.v9),
+    (PhysReg.v10, PhysReg.v11),
+    (PhysReg.v12, PhysReg.v13),
+    (PhysReg.v14, PhysReg.v15)
+  ]
+  pairs.filterMap fun (r1, r2) =>
+    if usedFP.contains r1 || usedFP.contains r2 then
       some #[Reg.phys r1, Reg.phys r2]
     else
       none
@@ -178,19 +206,40 @@ def acquireScratch : SelectM PhysReg := do
   -- Fallback
   return s.scratch.available[0]!
 
+/- Acquire an FP scratch register -/
+def acquireFPScratch : SelectM PhysReg := do
+  let s ← get
+  for r in s.scratch.availableFP do
+    if !s.scratch.inUseFP.contains r then
+      modify fun s => { s with scratch := { s.scratch with inUseFP := s.scratch.inUseFP.push r } }
+      return r
+  -- Fallback
+  return s.scratch.availableFP[0]!
+
 /-- Release a scratch register -/
 def releaseScratch (r : PhysReg) : SelectM Unit :=
-  modify fun s => { s with scratch := { s.scratch with inUse := s.scratch.inUse.filter (· != r) } }
+  if r.isFP then
+    modify fun s => { s with scratch := { s.scratch with inUseFP := s.scratch.inUseFP.filter (· != r) } }
+  else
+    modify fun s => { s with scratch := { s.scratch with inUse := s.scratch.inUse.filter (· != r) } }
 
 /-- Release all scratch registers -/
 def releaseAllScratch : SelectM Unit :=
-  modify fun s => { s with scratch := { s.scratch with inUse := #[] } }
+  modify fun s => { s with scratch := { s.scratch with inUse := #[], inUseFP := #[] } }
 
 /-- Run action with automatic scratch release -/
 def withScratchScope (action : SelectM α) : SelectM α := do
   let result ← action
   releaseAllScratch
   return result
+
+
+/- Acquire scratch register appropriate for the IR type. -/
+def acquireScratchForType (ty : IRType) : SelectM PhysReg := do
+  if ty == .float || ty == .float32 then
+    acquireFPScratch
+  else
+    acquireScratch
 
 /-!
 ## Register Access
@@ -204,13 +253,13 @@ def loadSpilledVar (v : VarId) : SelectM Reg := do
   match alloc.rematerializable.get? v.idx with
   | some constVal =>
     -- Rematerialize the constant instead of loading from stack
-    let scratch ← acquireScratch
+    let scratch ← acquireScratchForType ty
     emit (Instr.movz (.phys scratch) constVal.toNat 0)
     return .phys scratch
   | none =>
     match alloc.stackSlots.get? v.idx with
     | some slot =>
-      let scratch ← acquireScratch
+      let scratch ← acquireScratchForType ty
       let offset := slot * 8
       -- Choose appropriate load based on type
       if ty == .uint8 then
@@ -219,13 +268,15 @@ def loadSpilledVar (v : VarId) : SelectM Reg := do
         emit (Instr.ldrh (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
       else if ty == .uint32 then
         emit (Instr.ldrw (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
+      else if ty == .float32 then
+        emit (Instr.ldrs (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
       else
         emit (Instr.ldr (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
       return .phys scratch
     | none =>
       -- Variable not allocated - this can happen when liveness analysis misses a variable
       -- Use a scratch register as fallback
-      let scratch ← acquireScratch
+      let scratch ← acquireScratchForType ty
       emit (Instr.comment s!"WARNING: unallocated variable x{v.idx}, using scratch {scratch}")
       return .phys scratch
 
@@ -247,6 +298,8 @@ def storeToStackSlot (src : Reg) (slot : Nat) (ty : IRType) : SelectM Unit := do
     emit (Instr.strh src (.mem (.phys .sp) offset))
   else if ty == .uint32 then
     emit (Instr.strw src (.mem (.phys .sp) offset))
+  else if ty == .float32 then
+    emit (Instr.strs src (.mem (.phys .sp) offset))
   else
     emit (Instr.str src (.mem (.phys .sp) offset))
 
@@ -258,10 +311,7 @@ def getDstReg (v : VarId) : SelectM (Reg × Bool) := do
   | none =>
     -- Destination is spilled, use scratch register
     let ty := (← read).varTypes.get? v.idx |>.getD .object
-    let scratch := if ty == .float || ty == .float32 then
-      PhysReg.v16  -- FP scratch
-    else
-      PhysReg.x8   -- GP scratch
+    let scratch ← acquireScratchForType ty
     return (.phys scratch, true)
 
 /-- Store result if destination was spilled -/
@@ -364,6 +414,31 @@ def loadImm64 (dst : Reg) (value : Nat) : SelectM Unit := do
       emit (Instr.movk dst ((value >>> 32) &&& 0xFFFF) 32)
     if ((value >>> 48) &&& 0xFFFF) != 0 then
       emit (Instr.movk dst ((value >>> 48) &&& 0xFFFF) 48)
+
+/-- Adjust stack pointer by a positive byte count (add/sub), using a scratch if needed. -/
+def emitStackAdjust (isAdd : Bool) (bytes : Nat) : SelectM Unit := do
+  if bytes == 0 then
+    return
+  if bytes <= 4095 then
+    if isAdd then
+      emit (Instr.add (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat bytes)))
+    else
+      emit (Instr.sub (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat bytes)))
+  else
+    let scratch := Reg.phys PhysReg.x16
+    loadImm64 scratch bytes
+    if isAdd then
+      emit (Instr.add (.phys PhysReg.sp) (.phys PhysReg.sp) (.reg scratch))
+    else
+      emit (Instr.sub (.phys PhysReg.sp) (.phys PhysReg.sp) (.reg scratch))
+
+/-- Convenience: subtract from stack pointer by byte count. -/
+def emitStackSub (bytes : Nat) : SelectM Unit :=
+  emitStackAdjust false bytes
+
+/-- Convenience: add to stack pointer by byte count. -/
+def emitStackAdd (bytes : Nat) : SelectM Unit :=
+  emitStackAdjust true bytes
 
 end Lean.Compiler.Backend.ARM64.Lower
 

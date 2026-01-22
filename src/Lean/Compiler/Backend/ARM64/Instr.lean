@@ -138,6 +138,7 @@ inductive Instr where
   -- Load / store instructions
   | ldr (dst : Reg) (src : Operand) (suffix : String := "")
   | ldrw (dst : Reg) (src : Operand)  -- Load word (32-bit) - renders dst as w register
+  | ldrs (dst : Reg) (src : Operand)  -- Load single-precision float (32-bit)
   | ldrb (dst : Reg) (src : Operand)
   | ldrh (dst : Reg) (src : Operand)
   | ldrsb (dst : Reg) (src : Operand) -- load signed byte
@@ -145,6 +146,7 @@ inductive Instr where
   | ldrsw (dst : Reg) (src : Operand) -- load signed word
   | str (src : Reg) (dst : Operand)
   | strw (src : Reg) (dst : Operand)  -- Store word (32-bit)
+  | strs (src : Reg) (dst : Operand)  -- Store single-precision float (32-bit)
   | strb (src : Reg) (dst : Operand)
   | strh (src : Reg) (dst : Operand)
 
@@ -202,6 +204,7 @@ inductive Instr where
 
 namespace Instr
 
+set_option maxHeartbeats 0 in
 /-- Get registers read by this instruction -/
 def uses : Instr → Array Reg
   | .add _ s1 (.reg s2) => #[s1, s2]
@@ -240,6 +243,9 @@ def uses : Instr → Array Reg
   | .ldrw _ (.mem base _) => #[base]
   | .ldrw _ (.reg r) => #[r]
   | .ldrw _ _ => #[]
+  | .ldrs _ (.mem base _) => #[base]
+  | .ldrs _ (.reg r) => #[r]
+  | .ldrs _ _ => #[]
   | .ldrb _ (.mem base _) => #[base]
   | .ldrb _ _ => #[]
   | .ldrh _ (.mem base _) => #[base]
@@ -254,6 +260,8 @@ def uses : Instr → Array Reg
   | .str s _ => #[s]
   | .strw s (.mem base _) => #[s, base]
   | .strw s _ => #[s]
+  | .strs s (.mem base _) => #[s, base]
+  | .strs s _ => #[s]
   | .strb s (.mem base _) => #[s, base]
   | .strb s _ => #[s]
   | .strh s (.mem base _) => #[s, base]
@@ -299,6 +307,7 @@ def uses : Instr → Array Reg
   | .comment _ => #[]
   | .nop => #[]
 
+set_option maxHeartbeats 0 in
 /-- Get register defined by this instruction (if any) -/
 def defs : Instr → Array Reg
   | .add d _ _ => #[d]
@@ -324,6 +333,7 @@ def defs : Instr → Array Reg
   | .adrp d _ => #[d]
   | .ldr d _ _ => #[d]
   | .ldrw d _ => #[d]
+  | .ldrs d _ => #[d]
   | .ldrb d _ => #[d]
   | .ldrh d _ => #[d]
   | .ldrsb d _ => #[d]
@@ -331,6 +341,7 @@ def defs : Instr → Array Reg
   | .ldrsw d _ => #[d]
   | .str _ _ => #[]
   | .strw _ _ => #[]
+  | .strs _ _ => #[]
   | .strb _ _ => #[]
   | .strh _ _ => #[]
   | .ldp d1 d2 _ _ => #[d1, d2]
@@ -394,10 +405,11 @@ def isLabel : Instr → Bool
 
 /-- Check if instruction has side effects -/
 def hasSideEffects : Instr → Bool
-  | .str _ _ | .strw _ _ | .strb _ _ | .strh _ _ | .stp _ _ _ _
+  | .str _ _ | .strw _ _ | .strs _ _ | .strb _ _ | .strh _ _ | .stp _ _ _ _
   | .bl _ | .blr _ | .push _ => true
   | _ => false
 
+set_option maxHeartbeats 0 in
 /-- Render an instruction using GNU assembler syntax. -/
 def toString : Instr → String
   | add dst src1 src2 => s!"add {dst}, {src1}, {src2}"
@@ -427,6 +439,11 @@ def toString : Instr → String
   | ldrw dst src =>
     let dstStr := Reg.toGPR32String dst
     s!"ldr {dstStr}, {src}"
+  | ldrs dst src =>
+    let dstStr := match dst with
+      | .phys p => PhysReg.toFPString .single p
+      | _ => s!"{dst}"
+    s!"ldr {dstStr}, {src}"
   | ldrb dst src =>
     let dstStr := Reg.toGPR32String dst
     s!"ldrb {dstStr}, {src}"
@@ -439,6 +456,11 @@ def toString : Instr → String
   | str src dst => s!"str {src}, {dst}"
   | strw src dst =>
     let srcStr := Reg.toGPR32String src
+    s!"str {srcStr}, {dst}"
+  | strs src dst =>
+    let srcStr := match src with
+      | .phys p => PhysReg.toFPString .single p
+      | _ => s!"{src}"
     s!"str {srcStr}, {dst}"
   | strb src dst =>
     let srcStr := Reg.toGPR32String src
