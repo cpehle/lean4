@@ -39,39 +39,59 @@ def lowerBoxedTag (dstReg : Reg) (tag : Nat) : SelectM Unit := do
 
 /-- Detect if any argument would conflict with destination register -/
 def detectConflict (dstReg : Reg) (args : Array Arg) : SelectM (Option VarId) := do
-  for arg in args do
-    match arg with
-    | .var v =>
-      let vReg ← varToReg v
-      if vReg == dstReg then return some v
-    | .erased => pure ()
-  return none
+  let alloc ← getAllocResult
+  match dstReg with
+  | .phys dstPhys =>
+    for arg in args do
+      match arg with
+      | .var v =>
+        match alloc.allocation.get? v.idx with
+        | some phys =>
+          if phys == dstPhys then return some v
+        | none => pure ()
+      | .erased => pure ()
+    return none
+  | _ =>
+    return none
 
-/-- Save a conflicting argument to x9 before it gets overwritten -/
-def saveConflict (conflict : VarId) (dstReg : Reg) : SelectM Unit := do
-  emitComment s!"save vreg{conflict.idx} from {dstReg} to x9 (constructor will overwrite)"
-  emit (Instr.mov (.phys .x9) (.reg dstReg))
+/-- Save a conflicting argument to a scratch register before it gets overwritten. -/
+def saveConflict (conflict : VarId) (dstReg : Reg) : SelectM PhysReg := do
+  let scratch ← acquireScratch
+  emitComment s!"save vreg{conflict.idx} from {dstReg} to {scratch} (constructor will overwrite)"
+  emit (Instr.mov (.phys scratch) (.reg dstReg))
+  return scratch
 
-/-- Emit constructor allocation call -/
-def emitAllocCtor (tag : Nat) (numObjs : Nat) (scalarSize : Nat) : SelectM Unit := do
-  emit (Instr.mov (.phys .x0) (.imm (Int.ofNat tag)))
-  emit (Instr.mov (.phys .x1) (.imm (Int.ofNat numObjs)))
-  emit (Instr.mov (.phys .x2) (.imm (Int.ofNat scalarSize)))
+/-- Compute scalar bytes for constructor (usize fields + other scalars). -/
+def ctorScalarBytes (info : CtorInfo) : Nat :=
+  info.usize * 8 + info.ssize
+
+/-- Emit constructor allocation call (scalar size includes usize fields). -/
+def emitAllocCtor (info : CtorInfo) : SelectM Unit := do
+  emit (Instr.mov (.phys .x0) (.imm (Int.ofNat info.cidx)))
+  emit (Instr.mov (.phys .x1) (.imm (Int.ofNat info.size)))
+  emit (Instr.mov (.phys .x2) (.imm (Int.ofNat (ctorScalarBytes info))))
   emit (Instr.bl "lean_alloc_ctor")
 
 /-- Emit field set by inlining the store instruction.
     This avoids function call overhead and register clobbering from lean_ctor_set. -/
-def emitFieldSet (fieldIdx : Nat) (arg : Arg) (conflict : Option VarId)
-    (ctorReg : Reg) (ctorStackSlot : Option Nat) : SelectM Unit := do
+def emitFieldSet (fieldIdx : Nat) (arg : Arg) (conflict : Option (VarId × PhysReg))
+    (ctorReg : Reg) (ctorStackOffset : Option Int) : SelectM Unit := do
   -- Field offset: header is 8 bytes, each field is 8 bytes
   let fieldOffset := Int.ofNat (8 + fieldIdx * 8)
 
   match arg with
   | .var v =>
-    let vReg ← varToReg v
-    let actualReg := match conflict with
-      | some cv => if cv.idx == v.idx then .phys .x9 else vReg
-      | none => vReg
+    let alloc ← getAllocResult
+    let useConflict := match conflict with
+      | some (cv, _) => cv.idx == v.idx
+      | none => false
+    let vReg ← if useConflict then
+      match conflict with
+      | some (_, reg) => pure (.phys reg)
+      | none => varToReg v
+    else
+      varToReg v
+    let actualReg := vReg
 
     -- Check if field needs boxing
     let vType ← getVarType v
@@ -91,18 +111,7 @@ def emitFieldSet (fieldIdx : Nat) (arg : Arg) (conflict : Option VarId)
 
       -- For calls, we need to handle ctorReg potentially being clobbered
       -- ctorReg is either a callee-saved register (x19-x28) or x8
-      -- If it's x8 and we have a stack slot, we can reload from there
-      let ctorRegAfterCall ← if boxingIsCall then
-        -- x8 is caller-saved, need to preserve it if used
-        let needsSave := match ctorReg with
-          | .phys .x8 => true
-          | _ => false
-        if needsSave then
-          -- Save ctorReg to x10 before the call
-          emit (Instr.mov (.phys .x10) (.reg ctorReg))
-        pure ()
-      else
-        pure ()
+      -- If it's x8, reload from the stack slot after the call
 
       match ty with
       | .usize => emit (Instr.bl "_lean_box_usize")
@@ -125,12 +134,18 @@ def emitFieldSet (fieldIdx : Nat) (arg : Arg) (conflict : Option VarId)
       -- Determine which register holds the constructor pointer
       let finalCtorReg ← if boxingIsCall then
         match ctorReg with
-        | .phys .x8 =>
-          -- x8 was saved to x10 before the call, restore it
-          emit (Instr.mov (.phys .x8) (.reg (.phys .x10)))
-          pure ctorReg
+        | .phys pr =>
+          if pr.isCalleeSaved then
+            pure ctorReg
+          else
+            match ctorStackOffset with
+            | some offset =>
+              emitComment "reload constructor from temp stack slot"
+              emit (Instr.ldr (.phys pr) (.mem (.phys .sp) offset))
+              pure ctorReg
+            | none =>
+              pure ctorReg
         | _ =>
-          -- Callee-saved registers survive the call
           pure ctorReg
       else
         pure ctorReg
@@ -142,52 +157,100 @@ def emitFieldSet (fieldIdx : Nat) (arg : Arg) (conflict : Option VarId)
       -- No boxing needed, direct inline store
       emit (Instr.str actualReg (.mem ctorReg fieldOffset))
 
+    -- Release scratch registers used for spilled args once the value is stored.
+    if !useConflict && (alloc.allocation.get? v.idx).isNone then
+      match actualReg with
+      | .phys pr =>
+        let conflictReg := conflict.map (fun (_, reg) => reg)
+        let ctorPhys := match ctorReg with
+          | .phys p => some p
+          | _ => none
+        if RegClass.scratch.contains pr && conflictReg != some pr && ctorPhys != some pr then
+          releaseScratch pr
+      | _ => pure ()
+
   | .erased =>
     emitComment s!"field {fieldIdx} erased, set to lean_box(0) = 1"
-    emit (Instr.mov (.phys .x9) (.imm 1))
-    emit (Instr.str (.phys .x9) (.mem ctorReg fieldOffset))
+    let tmp ← acquireScratch
+    emit (Instr.mov (.phys tmp) (.imm 1))
+    emit (Instr.str (.phys tmp) (.mem ctorReg fieldOffset))
+    releaseScratch tmp
 
 /-- Lower .ctor expression -/
 def lowerCtor (dst : VarId) (info : CtorInfo) (args : Array Arg) : SelectM Unit := do
   let alloc ← getAllocResult
   let (dstReg, isSpilled) ← getDstReg dst
+  emitComment s!"ctor {info.name} (tag={info.cidx}, objs={info.size}, usize={info.usize}, scalar={info.ssize})"
 
-  emitComment s!"ctor {info.name} (tag={info.cidx}, objs={info.size}, scalar={info.ssize})"
-
-  -- Zero-sized constructors are just boxed tags
-  if info.size == 0 && info.ssize == 0 then
-    lowerBoxedTag dstReg info.cidx
+  -- Zero-sized constructors are either unboxed enums or boxed tags
+  if info.size == 0 && info.usize == 0 && info.ssize == 0 then
+    let dstTy ← getVarType dst
+    match dstTy with
+    | some ty =>
+      if ty.isScalar then
+        emit (Instr.mov dstReg (.imm (Int.ofNat info.cidx)))
+      else
+        lowerBoxedTag dstReg info.cidx
+    | none =>
+      lowerBoxedTag dstReg info.cidx
     if isSpilled then
       storeSpilledDst dst dstReg
+    releaseAllScratch
     return
 
   -- Check for register conflicts
-  let conflict ← detectConflict dstReg args
-  match conflict with
-  | some v => saveConflict v dstReg
-  | none => pure ()
+  let conflictVar ← if isSpilled then
+    pure none
+  else
+    detectConflict dstReg args
 
   -- Allocate constructor
-  emitAllocCtor info.cidx info.size info.ssize
+  emitAllocCtor info
 
   -- Move result to destination register (if not spilled)
-  let ctorReg := if isSpilled then .phys .x8 else dstReg
+  let ctorReg := dstReg
+  let conflict ← match conflictVar with
+    | some v => do
+      let reg ← saveConflict v dstReg
+      pure (some (v, reg))
+    | none => pure none
   emit (Instr.mov ctorReg (.reg (.phys .x0)))
 
-  -- If spilled, also store to stack
-  if isSpilled then
-    match alloc.stackSlots.get? dst.idx with
-    | some slot =>
-      let offset := Int.ofNat (slot * 8)
-      emitComment s!"store constructor for spilled vreg{dst.idx}"
-      emit (Instr.str (.phys .x0) (.mem (.phys .sp) offset))
-    | none => pure ()
+  let ctorStackOffset :=
+    if isSpilled then
+      alloc.stackSlots.get? dst.idx |>.map (fun slot => Int.ofNat (slot * 8))
+    else
+      none
+  match ctorStackOffset with
+  | some offset =>
+    emitComment "store constructor for reuse across boxing calls"
+    emit (Instr.str (.phys .x0) (.mem (.phys .sp) offset))
+  | none => pure ()
 
   -- Set all fields (pass stack slot for potential reload after boxing calls)
-  let ctorStackSlot := if isSpilled then alloc.stackSlots.get? dst.idx else none
-  for i in [:args.size] do
-    let arg := args[i]!
-    emitFieldSet i arg conflict ctorReg ctorStackSlot
+  let ctorStackSlot := ctorStackOffset
+  let mut conflictIdxs : Array Nat := #[]
+  match conflict with
+  | some (cv, _) =>
+    for i in [:args.size] do
+      match args[i]! with
+      | .var v =>
+        if v.idx == cv.idx then
+          conflictIdxs := conflictIdxs.push i
+      | .erased => pure ()
+  | none => pure ()
+  if conflictIdxs.isEmpty then
+    for i in [:args.size] do
+      let arg := args[i]!
+      emitFieldSet i arg conflict ctorReg ctorStackSlot
+  else
+    for i in conflictIdxs do
+      let arg := args[i]!
+      emitFieldSet i arg conflict ctorReg ctorStackSlot
+    for i in [:args.size] do
+      if !conflictIdxs.contains i then
+        let arg := args[i]!
+        emitFieldSet i arg conflict ctorReg ctorStackSlot
 
   -- Final move to destination if needed
   if !isSpilled && ctorReg != dstReg then
@@ -197,61 +260,180 @@ def lowerCtor (dst : VarId) (info : CtorInfo) (args : Array Arg) : SelectM Unit 
 
 /-- Lower .reset expression -/
 def lowerReset (dst : VarId) (n : Nat) (x : VarId) : SelectM Unit := do
-  let xReg ← varToReg x
+  let alloc ← getAllocResult
+  let xSpilled := (alloc.stackSlots.get? x.idx).isSome
+  let loadX : SelectM Reg := do
+    if xSpilled then
+      loadSpilledVar x
+    else
+      varToReg x
+  let releaseX (r : Reg) : SelectM Unit := do
+    if xSpilled then
+      match r with
+      | .phys pr => releaseScratch pr
+      | _ => pure ()
+    else
+      pure ()
+
   let (dstReg, isSpilled) ← getDstReg dst
   emitComment s!"reset {n}"
-  emit (Instr.mov dstReg (.reg xReg))
+
+  -- Check exclusivity: non-scalar and rc == 1
+  let rcReg ← acquireScratch
+  let xRegCheck ← loadX
+  let notExclusiveLabel ← freshLabel "reset_not_exclusive"
+  let exclusiveLabel ← freshLabel "reset_exclusive"
+  let doneLabel ← freshLabel "reset_done"
+  emit (Instr.tst xRegCheck (.imm 1))
+  emit (Instr.bCond Cond.ne notExclusiveLabel)
+  emit (Instr.ldrw (.phys rcReg) (.mem xRegCheck 0))
+  emit (Instr.cmp (.phys rcReg) (.imm 1))
+  releaseX xRegCheck
+  releaseScratch rcReg
+  emit (Instr.bCond Cond.eq exclusiveLabel)
+  emit (Instr.b notExclusiveLabel)
+
+  -- Not exclusive: dec_ref and return box(0)
+  emit (Instr.label notExclusiveLabel)
+  let xRegDec ← loadX
+  emit (Instr.mov (.phys .x0) (.reg xRegDec))
+  emit (Instr.bl "lean_dec_ref")
+  releaseX xRegDec
+  emit (Instr.mov dstReg (.imm 1))  -- lean_box(0)
   if isSpilled then
     storeSpilledDst dst dstReg
+  emit (Instr.b doneLabel)
+
+  -- Exclusive: release fields and return original object
+  emit (Instr.label exclusiveLabel)
+  for i in [:n] do
+    let fieldOffset := Int.ofNat (8 + i * 8)
+    let xRegField ← loadX
+    let fieldReg ← acquireScratch
+    emit (Instr.ldr (.phys fieldReg) (.mem xRegField fieldOffset))
+    emit (Instr.tst (.phys fieldReg) (.imm 1))
+    let skipLabel ← freshLabel "reset_skip_dec"
+    emit (Instr.bCond Cond.ne skipLabel)
+    emit (Instr.mov (.phys .x0) (.reg (.phys fieldReg)))
+    emit (Instr.bl "lean_dec_ref")
+    emit (Instr.label skipLabel)
+    emit (Instr.mov (.phys fieldReg) (.imm 1))
+    if xSpilled then
+      releaseX xRegField
+      let xRegStore ← loadX
+      emit (Instr.str (.phys fieldReg) (.mem xRegStore fieldOffset))
+      releaseX xRegStore
+    else
+      emit (Instr.str (.phys fieldReg) (.mem xRegField fieldOffset))
+      releaseX xRegField
+    releaseScratch fieldReg
+
+  let xRegFinal ← loadX
+  emit (Instr.mov dstReg (.reg xRegFinal))
+  if isSpilled then
+    storeSpilledDst dst dstReg
+  releaseX xRegFinal
+
+  emit (Instr.label doneLabel)
   releaseAllScratch
 
 /-- Lower .reuse expression -/
 def lowerReuse (dst : VarId) (x : VarId) (info : CtorInfo)
     (updtHeader : Bool) (args : Array Arg) : SelectM Unit := do
-  let xReg ← varToReg x
   let alloc ← getAllocResult
   let (dstReg, isSpilled) ← getDstReg dst
+  let xSpilled := (alloc.stackSlots.get? x.idx).isSome
+  let loadX : SelectM Reg := do
+    if xSpilled then
+      loadSpilledVar x
+    else
+      varToReg x
+  let releaseX (r : Reg) : SelectM Unit := do
+    if xSpilled then
+      match r with
+      | .phys pr => releaseScratch pr
+      | _ => pure ()
+    else
+      pure ()
 
   emitComment s!"reuse {info.name}"
 
-  -- Zero-sized just copies pointer
-  if info.size == 0 && info.ssize == 0 then
-    emit (Instr.mov dstReg (.reg xReg))
-    if isSpilled then
-      storeSpilledDst dst dstReg
-    return
-
   -- Check for conflicts
-  let conflict ← detectConflict dstReg args
-  match conflict with
-  | some v => saveConflict v dstReg
+  let conflictVar ← if isSpilled then
+    pure none
+  else
+    detectConflict dstReg args
+  let conflict ← match conflictVar with
+    | some v => do
+      let reg ← saveConflict v dstReg
+      pure (some (v, reg))
+    | none => pure none
+  let ctorReg := dstReg
+  let ctorStackSlot :=
+    if isSpilled then
+      alloc.stackSlots.get? dst.idx |>.map (fun slot => Int.ofNat (slot * 8))
+    else
+      none
+  let scalarLabel ← freshLabel "reuse_scalar"
+  let setFieldsLabel ← freshLabel "reuse_set_fields"
+
+  let xRegCheck ← loadX
+  emit (Instr.tst xRegCheck (.imm 1))
+  emit (Instr.bCond Cond.ne scalarLabel)
+
+  -- Non-scalar: reuse object
+  emit (Instr.mov ctorReg (.reg xRegCheck))
+  match ctorStackSlot with
+  | some offset =>
+    emitComment "store reused object for reuse across boxing calls"
+    emit (Instr.str ctorReg (.mem (.phys .sp) offset))
   | none => pure ()
-
-  -- Copy pointer to destination
-  let ctorReg := if isSpilled then .phys .x8 else dstReg
-  emit (Instr.mov ctorReg (.reg xReg))
-
-  -- Store to stack if spilled
-  let ctorStackSlot := if isSpilled then alloc.stackSlots.get? dst.idx else none
-  if isSpilled then
-    match ctorStackSlot with
-    | some slot =>
-      let offset := Int.ofNat (slot * 8)
-      emitComment s!"store reused object for spilled vreg{dst.idx}"
-      emit (Instr.str ctorReg (.mem (.phys .sp) offset))
-    | none => pure ()
-
-  -- Update tag if needed (inline as strb to avoid function call)
   if updtHeader then
     emitComment s!"update tag to {info.cidx} (inline)"
-    emit (Instr.mov (.phys .x9) (.imm (Int.ofNat info.cidx)))
+    let tagReg ← acquireScratch
+    emit (Instr.mov (.phys tagReg) (.imm (Int.ofNat info.cidx)))
     -- Tag is at byte offset 7 in the header (little-endian)
-    emit (Instr.strb (.phys .x9) (.mem ctorReg 7))
+    emit (Instr.strb (.phys tagReg) (.mem ctorReg 7))
+    releaseScratch tagReg
+  releaseX xRegCheck
+  emit (Instr.b setFieldsLabel)
+
+  -- Scalar: allocate new object
+  emit (Instr.label scalarLabel)
+  releaseX xRegCheck
+  emitAllocCtor info
+  emit (Instr.mov ctorReg (.reg (.phys .x0)))
+  match ctorStackSlot with
+  | some offset =>
+    emitComment "store reused object for reuse across boxing calls"
+    emit (Instr.str ctorReg (.mem (.phys .sp) offset))
+  | none => pure ()
+
+  emit (Instr.label setFieldsLabel)
 
   -- Set all fields
-  for i in [:args.size] do
-    let arg := args[i]!
-    emitFieldSet i arg conflict ctorReg ctorStackSlot
+  let mut conflictIdxs : Array Nat := #[]
+  match conflict with
+  | some (cv, _) =>
+    for i in [:args.size] do
+      match args[i]! with
+      | .var v =>
+        if v.idx == cv.idx then
+          conflictIdxs := conflictIdxs.push i
+      | .erased => pure ()
+  | none => pure ()
+  if conflictIdxs.isEmpty then
+    for i in [:args.size] do
+      let arg := args[i]!
+      emitFieldSet i arg conflict ctorReg ctorStackSlot
+  else
+    for i in conflictIdxs do
+      let arg := args[i]!
+      emitFieldSet i arg conflict ctorReg ctorStackSlot
+    for i in [:args.size] do
+      if !conflictIdxs.contains i then
+        let arg := args[i]!
+        emitFieldSet i arg conflict ctorReg ctorStackSlot
 
   -- Final move if needed
   if !isSpilled && ctorReg != dstReg then
