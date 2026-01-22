@@ -88,11 +88,11 @@ def init (affinity : Affinity) (callPositions : Array InstrPos)
   rematerializable
 }
 
-/-- Check if an interval spans any function call.
-    Must check individual ranges to handle gaps correctly. -/
+/-- Check if an interval spans any function call. -/
 def spansCall (s : AllocState) (iv : LiveInterval) : Bool :=
-  s.callPositions.any fun callPos =>
-    iv.ranges.any fun r => r.start <= callPos && callPos < r.end_
+  let start := iv.start
+  let end_ := iv.end_
+  s.callPositions.any fun callPos => start <= callPos && callPos < end_
 
 /-- Check if a variable is spilled -/
 def isSpilled (s : AllocState) (v : VarId) : Bool :=
@@ -220,19 +220,14 @@ def spillInterval (iv : LiveInterval) : AllocM Unit := do
       activeSpilled := (s.activeSpilled.push iv).qsort (·.end_ < ·.end_)
     }
     return
-  -- Try to reuse a free slot, otherwise allocate new
-  let (slot, freeSpillSlots, nextSlot) :=
-    if s.freeSpillSlots.isEmpty then
-      (s.nextStackSlot, s.freeSpillSlots, s.nextStackSlot + 1)
-    else
-      -- Reuse an existing free slot
-      (s.freeSpillSlots.back!, s.freeSpillSlots.pop, s.nextStackSlot)
+  -- Allocate a fresh stack slot (no reuse; conservatively avoids overlap bugs)
+  let slot := s.nextStackSlot
+  let nextSlot := s.nextStackSlot + 1
   modify fun s => {
     s with
     spilled := s.spilled.push iv.var,
     stackSlots := s.stackSlots.insert iv.var.idx slot,
     nextStackSlot := nextSlot,
-    freeSpillSlots,
     -- Track this interval as active spilled for slot reuse
     activeSpilled := (s.activeSpilled.push iv).qsort (·.end_ < ·.end_)
   }
@@ -286,19 +281,15 @@ def allocateBlocked (iv : LiveInterval) : AllocM Unit := do
           activeSpilled := (s.activeSpilled.push victim).qsort (·.end_ < ·.end_)
         }
       else
-        -- Free the register from victim, try to reuse slot
-        let (slot, freeSpillSlots, nextSlot) :=
-          if s.freeSpillSlots.isEmpty then
-            (s.nextStackSlot, s.freeSpillSlots, s.nextStackSlot + 1)
-          else
-            (s.freeSpillSlots.back!, s.freeSpillSlots.pop, s.nextStackSlot)
+        -- Free the register from victim, allocate a fresh slot (no reuse)
+        let slot := s.nextStackSlot
+        let nextSlot := s.nextStackSlot + 1
         modify fun s => {
           s with
           allocation := s.allocation.erase victim.var.idx |>.insert iv.var.idx reg,
           spilled := s.spilled.push victim.var,
           stackSlots := s.stackSlots.insert victim.var.idx slot,
           nextStackSlot := nextSlot,
-          freeSpillSlots,
           activeGP := if usesFP then s.activeGP else s.activeGP.filter (·.var.idx != victim.var.idx) |>.push iv |>.qsort (·.end_ < ·.end_),
           activeFP := if usesFP then s.activeFP.filter (·.var.idx != victim.var.idx) |>.push iv |>.qsort (·.end_ < ·.end_) else s.activeFP,
           activeSpilled := (s.activeSpilled.push victim).qsort (·.end_ < ·.end_)

@@ -249,9 +249,10 @@ def getInterval (info : LivenessInfo) (v : VarId) : Option LiveInterval :=
 
 /-- Check if an interval spans any call position -/
 def spansCall (info : LivenessInfo) (iv : LiveInterval) : Bool :=
-  -- An interval spans a call if any of its ranges contain a call position
-  info.callPositions.any fun callPos =>
-    iv.ranges.any fun r => r.start <= callPos && callPos < r.end_
+  -- Treat intervals as continuous between first def and last use, matching linear scan.
+  let start := iv.start
+  let end_ := iv.end_
+  info.callPositions.any fun callPos => start <= callPos && callPos < end_
 
 end LivenessInfo
 
@@ -266,6 +267,8 @@ are live at each point. For SSA IR, this is simpler than for general CFG.
 structure LivenessState where
   /-- Current position counter (decreasing) -/
   pos : InstrPos
+  /-- Total number of instructions in the function -/
+  numInstrs : Nat := 0
   /-- Currently live variables -/
   live : VarSet
   /-- Live-in at each position -/
@@ -352,15 +355,21 @@ def processExprUses (e : IR.Expr) : StateM LivenessState Unit := do
   | .ctor info args =>
     recordArgsUse args
     -- Allocation always calls lean_alloc_ctor (except for zero-sized boxed tags)
-    if info.size > 0 || info.ssize > 0 then recordCall
-  | .reset _ x => recordUse x
-  | .reuse x _ info _ args =>
+    if info.size > 0 || info.usize > 0 || info.ssize > 0 then recordCall
+  | .reset _ x =>
+    recordUse x
+    recordCall
+  | .reuse x _ _ args =>
     recordUse x
     recordArgsUse args
-    -- Reuse might call boxing functions for fields
-    if info.size > 0 || info.ssize > 0 then recordCall
+    -- Reuse may allocate or box fields
+    recordCall
   | .proj _ x | .uproj _ x | .sproj _ _ x => recordUse x
-  | .fap _ args | .pap _ args | .ap _ args =>
+  | .fap _ args | .pap _ args =>
+    recordArgsUse args
+    recordCall  -- Track call position for caller-saved register allocation
+  | .ap x args =>
+    recordUse x
     recordArgsUse args
     recordCall  -- Track call position for caller-saved register allocation
   | .box ty x =>
@@ -404,7 +413,10 @@ def exprUses (e : IR.Expr) : Array VarId :=
   | .reset _ x => #[x]
   | .reuse x _ _ args => #[x] ++ args.filterMap (fun arg => match arg with | .var v => some v | .erased => none)
   | .proj _ x | .uproj _ x | .sproj _ _ x => #[x]
-  | .fap _ args | .pap _ args | .ap _ args => args.filterMap (fun arg => match arg with | .var v => some v | .erased => none)
+  | .fap _ args | .pap _ args =>
+    args.filterMap (fun arg => match arg with | .var v => some v | .erased => none)
+  | .ap x args =>
+    #[x] ++ args.filterMap (fun arg => match arg with | .var v => some v | .erased => none)
   | .box _ x => #[x]
   | .unbox x => #[x]
   | .lit _ => #[]
@@ -495,13 +507,11 @@ partial def computeLivenessBody (fnName : Name) (body : FnBody) : StateM Livenes
       -- This is a tail call - args need to be live until the end
       -- The tail call will jump to function start, so args must survive
       -- We don't process 'rest' since it's just the return
-      saveAndStep
       recordDef x ty
       -- Record tail call args as used - they need to survive until function start
       recordArgsUse tailArgs
       -- Also extend their intervals to cover the whole function
       let st ← get
-      let numInstrs := st.pos  -- This is the total instruction count
       for arg in tailArgs do
         match arg with
         | .var v =>
@@ -509,15 +519,15 @@ partial def computeLivenessBody (fnName : Name) (body : FnBody) : StateM Livenes
           match st.intervals.get? v.idx with
           | some iv =>
             let extendedRanges := iv.ranges.map fun r =>
-              { r with end_ := max r.end_ numInstrs }
+              { r with end_ := max r.end_ st.numInstrs }
             modify fun s => { s with
               intervals := s.intervals.insert v.idx { iv with ranges := extendedRanges }
             }
           | none => pure ()
         | .erased => pure ()
+      saveAndStep
     | none =>
       computeLivenessBody fnName rest
-      saveAndStep
       recordDef x ty
       processExprUses e
       -- Check if this is a small constant that can be rematerialized instead of spilled
@@ -528,6 +538,7 @@ partial def computeLivenessBody (fnName : Name) (body : FnBody) : StateM Livenes
         if taggedVal < (1 <<< 16) then
           modify fun s => { s with rematerializable := s.rematerializable.insert x.idx (UInt64.ofNat taggedVal) }
       | _ => pure ()
+      saveAndStep
   | .jdecl j params jpBody rest => do
     -- Process rest first (maintains correct position numbering)
     -- jpLiveIn is already available from first pass, so .jmp handlers in rest
@@ -561,48 +572,54 @@ partial def computeLivenessBody (fnName : Name) (body : FnBody) : StateM Livenes
         acc.insert key merged
       | none => acc.insert key iv
     ) jpState.intervals
+    let mergedCalls := entryState.callPositions ++ jpState.callPositions
+    let mergedRematerializable :=
+      entryState.rematerializable.foldl (fun acc k v => acc.insert k v) jpState.rematerializable
     set { entryState with
       live := entryState.live.union jpState.live,
       intervals := mergedIntervals,
-      varTypes := entryState.varTypes.foldl (fun acc k v => acc.insert k v) jpState.varTypes
+      varTypes := entryState.varTypes.foldl (fun acc k v => acc.insert k v) jpState.varTypes,
+      callPositions := mergedCalls,
+      rematerializable := mergedRematerializable
       -- jpLiveIn/jpParams preserved from initState
     }
   | .set x _ y rest => do
     computeLivenessBody fnName rest
-    saveAndStep
     recordUse x
     recordArgUse y
+    saveAndStep
   | .uset x _ y rest => do
     computeLivenessBody fnName rest
-    saveAndStep
     recordUse x
     recordUse y
+    saveAndStep
   | .sset x _ _ y _ rest => do
     computeLivenessBody fnName rest
-    saveAndStep
     recordUse x
     recordUse y
+    saveAndStep
   | .setTag x _ rest => do
     computeLivenessBody fnName rest
-    saveAndStep
     recordUse x
+    saveAndStep
   | .inc x _ _ _ rest => do
     computeLivenessBody fnName rest
-    recordCall  -- inc generates a call to lean_inc_ref (record BEFORE step to get correct position)
-    saveAndStep
     recordUse x
+    recordCall  -- inc generates a call to lean_inc_ref
+    saveAndStep
   | .dec x _ _ _ rest => do
     computeLivenessBody fnName rest
-    recordCall  -- dec generates a call to lean_dec (record BEFORE step to get correct position)
-    saveAndStep
     recordUse x
+    recordCall  -- dec generates a call to lean_dec
+    saveAndStep
   | .del x rest => do
     computeLivenessBody fnName rest
-    saveAndStep
     recordUse x
+    recordCall  -- del generates a call to lean_free_object
+    saveAndStep
   | .case _ x _ alts => do
-    saveAndStep
     recordUse x
+    saveAndStep
     -- Process all alternatives with DISJOINT position ranges.
     -- Each alternative gets its own position range to prevent false register sharing.
     -- This is essential for correctness when variables need to survive through all branches.
@@ -611,11 +628,13 @@ partial def computeLivenessBody (fnName : Name) (body : FnBody) : StateM Livenes
     let mut mergedLive : VarSet := {}
     let mut mergedIntervals := baseState.intervals
     let mut mergedVarTypes := baseState.varTypes
+    let mut mergedCallPositions := baseState.callPositions
+    let mut mergedRematerializable := baseState.rematerializable
     let mut currentPos := basePos
     let mut minPos := basePos
     for alt in alts do
       -- Start this alternative from currentPos (disjoint from other alternatives)
-      let altStartState := { baseState with pos := currentPos }
+      let altStartState := { baseState with pos := currentPos, callPositions := #[] }
       set altStartState
       computeLivenessBody fnName alt.body
       let altState ← get
@@ -633,11 +652,25 @@ partial def computeLivenessBody (fnName : Name) (body : FnBody) : StateM Livenes
         | none => acc.insert key iv
       ) mergedIntervals
       mergedVarTypes := altState.varTypes.foldl (fun acc k v => acc.insert k v) mergedVarTypes
+      mergedCallPositions := mergedCallPositions ++ altState.callPositions
+      mergedRematerializable := altState.rematerializable.foldl (fun acc k v => acc.insert k v) mergedRematerializable
       -- Next alternative starts from where this one ended
       currentPos := altEndPos
-    -- For jpLiveIn variables, extend intervals to cover entire case construct
+    -- Ensure variables live across the case are live through the whole case span,
+    -- even if they are not used inside a particular alternative.
+    let caseRange : LiveRange := { start := minPos, end_ := basePos + 1 }
+    mergedIntervals := mergedLive.vars.foldl (fun acc v =>
+      match acc.get? v.idx with
+      | some iv =>
+        let ranges := LiveRange.mergeOverlapping (iv.ranges.push caseRange)
+        acc.insert v.idx { iv with ranges := ranges }
+      | none => acc
+    ) mergedIntervals
+    -- For variables live across the case (and jpLiveIn), extend intervals to cover the
+    -- entire case construct so they span calls and branches correctly.
     let jpLiveInVars := baseState.jpLiveIn.foldl (fun acc _ vars => acc.union vars) VarSet.empty
-    let finalIntervals := jpLiveInVars.vars.foldl (fun acc v =>
+    let varsToMerge := mergedLive.union jpLiveInVars
+    let finalIntervals := varsToMerge.vars.foldl (fun acc v =>
       match acc.get? v.idx with
       | some iv =>
         let merged := { iv with ranges := #[LiveRange.mergeAll iv.ranges] }
@@ -648,13 +681,14 @@ partial def computeLivenessBody (fnName : Name) (body : FnBody) : StateM Livenes
       pos := minPos,
       live := mergedLive,
       intervals := finalIntervals,
-      varTypes := mergedVarTypes
+      varTypes := mergedVarTypes,
+      callPositions := mergedCallPositions,
+      rematerializable := mergedRematerializable
     }
   | .ret arg => do
-    saveAndStep
     recordArgUse arg
-  | .jmp j args => do
     saveAndStep
+  | .jmp j args => do
     recordArgsUse args
     -- Propagate jpLiveIn: variables free in the join point body must be live here
     -- These variables are used in the JP body but defined outside it.
@@ -684,6 +718,7 @@ partial def computeLivenessBody (fnName : Name) (body : FnBody) : StateM Livenes
           let newIv := LiveInterval.single v ty s.pos (s.pos + 1)
           modify fun s => { s with intervals := s.intervals.insert v.idx newIv }
     | none => pure ()
+    saveAndStep
   | .unreachable =>
     saveAndStep
 
@@ -715,6 +750,7 @@ def computeLiveness (fnName : Name) (params : Array Param) (body : FnBody) (varT
   let numInstrs := countInstrs body
   let initState : LivenessState := {
     pos := numInstrs,
+    numInstrs := numInstrs,
     live := {},
     liveIn := {},
     liveOut := {},
