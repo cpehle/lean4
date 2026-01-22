@@ -31,13 +31,15 @@ open Lean.Compiler.Backend.ARM64
 def loadSpilledVar (v : VarId) (slot : Nat) : SelectM Reg := do
   let ty := (← read).varTypes.get? v.idx |>.getD .object
   let offset := slot * 8
-  let scratch ← acquireScratch
+  let scratch ← acquireScratchForType ty
   if ty == .uint8 then
     emit (Instr.ldrb (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
   else if ty == .uint16 then
     emit (Instr.ldrh (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
   else if ty == .uint32 then
     emit (Instr.ldrw (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
+  else if ty == .float32 then
+    emit (Instr.ldrs (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
   else
     emit (Instr.ldr (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
   return .phys scratch
@@ -51,20 +53,119 @@ def storeToStackSlot' (srcReg : Reg) (slot : Nat) (ty : IRType) : SelectM Unit :
     emit (Instr.strh srcReg (.mem (.phys .sp) offset))
   else if ty == .uint32 then
     emit (Instr.strw srcReg (.mem (.phys .sp) offset))
+  else if ty == .float32 then
+    emit (Instr.strs srcReg (.mem (.phys .sp) offset))
   else
     emit (Instr.str srcReg (.mem (.phys .sp) offset))
+
+/- Location for join point moves. -/
+inductive PhiLoc where
+  | reg (r : PhysReg)
+  | stack (slot : Nat)
+  | imm (val : Int)
+  deriving Inhabited, BEq, DecidableEq, Repr
+
+/- Move for join point parameter assignment. -/
+structure PhiMove where
+  src : PhiLoc
+  dst : PhiLoc
+  ty : IRType
+  deriving Inhabited, Repr
+
+/- Load a value from a stack slot into a register. -/
+def loadFromStackSlot (dst : Reg) (slot : Nat) (ty : IRType) : SelectM Unit := do
+  let offset := Int.ofNat (slot * 8)
+  if ty == .uint8 then
+    emit (Instr.ldrb dst (.mem (.phys .sp) offset))
+  else if ty == .uint16 then
+    emit (Instr.ldrh dst (.mem (.phys .sp) offset))
+  else if ty == .uint32 then
+    emit (Instr.ldrw dst (.mem (.phys .sp) offset))
+  else if ty == .float32 then
+    emit (Instr.ldrs dst (.mem (.phys .sp) offset))
+  else
+    emit (Instr.ldr dst (.mem (.phys .sp) offset))
+
+/- Emit a single join point move. -/
+def emitPhiMove (move : PhiMove) : SelectM Unit := do
+  match move.src, move.dst with
+  | .reg srcReg, .reg dstReg =>
+    if srcReg != dstReg then
+      emitMove (.phys dstReg) (.reg (.phys srcReg))
+  | .reg srcReg, .stack slot =>
+    storeToStackSlot' (.phys srcReg) slot move.ty
+  | .stack slot, .reg dstReg =>
+    loadFromStackSlot (.phys dstReg) slot move.ty
+  | .stack srcSlot, .stack dstSlot =>
+    if srcSlot != dstSlot then
+      let tmp ← acquireScratchForType move.ty
+      loadFromStackSlot (.phys tmp) srcSlot move.ty
+      storeToStackSlot' (.phys tmp) dstSlot move.ty
+      releaseScratch tmp
+  | .imm val, .reg dstReg =>
+    if move.ty == .float || move.ty == .float32 then
+      emitMove (.phys dstReg) (.reg (.phys PhysReg.xzr))
+    else
+      emit (Instr.mov (.phys dstReg) (.imm val))
+  | .imm val, .stack slot =>
+    let tmp ← acquireScratchForType move.ty
+    if move.ty == .float || move.ty == .float32 then
+      emitMove (.phys tmp) (.reg (.phys PhysReg.xzr))
+    else
+      emit (Instr.mov (.phys tmp) (.imm val))
+    storeToStackSlot' (.phys tmp) slot move.ty
+    releaseScratch tmp
+  | _, .imm _ =>
+    emitComment "ERROR: phi move to immediate"
+
+/- Emit parallel join point moves with cycle breaking. -/
+partial def emitParallelMoves (moves : Array PhiMove) : SelectM Unit := do
+  let rec loop (pending : Array PhiMove) (temps : Array PhysReg) : SelectM Unit := do
+    if pending.isEmpty then
+      pure ()
+    else
+      let sources := pending.foldl (init := #[]) fun acc m =>
+        match m.src with
+        | .imm _ => acc
+        | _ => if acc.contains m.src then acc else acc.push m.src
+      match pending.findIdx? (fun m => !(sources.contains m.dst)) with
+      | some idx =>
+        let m := pending[idx]!
+        emitPhiMove m
+        let pending' := pending.eraseIdx! idx
+        let temps' ←
+          match m.src with
+          | .reg r =>
+            if temps.contains r && !(pending'.any (fun p => p.src == .reg r)) then
+              releaseScratch r
+              pure (temps.filter (· != r))
+            else
+              pure temps
+          | _ => pure temps
+        loop pending' temps'
+      | none =>
+        let m := pending[0]!
+        let temp ← acquireScratchForType m.ty
+        emitPhiMove { src := m.src, dst := .reg temp, ty := m.ty }
+        let pending' := (pending.eraseIdx! 0).push { src := .reg temp, dst := m.dst, ty := m.ty }
+        loop pending' (temps.push temp)
+  loop moves #[]
 
 /-- Lower .case expression (pattern matching) -/
 def lowerCase (x : VarId) (xType : IRType) (alts : Array Alt)
     (selectBody : FnBody → SelectM Unit) : SelectM Unit := do
   let xReg ← varToReg x
+  let alloc ← getAllocResult
+  let xSpilled := (alloc.allocation.get? x.idx).isNone
 
   emitComment "case"
+
+  let tagReg ← acquireScratch
 
   -- Extract tag based on type
   if xType.isScalar then
     -- For scalar types, the value is already in the register
-    emit (Instr.mov (.phys PhysReg.x8) (.reg xReg))
+    emit (Instr.mov (.phys tagReg) (.reg xReg))
   else if xType.isObj then
     -- For `tagged` or `object` types, value can be scalar OR pointer at runtime
     let scalarLabel ← freshLabel "scalar_tag"
@@ -73,15 +174,15 @@ def lowerCase (x : VarId) (xType : IRType) (alts : Array Alt)
     emit (Instr.tst xReg (.imm 1))
     emit (Instr.bCond Cond.ne scalarLabel)
     -- Pointer case: load tag from object header
-    emit (Instr.ldrb (.phys PhysReg.x8) (.mem xReg 7))
+    emit (Instr.ldrb (.phys tagReg) (.mem xReg 7))
     emit (Instr.b compareLabel)
     -- Scalar case: unbox to get tag (shift right by 1)
     emit (Instr.label scalarLabel)
-    emit (Instr.lsr (.phys PhysReg.x8) xReg (.imm 1))
+    emit (Instr.lsr (.phys tagReg) xReg (.imm 1))
     emit (Instr.label compareLabel)
   else
     -- Unknown type, assume pointer
-    emit (Instr.ldrb (.phys PhysReg.x8) (.mem xReg 7))
+    emit (Instr.ldrb (.phys tagReg) (.mem xReg 7))
 
   let endLabel ← freshLabel "case_end"
 
@@ -94,7 +195,7 @@ def lowerCase (x : VarId) (xType : IRType) (alts : Array Alt)
     | .ctor info _ =>
       let label ← freshLabel "case_ctor"
       ctorLabels := ctorLabels.push (label, alt)
-      emit (Instr.cmp (.phys PhysReg.x8) (.imm (Int.ofNat info.cidx)))
+      emit (Instr.cmp (.phys tagReg) (.imm (Int.ofNat info.cidx)))
       emit (Instr.bCond Cond.eq label)
     | .default _ =>
       let label ← freshLabel "case_default"
@@ -103,6 +204,14 @@ def lowerCase (x : VarId) (xType : IRType) (alts : Array Alt)
   match defaultAlt with
   | some (label, _) => emit (Instr.b label)
   | none => emit (Instr.b endLabel)
+
+  releaseScratch tagReg
+  if xSpilled then
+    match xReg with
+    | .phys pr =>
+      if RegClass.scratch.contains pr then
+        releaseScratch pr
+    | _ => pure ()
 
   -- Emit constructor arms
   for (label, alt) in ctorLabels do
@@ -119,6 +228,21 @@ def lowerCase (x : VarId) (xType : IRType) (alts : Array Alt)
   | none => pure ()
 
   emit (Instr.label endLabel)
+  -- Unmatched tag: treat as unreachable but restore the stack to avoid fallthrough corruption.
+  let spillBytes ← getSpillBytes
+  if spillBytes > 0 then
+    emitStackAdd spillBytes
+  let usedGP ← getUsedCalleeSavedGP
+  let usedFP ← getUsedCalleeSavedFP
+  let fpPairs := getCalleeSavedFPPairs usedFP
+  let pairs := getCalleeSavedPairs usedGP
+  for pair in fpPairs.reverse do
+    emit (Instr.pop pair)
+  for pair in pairs.reverse do
+    emit (Instr.pop pair)
+  emit (Instr.pop #[Reg.phys PhysReg.x29, Reg.phys PhysReg.x30])
+  emit (Instr.bl "lean_internal_panic_unreachable")
+  emit Instr.ret
 
 /-- Lower .ret expression (function return) -/
 def lowerRet (arg : Arg) (retTy : IRType) (spillBytes : Nat) : SelectM Unit := do
@@ -138,12 +262,16 @@ def lowerRet (arg : Arg) (retTy : IRType) (spillBytes : Nat) : SelectM Unit := d
 
   -- Restore stack
   if spillBytes > 0 then
-    emit (Instr.add (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat spillBytes)))
+    emitStackAdd spillBytes
 
   -- Only restore callee-saved registers that were saved (reverse order of prologue)
   let usedGP ← getUsedCalleeSavedGP
+  let usedFP ← getUsedCalleeSavedFP
+  let fpPairs := getCalleeSavedFPPairs usedFP
   let pairs := getCalleeSavedPairs usedGP
   -- Pop in reverse order (last saved = first popped)
+  for pair in fpPairs.reverse do
+    emit (Instr.pop pair)
   for pair in pairs.reverse do
     emit (Instr.pop pair)
 
@@ -164,52 +292,40 @@ def lowerJmp (j : JoinPointId) (args : Array Arg) : SelectM Unit := do
     emit (Instr.b label)
   | some params =>
     let varTypes := (← read).varTypes
+    let getVarLoc? (v : VarId) : Option PhiLoc :=
+      match alloc.allocation.get? v.idx with
+      | some reg => some (.reg reg)
+      | none =>
+        match alloc.stackSlots.get? v.idx with
+        | some slot => some (.stack slot)
+        | none => none
+
     -- Phi resolution: move arguments into parameter locations
+    let mut moves : Array PhiMove := #[]
     for i in [:min args.size params.size] do
       let arg := args[i]!
       let param := params[i]!
+      let paramTy := varTypes.get? param.idx |>.getD IRType.object
+      let dstLoc? := getVarLoc? param
 
       match arg with
       | .var argVar =>
-        let argPhys := alloc.allocation.get? argVar.idx
-        let argSpill := alloc.stackSlots.get? argVar.idx
-        let paramPhys := alloc.allocation.get? param.idx
-        let paramSpill := alloc.stackSlots.get? param.idx
-
-        match argPhys, argSpill, paramPhys, paramSpill with
-        | some argReg, _, some paramReg, _ =>
-          -- Both in physical registers
-          if argReg != paramReg then
-            emit (Instr.mov (.phys paramReg) (.reg (.phys argReg)))
-        | some argReg, _, none, some paramSlot =>
-          -- Arg in register, param spilled to stack
-          let paramTy := varTypes.get? param.idx |>.getD IRType.object
-          storeToStackSlot' (.phys argReg) paramSlot paramTy
-        | none, some argSlot, some paramReg, _ =>
-          -- Arg spilled, param in register
-          let tmpReg ← loadSpilledVar argVar argSlot
-          emit (Instr.mov (.phys paramReg) (.reg tmpReg))
-        | none, some argSlot, none, some paramSlot =>
-          -- Both spilled to stack
-          if argSlot != paramSlot then
-            let tmpReg ← loadSpilledVar argVar argSlot
-            let paramTy := varTypes.get? param.idx |>.getD IRType.object
-            storeToStackSlot' tmpReg paramSlot paramTy
-        | _, _, _, _ =>
+        let srcLoc? := getVarLoc? argVar
+        match srcLoc?, dstLoc? with
+        | some srcLoc, some dstLoc =>
+          if srcLoc != dstLoc then
+            moves := moves.push { src := srcLoc, dst := dstLoc, ty := paramTy }
+        | _, _ =>
           emitComment s!"ERROR: phi arg vreg{argVar.idx} or param vreg{param.idx} not allocated!"
       | .erased =>
-        let paramPhys := alloc.allocation.get? param.idx
-        let paramSpill := alloc.stackSlots.get? param.idx
-        match paramPhys, paramSpill with
-        | some paramReg, _ =>
-          emit (Instr.mov (.phys paramReg) (.imm 0))
-        | none, some paramSlot =>
-          emit (Instr.mov (.phys PhysReg.x8) (.imm 0))
-          let paramTy := varTypes.get? param.idx |>.getD IRType.object
-          storeToStackSlot' (.phys PhysReg.x8) paramSlot paramTy
-        | _, _ =>
+        match dstLoc? with
+        | some dstLoc =>
+          let immVal := if paramTy.isObj then 1 else 0
+          moves := moves.push { src := .imm (Int.ofNat immVal), dst := dstLoc, ty := paramTy }
+        | none =>
           emitComment s!"ERROR: phi param vreg{param.idx} not allocated!"
 
+    emitParallelMoves moves
     let label ← getJPLabel j
     emit (Instr.b label)
 
@@ -249,8 +365,10 @@ def lowerSet (x : VarId) (i : Nat) (y : Arg) : SelectM Unit := do
     emit (Instr.str yReg (.mem xReg fieldOffset))
   | .erased =>
     -- lean_box(0) = 1
-    emit (Instr.mov (.phys PhysReg.x9) (.imm 1))
-    emit (Instr.str (.phys PhysReg.x9) (.mem xReg fieldOffset))
+    let tmp ← acquireScratch
+    emit (Instr.mov (.phys tmp) (.imm 1))
+    emit (Instr.str (.phys tmp) (.mem xReg fieldOffset))
+    releaseScratch tmp
   releaseAllScratch
 
 /-- Lower usize field set -/
@@ -276,6 +394,8 @@ def lowerSSet (x : VarId) (n : Nat) (offset : Nat) (y : VarId) (ty : IRType) : S
     emit (Instr.strh yReg (.mem xReg (Int.ofNat totalOffset)))
   else if ty == .uint32 then
     emit (Instr.strw yReg (.mem xReg (Int.ofNat totalOffset)))
+  else if ty == .float32 then
+    emit (Instr.strs yReg (.mem xReg (Int.ofNat totalOffset)))
   else
     emit (Instr.str yReg (.mem xReg (Int.ofNat totalOffset)))
   releaseAllScratch
@@ -285,10 +405,10 @@ def lowerSetTag (x : VarId) (tag : Nat) : SelectM Unit := do
   let xReg ← varToReg x
   emitComment s!"setTag {tag} (inline)"
   -- m_tag is at offset 7 in lean_object header (little-endian layout)
-  -- Use x9 if xReg is x8 to avoid overwriting the pointer
-  let tempReg := if xReg == .phys PhysReg.x8 then PhysReg.x9 else PhysReg.x8
+  let tempReg ← acquireScratch
   emit (Instr.mov (.phys tempReg) (.imm (Int.ofNat tag)))
   emit (Instr.strb (.phys tempReg) (.mem xReg 7))
+  releaseScratch tempReg
   releaseAllScratch
 
 end Lean.Compiler.Backend.ARM64.Lower.Control

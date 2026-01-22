@@ -182,10 +182,7 @@ def inlineFloatBinOp (op : String) (args : Array Arg) (dstReg : Reg)
       let v1Reg ← varToReg v1
       let v2Reg ← varToReg v2
       emitComment s!"inline lean_float_{op}"
-      emit (Instr.fmov FloatPrec.double (.phys PhysReg.v16) v1Reg)
-      emit (Instr.fmov FloatPrec.double (.phys PhysReg.v17) v2Reg)
-      emitOp FloatPrec.double (.phys PhysReg.v16) (.phys PhysReg.v16) (.phys PhysReg.v17)
-      emit (Instr.fmov FloatPrec.double dstReg (.phys PhysReg.v16))
+      emitOp FloatPrec.double dstReg v1Reg v2Reg
       return true
     | _, _ => return false
   else
@@ -199,9 +196,7 @@ def inlineFloatUnaryOp (op : String) (args : Array Arg) (dstReg : Reg)
     | .var v =>
       let vReg ← varToReg v
       emitComment s!"inline lean_float_{op}"
-      emit (Instr.fmov FloatPrec.double (.phys PhysReg.v16) vReg)
-      emitOp FloatPrec.double (.phys PhysReg.v16) (.phys PhysReg.v16)
-      emit (Instr.fmov FloatPrec.double dstReg (.phys PhysReg.v16))
+      emitOp FloatPrec.double dstReg vReg
       return true
     | .erased => return false
   else
@@ -215,13 +210,12 @@ def inlineFloatCmp (cond : Cond) (args : Array Arg) (dstReg : Reg) : SelectM Boo
       let v1Reg ← varToReg v1
       let v2Reg ← varToReg v2
       emitComment "inline float comparison"
-      emit (Instr.fmov FloatPrec.double (.phys PhysReg.v16) v1Reg)
-      emit (Instr.fmov FloatPrec.double (.phys PhysReg.v17) v2Reg)
-      emit (Instr.fcmp FloatPrec.double (.phys PhysReg.v16) (.phys PhysReg.v17))
+      emit (Instr.fcmp FloatPrec.double v1Reg v2Reg)
       -- Returns decidable: isTrue (boxed 0) or isFalse (boxed 1)
-      emit (Instr.mov (.phys PhysReg.x8) (.imm 1))  -- isTrue tag = 0, boxed = 1
-      emit (Instr.mov (.phys PhysReg.x9) (.imm 3))  -- isFalse tag = 1, boxed = 3
-      emit (Instr.csel dstReg (.phys PhysReg.x8) (.phys PhysReg.x9) cond)
+      emit (Instr.cset dstReg cond)                 -- 1 if true, 0 otherwise
+      emit (Instr.eor dstReg dstReg (.imm 1))       -- invert
+      emit (Instr.lsl dstReg dstReg (.imm 1))       -- 0 or 2
+      emit (Instr.add dstReg dstReg (.imm 1))       -- 1 or 3
       return true
     | _, _ => return false
   else
@@ -235,12 +229,10 @@ def inlineFloatBeq (args : Array Arg) (dstReg : Reg) : SelectM Bool := do
       let v1Reg ← varToReg v1
       let v2Reg ← varToReg v2
       emitComment "inline lean_float_beq"
-      emit (Instr.fmov FloatPrec.double (.phys PhysReg.v16) v1Reg)
-      emit (Instr.fmov FloatPrec.double (.phys PhysReg.v17) v2Reg)
-      emit (Instr.fcmp FloatPrec.double (.phys PhysReg.v16) (.phys PhysReg.v17))
+      emit (Instr.fcmp FloatPrec.double v1Reg v2Reg)
       -- Set result to 1 if equal, 0 otherwise
-      emit (Instr.mov (.phys PhysReg.x8) (.imm 1))
-      emit (Instr.csel dstReg (.phys PhysReg.x8) (.phys PhysReg.xzr) Cond.eq)
+      emit (Instr.mov dstReg (.imm 1))
+      emit (Instr.csel dstReg dstReg (.phys PhysReg.xzr) Cond.eq)
       return true
     | _, _ => return false
   else
@@ -264,11 +256,11 @@ def inlineMkEmptyArrayWithCapacity (args : Array Arg) (dstReg : Reg) : SelectM B
       | _ =>
         emit (Instr.mov (.phys PhysReg.x0) (.reg capReg))
       if treatAsScalar then
-        emit (Instr.bl "_lean_unsigned_to_nat")
+        emit (Instr.bl "_lean_unsigned_to_nat_export")
       emit (Instr.bl "_lean_mk_empty_array_with_capacity")
     | .erased =>
       emit (Instr.mov (.phys PhysReg.x0) (.imm 0))
-      emit (Instr.bl "_lean_unsigned_to_nat")
+      emit (Instr.bl "_lean_unsigned_to_nat_export")
       emit (Instr.bl "_lean_mk_empty_array_with_capacity")
     if dstReg != .phys PhysReg.x0 then
       emitMove dstReg (.reg (.phys PhysReg.x0))
