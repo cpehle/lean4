@@ -31,3 +31,5 @@ wdErr.txt
 wdIn.txt
 wdOut.txt
 downstream_releases/
+.DS_Store
+AGENTS.md
