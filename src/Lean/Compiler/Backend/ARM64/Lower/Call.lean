@@ -8,8 +8,10 @@ module
 
 prelude
 public import Lean.Compiler.Backend.ARM64.Lower.Base
+public import Lean.Compiler.ExportAttr
 public import Lean.Compiler.ExternAttr
 public import Lean.Compiler.ClosedTermCache
+public import Lean.Compiler.ModPkgExt
 
 public section
 
@@ -44,29 +46,48 @@ def isUserDefinedFunction (f : FunId) : SelectM Bool := do
   -- Closed terms are global constants, not callable functions
   if isClosedTermName env f then return false
   match findEnvDecl' env f with
-  | some (.fdecl ..) => return true  -- User-defined function
+  | some (.fdecl _ params ..) =>
+    let arity := params.foldl (init := 0) fun acc p =>
+      if p.ty.isVoid then acc else acc + 1
+    if arity == 0 then
+      return false
+    return true  -- User-defined function
   | _ => return false  -- Extern or unknown - don't tail call
 
 /-- Get the mangled function name for a FunId -/
 def getFunctionName (f : FunId) : SelectM String := do
-  -- Special case: main function is called _lean_main
-  if f == `main then return "_lean_main"
-
   let env ← getEnv
+  let withSymbolPrefix (name : String) : String :=
+    if name.startsWith "_" then name else s!"_{name}"
+  let defaultSymbolName : String :=
+    if f == `main then "_lean_main" else withSymbolPrefix (Lean.getSymbolStem env f)
+  let exportSymbolName? : Option String :=
+    match Lean.getExportNameFor? env f with
+    | some (.str .anonymous s) => some (withSymbolPrefix s)
+    | some _ => panic! s!"invalid export name '{f}'"
+    | none => none
   match findEnvDecl' env f with
   | some (.extern _ _ _ extData) =>
     -- Try to get the C function name from extern data
     match getExternEntryFor extData `c with
-    | some (.standard _ cName) => return s!"_{cName}"
-    | _ => return "_" ++ Name.mangle f "l_"
-  | _ => return "_" ++ Name.mangle f "l_"
+    | some (.standard _ cName) => return withSymbolPrefix cName
+    | _ => return defaultSymbolName
+  | _ =>
+    match exportSymbolName? with
+    | some exportName => return exportName
+    | none => return defaultSymbolName
 
 /-- Get the arity of a function -/
 def getFunctionArity (f : FunId) : SelectM Nat := do
   let env ← getEnv
   match findEnvDecl' env f with
-  | some (.fdecl _ params ..) => return params.size
-  | some (.extern _ params ..) => return params.size
+  | some (.fdecl _ params ..) =>
+    return params.foldl (init := 0) fun acc p =>
+      if p.ty.isVoid then acc else acc + 1
+  | some (.extern _ params ..) =>
+    let externC := isExternC env f
+    return params.foldl (init := 0) fun acc p =>
+      if p.ty.isVoid || (externC && p.ty.isErased) then acc else acc + 1
   | none => return 0
 
 /-- Get parameter types for a function -/
@@ -74,13 +95,14 @@ def getParamTypes (f : FunId) (args : Array Arg) : SelectM (Array Arg × Array I
   let env ← getEnv
   match findEnvDecl' env f with
   | some (.extern _ params ..) =>
+    let externC := isExternC env f
     let mut acc := #[]
     let mut types := #[]
     for idx in [:args.size] do
       let arg := args[idx]!
       if h : idx < params.size then
         let param := params[idx]!
-        if !param.ty.isErased then
+        if !param.ty.isVoid && (!externC || !param.ty.isErased) then
           acc := acc.push arg
           types := types.push param.ty
       else
@@ -94,7 +116,7 @@ def getParamTypes (f : FunId) (args : Array Arg) : SelectM (Array Arg × Array I
       let arg := args[idx]!
       if h : idx < params.size then
         let param := params[idx]!
-        if !param.ty.isErased then
+        if !param.ty.isVoid then
           acc := acc.push arg
           types := types.push param.ty
       else
@@ -140,6 +162,16 @@ def lowerGlobalLoad (dst : VarId) (f : FunId) (dstType : IRType) : SelectM Unit 
     storeSpilledDst dst dstReg
   releaseAllScratch
 
+/-- Release scratch register used for a spilled variable. -/
+def releaseScratchIfSpilled (v : VarId) (reg : Reg) : SelectM Unit := do
+  let alloc ← getAllocResult
+  if (alloc.allocation.get? v.idx).isNone then
+    match reg with
+    | .phys pr =>
+      if RegClass.scratch.contains pr || RegClass.fpScratch.contains pr then
+        releaseScratch pr
+    | _ => pure ()
+
 /-- Setup argument in register for function call -/
 def setupCallArg (i : Nat) (arg : Arg) (paramTy : IRType) : SelectM Unit := do
   let isFloat := paramTy == IRType.float || paramTy == IRType.float32
@@ -153,9 +185,41 @@ def setupCallArg (i : Nat) (arg : Arg) (paramTy : IRType) : SelectM Unit := do
     else
       let argReg := getArgReg i
       emitMove (.phys argReg) (.reg vReg)
+    releaseScratchIfSpilled v vReg
   | .erased =>
     let argReg := getArgReg i
     emit (Instr.mov (.phys argReg) (.imm 1))  -- lean_box(0)
+
+/-- Load an argument into a GP register, honoring rematerializable constants and stack offsets. -/
+def loadArgToGP (dst : PhysReg) (arg : Arg) (stackOffset : Nat) : SelectM Unit := do
+  match arg with
+  | .erased =>
+    emit (Instr.mov (.phys dst) (.imm 1))
+  | .var v =>
+    let alloc ← getAllocResult
+    match alloc.allocation.get? v.idx with
+    | some phys =>
+      if phys != dst then
+        emitMove (.phys dst) (.reg (.phys phys))
+    | none =>
+      match alloc.rematerializable.get? v.idx with
+      | some constVal =>
+        loadImm64 (.phys dst) constVal.toNat
+      | none =>
+        match alloc.stackSlots.get? v.idx with
+        | some slot =>
+          let offset := Int.ofNat (stackOffset + slot * 8)
+          let ty := (← getVarType v).getD .object
+          if ty == .uint8 then
+            emit (Instr.ldrb (.phys dst) (.mem (.phys PhysReg.sp) offset))
+          else if ty == .uint16 then
+            emit (Instr.ldrh (.phys dst) (.mem (.phys PhysReg.sp) offset))
+          else if ty == .uint32 || ty == .float32 then
+            emit (Instr.ldrw (.phys dst) (.mem (.phys PhysReg.sp) offset))
+          else
+            emit (Instr.ldr (.phys dst) (.mem (.phys PhysReg.sp) offset))
+        | none =>
+          emitComment s!"ERROR: arg var{v.idx} not allocated!"
 
 /-- Handle result from function call -/
 def handleCallResult (dstReg : Reg) (dstType : IRType) : SelectM Unit := do
@@ -196,13 +260,68 @@ def lowerSelfTailCall (f : FunId) (args : Array Arg) : SelectM Unit := do
     let paramTy := if i < paramTypes.size then paramTypes[i]! else IRType.object
     setupCallArg i callArgs[i]! paramTy
 
+  -- If more than 8 args, fall back to a normal call with stack args
+  if callArgs.size > 8 then
+    emitComment "WARNING: self tail call with >8 args, falling back to regular call"
+    let extra := callArgs.size - 8
+    let extraBytes := extra * 8
+    let stackBytes := ((extraBytes + 15) / 16) * 16
+
+    if stackBytes > 0 then
+      emitStackSub stackBytes
+
+    if extra > 0 then
+      let alloc ← getAllocResult
+      for j in [:extra] do
+        let argIdx := j + 8
+        let offset := Int.ofNat (j * 8)
+        match callArgs[argIdx]! with
+        | .var v =>
+          match alloc.allocation.get? v.idx with
+          | some phys =>
+            emit (Instr.str (.phys phys) (.mem (.phys PhysReg.sp) offset))
+          | none =>
+            let tmp ← acquireScratch
+            loadArgToGP tmp (.var v) stackBytes
+            emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
+            releaseScratch tmp
+        | .erased =>
+          let tmp ← acquireScratch
+          emit (Instr.mov (.phys tmp) (.imm 1))
+          emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
+          releaseScratch tmp
+
+    emit (Instr.bl fnName)
+
+    if stackBytes > 0 then
+      emitStackAdd stackBytes
+
+    if spillBytes > 0 then
+      emitStackAdd spillBytes
+
+    let usedGP ← getUsedCalleeSavedGP
+    let usedFP ← getUsedCalleeSavedFP
+    let fpPairs := getCalleeSavedFPPairs usedFP
+    let pairs := getCalleeSavedPairs usedGP
+    for pair in fpPairs.reverse do
+      emit (Instr.pop pair)
+    for pair in pairs.reverse do
+      emit (Instr.pop pair)
+    emit (Instr.pop #[Reg.phys PhysReg.x29, Reg.phys PhysReg.x30])
+    emit Instr.ret
+    return
+
   -- Restore stack frame (epilogue without ret)
   if spillBytes > 0 then
-    emit (Instr.add (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat spillBytes)))
+    emitStackAdd spillBytes
 
   -- Only restore callee-saved registers that were saved (reverse order of prologue)
   let usedGP ← getUsedCalleeSavedGP
+  let usedFP ← getUsedCalleeSavedFP
+  let fpPairs := getCalleeSavedFPPairs usedFP
   let pairs := getCalleeSavedPairs usedGP
+  for pair in fpPairs.reverse do
+    emit (Instr.pop pair)
   for pair in pairs.reverse do
     emit (Instr.pop pair)
 
@@ -231,13 +350,47 @@ def lowerTailCall (f : FunId) (args : Array Arg) : SelectM Unit := do
   -- clean up our frame first. For now, only support <= 8 args in tail calls.
   if callArgs.size > 8 then
     emitComment "WARNING: tail call with >8 args, falling back to regular call"
-    -- Fall back to regular call - this is a limitation
-    -- We can't easily tail-call with stack args because our frame is in the way
+    let extra := callArgs.size - 8
+    let extraBytes := extra * 8
+    let stackBytes := ((extraBytes + 15) / 16) * 16
+
+    if stackBytes > 0 then
+      emitStackSub stackBytes
+
+    if extra > 0 then
+      let alloc ← getAllocResult
+      for j in [:extra] do
+        let argIdx := j + 8
+        let offset := Int.ofNat (j * 8)
+        match callArgs[argIdx]! with
+        | .var v =>
+          match alloc.allocation.get? v.idx with
+          | some phys =>
+            emit (Instr.str (.phys phys) (.mem (.phys PhysReg.sp) offset))
+          | none =>
+            let tmp ← acquireScratch
+            loadArgToGP tmp (.var v) stackBytes
+            emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
+            releaseScratch tmp
+        | .erased =>
+          let tmp ← acquireScratch
+          emit (Instr.mov (.phys tmp) (.imm 1))
+          emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
+          releaseScratch tmp
+
     emit (Instr.bl fnName)
+
+    if stackBytes > 0 then
+      emitStackAdd stackBytes
+
     if spillBytes > 0 then
-      emit (Instr.add (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat spillBytes)))
+      emitStackAdd spillBytes
     let usedGP ← getUsedCalleeSavedGP
+    let usedFP ← getUsedCalleeSavedFP
+    let fpPairs := getCalleeSavedFPPairs usedFP
     let pairs := getCalleeSavedPairs usedGP
+    for pair in fpPairs.reverse do
+      emit (Instr.pop pair)
     for pair in pairs.reverse do
       emit (Instr.pop pair)
     emit (Instr.pop #[Reg.phys PhysReg.x29, Reg.phys PhysReg.x30])
@@ -246,11 +399,15 @@ def lowerTailCall (f : FunId) (args : Array Arg) : SelectM Unit := do
 
   -- Restore stack frame (epilogue without ret)
   if spillBytes > 0 then
-    emit (Instr.add (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat spillBytes)))
+    emitStackAdd spillBytes
 
   -- Only restore callee-saved registers that were saved (reverse order of prologue)
   let usedGP ← getUsedCalleeSavedGP
+  let usedFP ← getUsedCalleeSavedFP
+  let fpPairs := getCalleeSavedFPPairs usedFP
   let pairs := getCalleeSavedPairs usedGP
+  for pair in fpPairs.reverse do
+    emit (Instr.pop pair)
   for pair in pairs.reverse do
     emit (Instr.pop pair)
 
@@ -273,6 +430,7 @@ def lowerFap (dst : VarId) (dstType : IRType) (f : FunId) (args : Array Arg)
   if ← tryInline fnName args dstReg then
     if isSpilled then
       storeSpilledDst dst dstReg
+    releaseAllScratch
     return
 
   -- NOTE: Tail call optimization is now handled at the IR level
@@ -294,7 +452,7 @@ def lowerFap (dst : VarId) (dstType : IRType) (f : FunId) (args : Array Arg)
   let stackBytes := ((extraBytes + 15) / 16) * 16
 
   if stackBytes > 0 then
-    emit (Instr.sub (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat stackBytes)))
+    emitStackSub stackBytes
 
   -- Store extra arguments to stack
   if extra > 0 then
@@ -308,21 +466,20 @@ def lowerFap (dst : VarId) (dstType : IRType) (f : FunId) (args : Array Arg)
         | some phys =>
           emit (Instr.str (.phys phys) (.mem (.phys PhysReg.sp) offset))
         | none =>
-          match alloc.stackSlots.get? v.idx with
-          | some slot =>
-            let oldOffset := Int.ofNat (stackBytes + slot * 8)
-            emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) oldOffset))
-            emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
-          | none =>
-            emitComment s!"ERROR: arg var{v.idx} not allocated!"
+          let tmp ← acquireScratch
+          loadArgToGP tmp (.var v) stackBytes
+          emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
+          releaseScratch tmp
       | .erased =>
-        emit (Instr.mov (.phys PhysReg.x8) (.imm 1))
-        emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
+        let tmp ← acquireScratch
+        emit (Instr.mov (.phys tmp) (.imm 1))
+        emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
+        releaseScratch tmp
 
   emit (Instr.bl fnName)
 
   if stackBytes > 0 then
-    emit (Instr.add (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat stackBytes)))
+    emitStackAdd stackBytes
 
   handleCallResult dstReg dstType
 
@@ -333,15 +490,24 @@ def lowerFap (dst : VarId) (dstType : IRType) (f : FunId) (args : Array Arg)
 /-- Lower .pap (partial application / closure creation) -/
 def lowerPap (dst : VarId) (f : FunId) (args : Array Arg) : SelectM Unit := do
   let (dstReg, isSpilled) ← getDstReg dst
-  let alloc ← getAllocResult
 
   emitComment s!"partial application {f} with {args.size} args"
   let fnName ← getFunctionName f
   let arity ← getFunctionArity f
 
   -- Allocate closure: lean_alloc_closure(fn, arity, num_args)
-  emit (Instr.adrp (.phys PhysReg.x0) s!"{fnName}@PAGE")
-  emit (Instr.add (.phys PhysReg.x0) (.phys PhysReg.x0) (.label s!"{fnName}@PAGEOFF"))
+  -- Use direct address for internal functions; use GOT for externs on macOS.
+  let env ← getEnv
+  let useGOT :=
+    match findEnvDecl' env f with
+    | some (.extern ..) => true
+    | _ => false
+  if useGOT then
+    emit (Instr.adrp (.phys PhysReg.x0) s!"{fnName}@GOTPAGE")
+    emit (Instr.ldr (.phys PhysReg.x0) (.reg (.phys PhysReg.x0)) s!", {fnName}@GOTPAGEOFF")
+  else
+    emit (Instr.adrp (.phys PhysReg.x0) s!"{fnName}@PAGE")
+    emit (Instr.add (.phys PhysReg.x0) (.phys PhysReg.x0) (.label s!"{fnName}@PAGEOFF"))
   emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat arity)))
   emit (Instr.mov (.phys PhysReg.x2) (.imm (Int.ofNat args.size)))
   emit (Instr.bl "_lean_alloc_closure")
@@ -350,57 +516,30 @@ def lowerPap (dst : VarId) (f : FunId) (args : Array Arg) : SelectM Unit := do
     if dstReg != .phys PhysReg.x0 then
       emitMove dstReg (.reg (.phys PhysReg.x0))
   else
-    -- Check if dstReg is callee-saved (x19-x28)
-    let isCalleeSaved := match dstReg with
-      | .phys p => p.toNat >= 19 && p.toNat <= 28
-      | _ => false
-
-    if isCalleeSaved then
-      emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
-      for i in [:args.size] do
-        emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
-        emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat i)))
-        match args[i]! with
-        | .var v =>
-          let vReg ← varToReg v
-          emitMove (.phys PhysReg.x2) (.reg vReg)
-        | .erased =>
-          emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
-        emit (Instr.bl "_lean_closure_set")
-    else if isSpilled then
-      -- Use stack slot to hold closure across calls
-      match alloc.stackSlots.get? dst.idx with
-      | some slot =>
-        let offset := Int.ofNat (slot * 8)
-        emitComment s!"store closure to stack slot {slot}"
-        emit (Instr.str (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) offset))
-        for i in [:args.size] do
-          emit (Instr.ldr (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) offset))
-          emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat i)))
-          match args[i]! with
-          | .var v =>
-            let vReg ← varToReg v
-            emitMove (.phys PhysReg.x2) (.reg vReg)
-          | .erased =>
-            emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
-          emit (Instr.bl "_lean_closure_set")
-        emit (Instr.ldr dstReg (.mem (.phys PhysReg.sp) offset))
-        releaseAllScratch
-        return  -- Spill already handled
-      | none =>
-        emitMove dstReg (.reg (.phys PhysReg.x0))
-    else
+    -- Preserve the closure pointer across _lean_closure_set calls.
+    -- Prefer the per-function temp slot to avoid extra stack adjustment.
+    let tempSlotOffset? ← getTempSlotOffset
+    let (slotOffset, stackAdjust) :=
+      match tempSlotOffset? with
+      | some off => (off, 0)
+      | none => (Int.ofNat 0, 16)
+    if stackAdjust > 0 then
+      emitStackSub stackAdjust
+    emit (Instr.str (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) slotOffset))
+    for i in [:args.size] do
+      emit (Instr.ldr (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) slotOffset))
+      emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat i)))
+      match args[i]! with
+      | .var v =>
+        loadArgToGP PhysReg.x2 (.var v) stackAdjust
+      | .erased =>
+        emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
+      emit (Instr.bl "_lean_closure_set")
+    emit (Instr.ldr (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) slotOffset))
+    if stackAdjust > 0 then
+      emitStackAdd stackAdjust
+    if dstReg != .phys PhysReg.x0 then
       emitMove dstReg (.reg (.phys PhysReg.x0))
-      for i in [:args.size] do
-        emit (Instr.mov (.phys PhysReg.x0) (.reg dstReg))
-        emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat i)))
-        match args[i]! with
-        | .var v =>
-          let vReg ← varToReg v
-          emitMove (.phys PhysReg.x2) (.reg vReg)
-        | .erased =>
-          emit (Instr.mov (.phys PhysReg.x2) (.imm 1))
-        emit (Instr.bl "_lean_closure_set")
 
   if isSpilled then
     storeSpilledDst dst dstReg
@@ -421,16 +560,41 @@ def lowerAp (dst : VarId) (x : VarId) (args : Array Arg) : SelectM Unit := do
     let maxArgs := closureMaxArgs
     if args.size ≤ maxArgs then
       let n := args.size
+      let extra := if n > 7 then n - 7 else 0
+      let extraBytes := extra * 8
+      let stackBytes := ((extraBytes + 15) / 16) * 16
+      if stackBytes > 0 then
+        emitStackSub stackBytes
       emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
-      for i in [:n] do
+      for i in [:min n 7] do
         let argReg := getArgReg (i + 1)
         match args[i]! with
         | .var v =>
-          let vReg ← varToReg v
-          emit (Instr.mov (.phys argReg) (.reg vReg))
+          loadArgToGP argReg (.var v) stackBytes
         | .erased =>
           emit (Instr.mov (.phys argReg) (.imm 1))
+      if extra > 0 then
+        for j in [:extra] do
+          let argIdx := j + 7
+          let offset := Int.ofNat (j * 8)
+          match args[argIdx]! with
+          | .var v =>
+            match alloc.allocation.get? v.idx with
+            | some phys =>
+              emit (Instr.str (.phys phys) (.mem (.phys PhysReg.sp) offset))
+            | none =>
+              let tmp ← acquireScratch
+              loadArgToGP tmp (.var v) stackBytes
+              emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
+              releaseScratch tmp
+          | .erased =>
+            let tmp ← acquireScratch
+            emit (Instr.mov (.phys tmp) (.imm 1))
+            emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
+            releaseScratch tmp
       emit (Instr.bl s!"_lean_apply_{n}")
+      if stackBytes > 0 then
+        emitStackAdd stackBytes
       if dstReg != .phys PhysReg.x0 then
         emitMove dstReg (.reg (.phys PhysReg.x0))
     else
@@ -438,7 +602,7 @@ def lowerAp (dst : VarId) (x : VarId) (args : Array Arg) : SelectM Unit := do
       let argBytes := args.size * 8
       let totalBytes := ((argBytes + 15) / 16) * 16
       if totalBytes > 0 then
-        emit (Instr.sub (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat totalBytes)))
+        emitStackSub totalBytes
       for i in [:args.size] do
         let offset := Int.ofNat (i * 8)
         match args[i]! with
@@ -447,22 +611,21 @@ def lowerAp (dst : VarId) (x : VarId) (args : Array Arg) : SelectM Unit := do
           | some phys =>
             emit (Instr.str (.phys phys) (.mem (.phys PhysReg.sp) offset))
           | none =>
-            match alloc.stackSlots.get? v.idx with
-            | some slot =>
-              let oldOffset := Int.ofNat (totalBytes + slot * 8)
-              emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) oldOffset))
-              emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
-            | none =>
-              emitComment s!"ERROR: arg var{v.idx} not allocated!"
+            let tmp ← acquireScratch
+            loadArgToGP tmp (.var v) totalBytes
+            emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
+            releaseScratch tmp
         | .erased =>
-          emit (Instr.mov (.phys PhysReg.x8) (.imm 0))
-          emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) offset))
+          let tmp ← acquireScratch
+          emit (Instr.mov (.phys tmp) (.imm 1))
+          emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
+          releaseScratch tmp
       emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
       emit (Instr.mov (.phys PhysReg.x1) (.imm (Int.ofNat args.size)))
       emit (Instr.mov (.phys PhysReg.x2) (.reg (.phys PhysReg.sp)))
       emit (Instr.bl "_lean_apply_m")
       if totalBytes > 0 then
-        emit (Instr.add (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat totalBytes)))
+        emitStackAdd totalBytes
       if dstReg != .phys PhysReg.x0 then
         emitMove dstReg (.reg (.phys PhysReg.x0))
 
@@ -547,6 +710,26 @@ def lowerUnbox (dst : VarId) (dstType : IRType) (x : VarId) : SelectM Unit := do
     storeSpilledDst dst dstReg
   releaseAllScratch
 
+/-- Register a string literal for data emission and return its data label. -/
+private def registerStringLiteral (s : String) : SelectM String := do
+  let state ← get
+  let fnName ← getFnName
+  let fnSuffix := sanitizeForLabel fnName.toString
+  let strId := state.buffer.nextStringId
+  let dataLabel := s!"_str_{fnSuffix}_{strId}_data"
+  modify fun st => { st with
+    buffer := { st.buffer with
+      stringLits := st.buffer.stringLits.push {
+        id := strId
+        ptrLabel := dataLabel
+        dataLabel := dataLabel
+        value := s
+      }
+      nextStringId := strId + 1
+    }
+  }
+  return dataLabel
+
 /-- Lower numeric literal -/
 def lowerLitNum (dst : VarId) (dstType : IRType) (n : Nat) : SelectM Unit := do
   let (dstReg, isSpilled) ← getDstReg dst
@@ -573,37 +756,43 @@ def lowerLitNum (dst : VarId) (dstType : IRType) (n : Nat) : SelectM Unit := do
         storeSpilledDst dst dstReg
     else
       -- Need heap allocation - cannot rematerialize
-      loadImm64 (.phys PhysReg.x0) n
-      emit (Instr.bl "_lean_unsigned_to_nat")
+      if n < (1 <<< 64) then
+        loadImm64 (.phys PhysReg.x0) n
+        emit (Instr.bl "_lean_nat_of_uint64")
+      else
+        let dataLabel ← registerStringLiteral (toString n)
+        emit (Instr.adrp (.phys PhysReg.x0) s!"{dataLabel}@PAGE")
+        emit (Instr.add (.phys PhysReg.x0) (.phys PhysReg.x0) (.label s!"{dataLabel}@PAGEOFF"))
+        emit (Instr.bl "_lean_cstr_to_nat")
       if dstReg != .phys PhysReg.x0 then
         emitMove dstReg (.reg (.phys PhysReg.x0))
       if isSpilled then
         storeSpilledDst dst dstReg
   releaseAllScratch
 
+/-- Escape a string for a single-line comment preview. -/
+private def escapeForComment (s : String) : String :=
+  s.foldl (init := "") fun acc c =>
+    match c with
+    | '\n' => acc ++ "\\n"
+    | '\r' => acc ++ "\\r"
+    | '\t' => acc ++ "\\t"
+    | _ =>
+      let n := c.toNat
+      if n < 32 || n > 126 then
+        acc ++ "?"
+      else
+        acc.push c
+
 /-- Lower string literal -/
 def lowerLitStr (dst : VarId) (s : String) : SelectM Unit := do
   let (dstReg, isSpilled) ← getDstReg dst
 
-  emitComment s!"lit string \"{s.take 20}...\""
+  let preview := escapeForComment ((s.take 20).toString)
+  let suffix := if s.length > 20 then "..." else ""
+  emitComment s!"lit string \"{preview}{suffix}\""
 
-  -- Register string literal with unique labels (include function name)
-  let state ← get
-  let fnName ← getFnName
-  let fnSuffix := sanitizeForLabel fnName.toString
-  let strId := state.buffer.nextStringId
-  let dataLabel := s!"_str_{fnSuffix}_{strId}_data"
-  modify fun st => { st with
-    buffer := { st.buffer with
-      stringLits := st.buffer.stringLits.push {
-        id := strId
-        ptrLabel := dataLabel  -- We only need the data label now
-        dataLabel := dataLabel
-        value := s
-      }
-      nextStringId := strId + 1
-    }
-  }
+  let dataLabel ← registerStringLiteral s
 
   -- Get the UTF-8 byte length of the string
   let byteLen := s.toUTF8.size
@@ -634,25 +823,40 @@ def lowerIsShared (dst : VarId) (x : VarId) : SelectM Unit := do
   emitComment "isShared (inline)"
 
   -- If xReg and dstReg are the same, we need to save xReg first
-  let ptrReg := if xReg == dstReg then Reg.phys PhysReg.x9 else xReg
-  if xReg == dstReg then
-    emit (Instr.mov ptrReg (.reg xReg))
+  let (ptrReg, ptrScratch) ←
+    if xReg == dstReg then
+      let tmp ← acquireScratch
+      emit (Instr.mov (.phys tmp) (.reg xReg))
+      pure (.phys tmp, some tmp)
+    else
+      pure (xReg, none)
 
-  -- Check if tagged pointer (low bit set) - if tagged, not shared
+  -- Check if tagged pointer (low bit set) - if tagged, treat as shared
   emit (Instr.tst ptrReg (.imm 1))
   let doneLabel ← freshLabel "is_shared_done"
-  emit (Instr.mov dstReg (.imm 0))  -- Default to 0 (not shared)
-  emit (Instr.bCond Cond.ne doneLabel)  -- If tagged, skip to done
+  let scalarLabel ← freshLabel "is_shared_scalar"
+  emit (Instr.bCond Cond.ne scalarLabel)
 
   -- Not tagged, check reference count
   -- m_rc is at offset 0, 4 bytes (int32_t)
-  emit (Instr.ldrw (.phys PhysReg.x8) (.mem ptrReg 0))
+  let rcReg ← acquireScratch
+  emit (Instr.ldrw (.phys rcReg) (.mem ptrReg 0))
   -- The IR `isShared` instruction implements `!lean_is_exclusive`, i.e., rc != 1
   -- (This includes persistent objects with rc=0 and shared objects with rc>=2)
-  emit (Instr.cmp (.phys PhysReg.x8) (.imm 1))
+  emit (Instr.cmp (.phys rcReg) (.imm 1))
   emit (Instr.cset dstReg Cond.ne)  -- dstReg = 1 if rc != 1
+  releaseScratch rcReg
+  emit (Instr.b doneLabel)
+
+  -- Tagged scalars are treated as shared (not reusable)
+  emit (Instr.label scalarLabel)
+  emit (Instr.mov dstReg (.imm 1))
 
   emit (Instr.label doneLabel)
+
+  match ptrScratch with
+  | some pr => releaseScratch pr
+  | none => pure ()
 
   if isSpilled then
     storeSpilledDst dst dstReg

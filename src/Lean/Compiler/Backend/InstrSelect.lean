@@ -170,13 +170,14 @@ Handles stack frame setup and teardown.
 /-- Emit function prologue with dynamic callee-saved register saving -/
 def emitPrologue (spillBytes : Nat) (numSpilled : Nat) : SelectM Unit := do
   let usedGP ← getUsedCalleeSavedGP
+  let usedFP ← getUsedCalleeSavedFP
   let isBoxed ← getIsBoxed
 
   emit (Instr.push #[Reg.phys PhysReg.x29, Reg.phys PhysReg.x30])
   emit (Instr.mov (.phys PhysReg.x29) (.reg (.phys PhysReg.sp)))
 
   -- For boxed wrappers, save all registers; for normal functions, only save used
-  let pairs := if isBoxed then
+  let gpPairs := if isBoxed then
     -- Boxed wrappers call other code - must save all callee-saved registers
     #[#[Reg.phys PhysReg.x19, Reg.phys PhysReg.x20],
       #[Reg.phys PhysReg.x21, Reg.phys PhysReg.x22],
@@ -187,22 +188,37 @@ def emitPrologue (spillBytes : Nat) (numSpilled : Nat) : SelectM Unit := do
     -- Normal functions: only save callee-saved register pairs that are actually used
     getCalleeSavedPairs usedGP
 
-  for pair in pairs do
+  let fpPairs := if isBoxed then
+    #[#[Reg.phys PhysReg.v8, Reg.phys PhysReg.v9],
+      #[Reg.phys PhysReg.v10, Reg.phys PhysReg.v11],
+      #[Reg.phys PhysReg.v12, Reg.phys PhysReg.v13],
+      #[Reg.phys PhysReg.v14, Reg.phys PhysReg.v15]]
+  else
+    getCalleeSavedFPPairs usedFP
+
+  for pair in gpPairs do
+    emit (Instr.push pair)
+
+  for pair in fpPairs do
     emit (Instr.push pair)
 
   if spillBytes > 0 then
-    emit (Instr.sub (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat spillBytes)))
+    emitStackSub spillBytes
 
-  if numSpilled > 0 || pairs.size < 5 then
-    let savedBytes := pairs.size * 16
-    emit (Instr.comment s!"Stack frame: {spillBytes} spill + {savedBytes} saved regs ({pairs.size}/5 pairs)")
+  if numSpilled > 0 || gpPairs.size < 5 || fpPairs.size < 4 then
+    let savedBytes := (gpPairs.size + fpPairs.size) * 16
+    emit (Instr.comment s!"Stack frame: {spillBytes} spill + {savedBytes} saved regs (gp {gpPairs.size}/5, fp {fpPairs.size}/4)")
 
 /-- Emit boxed function wrapper epilogue -/
 def emitBoxedEpilogue (spillBytes : Nat) : SelectM Unit := do
   if spillBytes > 0 then
-    emit (Instr.add (.phys PhysReg.sp) (.phys PhysReg.sp) (.imm (Int.ofNat spillBytes)))
+    emitStackAdd spillBytes
 
   -- Always restore all callee-saved registers (conservative)
+  emit (Instr.pop #[Reg.phys PhysReg.v14, Reg.phys PhysReg.v15])
+  emit (Instr.pop #[Reg.phys PhysReg.v12, Reg.phys PhysReg.v13])
+  emit (Instr.pop #[Reg.phys PhysReg.v10, Reg.phys PhysReg.v11])
+  emit (Instr.pop #[Reg.phys PhysReg.v8, Reg.phys PhysReg.v9])
   emit (Instr.pop #[Reg.phys PhysReg.x27, Reg.phys PhysReg.x28])
   emit (Instr.pop #[Reg.phys PhysReg.x25, Reg.phys PhysReg.x26])
   emit (Instr.pop #[Reg.phys PhysReg.x23, Reg.phys PhysReg.x24])
@@ -217,31 +233,91 @@ def emitBoxedWrapper (f : Name) (params : Array Param) (spillBytes : Nat) : Sele
   emit (Instr.comment s!"Boxed wrapper: unpacking {params.size} args from array")
 
   let extra := if params.size > 8 then params.size - 8 else 0
-  let argStorageOffset := extra * 8
+  let callStackBytes := extra * 8
+  let callStackBase := 0
+  let argStorageBase := callStackBytes
+
+  -- Remove "_boxed" suffix from function name and fetch base parameter types if available.
+  let baseFunc := stripBoxedSuffix f
+  let env ← Lean.Compiler.Backend.ARM64.Lower.getEnv
+  let baseParamTypes : Array IRType :=
+    match (Lean.IR.getDecls env).find? (fun decl => decl.name == baseFunc) with
+    | some (.fdecl _ baseParams _ _ _) =>
+      baseParams.filter (fun (p : Param) => !p.ty.isVoid) |>.map (fun (p : Param) => p.ty)
+    | _ =>
+      params.map (fun (p : Param) => p.ty)
+  let getParamTy (idx : Nat) : IRType :=
+    if h : idx < baseParamTypes.size then
+      baseParamTypes[idx]
+    else
+      (params[idx]!).ty
 
   -- Unpack all arguments from array to temporary storage
   for idx in [:params.size] do
     let arrayOffset := Int.ofNat (idx * 8)
-    let spillOffset := Int.ofNat (argStorageOffset + idx * 8)
+    let spillOffset := Int.ofNat (argStorageBase + idx * 8)
     emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.x0) arrayOffset))
     emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) spillOffset))
 
-  -- Remove "_boxed" suffix from function name
-  let baseFunc := stripBoxedSuffix f
-
-  -- Load args 0-7 into x0-x7
-  for i in [:min params.size 8] do
-    let argReg := getArgReg i
-    let spillOffset := Int.ofNat (argStorageOffset + i * 8)
-    emit (Instr.ldr (.phys argReg) (.mem (.phys PhysReg.sp) spillOffset))
+  -- Unbox scalar arguments in-place
+  for idx in [:params.size] do
+    let paramTy := getParamTy idx
+    if paramTy.isScalar then
+      let spillOffset := Int.ofNat (argStorageBase + idx * 8)
+      emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) spillOffset))
+      match paramTy with
+      | .uint64 =>
+        emit (Instr.mov (.phys PhysReg.x0) (.reg (.phys PhysReg.x8)))
+        emit (Instr.bl "_lean_unbox_uint64")
+        emit (Instr.str (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) spillOffset))
+      | .usize =>
+        emit (Instr.mov (.phys PhysReg.x0) (.reg (.phys PhysReg.x8)))
+        emit (Instr.bl "_lean_unbox_usize")
+        emit (Instr.str (.phys PhysReg.x0) (.mem (.phys PhysReg.sp) spillOffset))
+      | .float =>
+        emit (Instr.mov (.phys PhysReg.x0) (.reg (.phys PhysReg.x8)))
+        emit (Instr.bl "_lean_unbox_float")
+        emit (Instr.str (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) spillOffset))
+      | .float32 =>
+        emit (Instr.mov (.phys PhysReg.x0) (.reg (.phys PhysReg.x8)))
+        emit (Instr.bl "_lean_unbox_float32")
+        emit (Instr.strs (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) spillOffset))
+      | .uint8 | .uint16 | .uint32 =>
+        emit (Instr.asr (.phys PhysReg.x8) (.phys PhysReg.x8) (.imm 1))
+        emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) spillOffset))
+      | _ =>
+        emit (Instr.asr (.phys PhysReg.x8) (.phys PhysReg.x8) (.imm 1))
+        emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) spillOffset))
 
   -- Copy args 8+ from temporary storage to call stack positions
   for j in [:extra] do
     let argIdx := j + 8
-    let srcOffset := Int.ofNat (argStorageOffset + argIdx * 8)
-    let dstOffset := Int.ofNat (j * 8)
-    emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) srcOffset))
-    emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) dstOffset))
+    let paramTy := getParamTy argIdx
+    let srcOffset := Int.ofNat (argStorageBase + argIdx * 8)
+    let dstOffset := Int.ofNat (callStackBase + j * 8)
+    if paramTy == IRType.float32 then
+      emit (Instr.ldrs (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) srcOffset))
+      emit (Instr.strs (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) dstOffset))
+    else if paramTy == IRType.float then
+      emit (Instr.ldr (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) srcOffset))
+      emit (Instr.str (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) dstOffset))
+    else
+      emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) srcOffset))
+      emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) dstOffset))
+
+  -- Load args 0-7 into x0-x7
+  for i in [:min params.size 8] do
+    let argReg := getArgReg i
+    let spillOffset := Int.ofNat (argStorageBase + i * 8)
+    let paramTy := getParamTy i
+    if paramTy == IRType.float32 then
+      let fpArgReg := getFPArgReg i
+      emit (Instr.ldrs (.phys fpArgReg) (.mem (.phys PhysReg.sp) spillOffset))
+    else if paramTy == IRType.float then
+      let fpArgReg := getFPArgReg i
+      emit (Instr.ldr (.phys fpArgReg) (.mem (.phys PhysReg.sp) spillOffset))
+    else
+      emit (Instr.ldr (.phys argReg) (.mem (.phys PhysReg.sp) spillOffset))
 
   -- Call the non-boxed version
   let callTarget := if baseFunc == `main then "_lean_main" else "_" ++ Name.mangle baseFunc "l_"
@@ -335,6 +411,8 @@ def runSelectM (ctx : SelectContext) (action : SelectM Unit) : SelectState :=
 def compileDecl (env : Environment) (decl : Decl) : MachineFunction :=
   match decl with
   | .fdecl f params retTy body _ =>
+    -- Void parameters are not passed at runtime; drop them for codegen.
+    let params := params.filter fun p => !p.ty.isVoid
     -- Pre-collect variable types for register allocation
     let varTypes := collectVarTypes body params
 
@@ -355,6 +433,12 @@ def compileDecl (env : Environment) (decl : Decl) : MachineFunction :=
 
     -- Calculate stack size
     let baseSpillBytes := ((allocState.nextStackSlot * 8 + 15) / 16) * 16
+    let tempSlotBytes := 16
+    let tempSlotOffset :=
+      if baseSpillBytes == 0 then
+        some (Int.ofNat 0)
+      else
+        some (Int.ofNat baseSpillBytes)
 
     -- Check if this is a boxed function
     let isBoxed := params.size > closureMaxArgs && ExplicitBoxing.isBoxedName f
@@ -362,12 +446,14 @@ def compileDecl (env : Environment) (decl : Decl) : MachineFunction :=
       let argBytes := params.size * 8
       let extra := if params.size > 8 then params.size - 8 else 0
       let callStackBytes := extra * 8
-      ((argBytes + callStackBytes + 15) / 16) * 16
+      let boxedBytes := argBytes + callStackBytes
+      ((boxedBytes + 15) / 16) * 16
     else
-      baseSpillBytes
+      baseSpillBytes + tempSlotBytes
 
     -- Get used callee-saved registers for dynamic save/restore
     let usedCalleeSavedGP := allocState.usedCalleeSavedGP
+    let usedCalleeSavedFP := allocState.usedCalleeSavedFP
 
     -- Create context for SelectM
     let ctx : SelectContext := {
@@ -378,7 +464,9 @@ def compileDecl (env : Environment) (decl : Decl) : MachineFunction :=
       allocResult := allocState
       varTypes := varTypes
       spillBytes := spillBytes
+      tempSlotOffset := if isBoxed then none else tempSlotOffset
       usedCalleeSavedGP := usedCalleeSavedGP
+      usedCalleeSavedFP := usedCalleeSavedFP
       isBoxed := isBoxed
     }
 
