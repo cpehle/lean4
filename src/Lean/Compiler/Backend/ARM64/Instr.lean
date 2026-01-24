@@ -139,6 +139,7 @@ inductive Instr where
   | ldr (dst : Reg) (src : Operand) (suffix : String := "")
   | ldrw (dst : Reg) (src : Operand)  -- Load word (32-bit) - renders dst as w register
   | ldrs (dst : Reg) (src : Operand)  -- Load single-precision float (32-bit)
+  | ldrd (dst : Reg) (src : Operand)  -- Load double-precision float (64-bit)
   | ldrb (dst : Reg) (src : Operand)
   | ldrh (dst : Reg) (src : Operand)
   | ldrsb (dst : Reg) (src : Operand) -- load signed byte
@@ -147,6 +148,7 @@ inductive Instr where
   | str (src : Reg) (dst : Operand)
   | strw (src : Reg) (dst : Operand)  -- Store word (32-bit)
   | strs (src : Reg) (dst : Operand)  -- Store single-precision float (32-bit)
+  | strd (src : Reg) (dst : Operand)  -- Store double-precision float (64-bit)
   | strb (src : Reg) (dst : Operand)
   | strh (src : Reg) (dst : Operand)
 
@@ -246,6 +248,9 @@ def uses : Instr → Array Reg
   | .ldrs _ (.mem base _) => #[base]
   | .ldrs _ (.reg r) => #[r]
   | .ldrs _ _ => #[]
+  | .ldrd _ (.mem base _) => #[base]
+  | .ldrd _ (.reg r) => #[r]
+  | .ldrd _ _ => #[]
   | .ldrb _ (.mem base _) => #[base]
   | .ldrb _ _ => #[]
   | .ldrh _ (.mem base _) => #[base]
@@ -262,6 +267,8 @@ def uses : Instr → Array Reg
   | .strw s _ => #[s]
   | .strs s (.mem base _) => #[s, base]
   | .strs s _ => #[s]
+  | .strd s (.mem base _) => #[s, base]
+  | .strd s _ => #[s]
   | .strb s (.mem base _) => #[s, base]
   | .strb s _ => #[s]
   | .strh s (.mem base _) => #[s, base]
@@ -334,6 +341,7 @@ def defs : Instr → Array Reg
   | .ldr d _ _ => #[d]
   | .ldrw d _ => #[d]
   | .ldrs d _ => #[d]
+  | .ldrd d _ => #[d]
   | .ldrb d _ => #[d]
   | .ldrh d _ => #[d]
   | .ldrsb d _ => #[d]
@@ -342,6 +350,7 @@ def defs : Instr → Array Reg
   | .str _ _ => #[]
   | .strw _ _ => #[]
   | .strs _ _ => #[]
+  | .strd _ _ => #[]
   | .strb _ _ => #[]
   | .strh _ _ => #[]
   | .ldp d1 d2 _ _ => #[d1, d2]
@@ -405,7 +414,7 @@ def isLabel : Instr → Bool
 
 /-- Check if instruction has side effects -/
 def hasSideEffects : Instr → Bool
-  | .str _ _ | .strw _ _ | .strs _ _ | .strb _ _ | .strh _ _ | .stp _ _ _ _
+  | .str _ _ | .strw _ _ | .strs _ _ | .strd _ _ | .strb _ _ | .strh _ _ | .stp _ _ _ _
   | .bl _ | .blr _ | .push _ => true
   | _ => false
 
@@ -444,6 +453,11 @@ def toString : Instr → String
       | .phys p => PhysReg.toFPString .single p
       | _ => s!"{dst}"
     s!"ldr {dstStr}, {src}"
+  | ldrd dst src =>
+    let dstStr := match dst with
+      | .phys p => PhysReg.toFPString .double p
+      | _ => s!"{dst}"
+    s!"ldr {dstStr}, {src}"
   | ldrb dst src =>
     let dstStr := Reg.toGPR32String dst
     s!"ldrb {dstStr}, {src}"
@@ -460,6 +474,11 @@ def toString : Instr → String
   | strs src dst =>
     let srcStr := match src with
       | .phys p => PhysReg.toFPString .single p
+      | _ => s!"{src}"
+    s!"str {srcStr}, {dst}"
+  | strd src dst =>
+    let srcStr := match src with
+      | .phys p => PhysReg.toFPString .double p
       | _ => s!"{src}"
     s!"str {srcStr}, {dst}"
   | strb src dst =>

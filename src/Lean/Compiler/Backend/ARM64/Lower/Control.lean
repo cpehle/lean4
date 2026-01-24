@@ -40,6 +40,8 @@ def loadSpilledVar (v : VarId) (slot : Nat) : SelectM Reg := do
     emit (Instr.ldrw (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
   else if ty == .float32 then
     emit (Instr.ldrs (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
+  else if ty == .float then
+    emit (Instr.ldrd (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
   else
     emit (Instr.ldr (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
   return .phys scratch
@@ -55,6 +57,8 @@ def storeToStackSlot' (srcReg : Reg) (slot : Nat) (ty : IRType) : SelectM Unit :
     emit (Instr.strw srcReg (.mem (.phys .sp) offset))
   else if ty == .float32 then
     emit (Instr.strs srcReg (.mem (.phys .sp) offset))
+  else if ty == .float then
+    emit (Instr.strd srcReg (.mem (.phys .sp) offset))
   else
     emit (Instr.str srcReg (.mem (.phys .sp) offset))
 
@@ -83,6 +87,8 @@ def loadFromStackSlot (dst : Reg) (slot : Nat) (ty : IRType) : SelectM Unit := d
     emit (Instr.ldrw dst (.mem (.phys .sp) offset))
   else if ty == .float32 then
     emit (Instr.ldrs dst (.mem (.phys .sp) offset))
+  else if ty == .float then
+    emit (Instr.ldrd dst (.mem (.phys .sp) offset))
   else
     emit (Instr.ldr dst (.mem (.phys .sp) offset))
 
@@ -91,7 +97,11 @@ def emitPhiMove (move : PhiMove) : SelectM Unit := do
   match move.src, move.dst with
   | .reg srcReg, .reg dstReg =>
     if srcReg != dstReg then
-      emitMove (.phys dstReg) (.reg (.phys srcReg))
+      if move.ty == .float || move.ty == .float32 then
+        let prec := typeToFloatPrec move.ty
+        emit (Instr.fmov prec (.phys dstReg) (.phys srcReg))
+      else
+        emitMove (.phys dstReg) (.reg (.phys srcReg))
   | .reg srcReg, .stack slot =>
     storeToStackSlot' (.phys srcReg) slot move.ty
   | .stack slot, .reg dstReg =>
@@ -396,6 +406,8 @@ def lowerSSet (x : VarId) (n : Nat) (offset : Nat) (y : VarId) (ty : IRType) : S
     emit (Instr.strw yReg (.mem xReg (Int.ofNat totalOffset)))
   else if ty == .float32 then
     emit (Instr.strs yReg (.mem xReg (Int.ofNat totalOffset)))
+  else if ty == .float then
+    emit (Instr.strd yReg (.mem xReg (Int.ofNat totalOffset)))
   else
     emit (Instr.str yReg (.mem xReg (Int.ofNat totalOffset)))
   releaseAllScratch

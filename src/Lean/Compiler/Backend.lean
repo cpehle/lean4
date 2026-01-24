@@ -7,7 +7,6 @@ module
 
 prelude
 public import Lean.Compiler.Backend.ARM64
-public import Lean.Compiler.Backend.RegisterAlloc
 public import Lean.Compiler.Backend.InstrSelect
 public import Lean.Compiler.Backend.EmitARM64
 

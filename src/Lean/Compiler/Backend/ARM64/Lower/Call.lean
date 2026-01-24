@@ -100,7 +100,7 @@ def getParamTypes (f : FunId) (args : Array Arg) : SelectM (Array Arg × Array I
     let mut types := #[]
     for idx in [:args.size] do
       let arg := args[idx]!
-      if h : idx < params.size then
+      if idx < params.size then
         let param := params[idx]!
         if !param.ty.isVoid && (!externC || !param.ty.isErased) then
           acc := acc.push arg
@@ -114,7 +114,7 @@ def getParamTypes (f : FunId) (args : Array Arg) : SelectM (Array Arg × Array I
     let mut types := #[]
     for idx in [:args.size] do
       let arg := args[idx]!
-      if h : idx < params.size then
+      if idx < params.size then
         let param := params[idx]!
         if !param.ty.isVoid then
           acc := acc.push arg
@@ -126,7 +126,7 @@ def getParamTypes (f : FunId) (args : Array Arg) : SelectM (Array Arg × Array I
   | _ => return (args, args.map (fun _ => IRType.object))
 
 /-- Get parameter index for a variable (if it's a function parameter) -/
-def getParameterIndex? (v : VarId) : SelectM (Option Nat) := pure none
+def getParameterIndex? (_v : VarId) : SelectM (Option Nat) := pure none
 
 /-- Lower nullary function reference (global constant load) -/
 def lowerGlobalLoad (dst : VarId) (f : FunId) (dstType : IRType) : SelectM Unit := do
@@ -137,10 +137,14 @@ def lowerGlobalLoad (dst : VarId) (f : FunId) (dstType : IRType) : SelectM Unit 
 
   match dstType with
   | .float | .float32 =>
-    -- Float constants: use temp GP register for adrp, then ldr into FP register
+    -- Float constants: use temp GP register for adrp/add, then load into FP register
     let tempReg := Reg.phys PhysReg.x16
     emit (Instr.adrp tempReg s!"{fnName}@PAGE")
-    emit (Instr.ldr dstReg (.reg tempReg) s!", {fnName}@PAGEOFF")
+    emit (Instr.add tempReg tempReg (.label s!"{fnName}@PAGEOFF"))
+    if dstType == .float32 then
+      emit (Instr.ldrs dstReg (.mem tempReg 0))
+    else
+      emit (Instr.ldrd dstReg (.mem tempReg 0))
   | .uint8 =>
     emit (Instr.adrp dstReg s!"{fnName}@PAGE")
     emit (Instr.add dstReg dstReg (.label s!"{fnName}@PAGEOFF"))
@@ -214,12 +218,88 @@ def loadArgToGP (dst : PhysReg) (arg : Arg) (stackOffset : Nat) : SelectM Unit :
             emit (Instr.ldrb (.phys dst) (.mem (.phys PhysReg.sp) offset))
           else if ty == .uint16 then
             emit (Instr.ldrh (.phys dst) (.mem (.phys PhysReg.sp) offset))
-          else if ty == .uint32 || ty == .float32 then
+          else if ty == .uint32 then
             emit (Instr.ldrw (.phys dst) (.mem (.phys PhysReg.sp) offset))
           else
             emit (Instr.ldr (.phys dst) (.mem (.phys PhysReg.sp) offset))
         | none =>
           emitComment s!"ERROR: arg var{v.idx} not allocated!"
+
+/-- Load an argument into an FP register (float/float32). -/
+def loadArgToFP (dst : PhysReg) (arg : Arg) (stackOffset : Nat) (ty : IRType) : SelectM Unit := do
+  let prec := typeToFloatPrec ty
+  match arg with
+  | .erased =>
+    -- Default to 0.0 for erased float arguments.
+    emit (Instr.mov (.phys PhysReg.x0) (.imm 0))
+    emit (Instr.fmov prec (.phys dst) (.phys PhysReg.x0))
+  | .var v =>
+    let alloc ← getAllocResult
+    match alloc.allocation.get? v.idx with
+    | some phys =>
+      if phys != dst then
+        emit (Instr.fmov prec (.phys dst) (.phys phys))
+    | none =>
+      match alloc.stackSlots.get? v.idx with
+      | some slot =>
+        let offset := Int.ofNat (stackOffset + slot * 8)
+        if ty == .float32 then
+          emit (Instr.ldrs (.phys dst) (.mem (.phys PhysReg.sp) offset))
+        else
+          emit (Instr.ldrd (.phys dst) (.mem (.phys PhysReg.sp) offset))
+      | none =>
+        emitComment s!"ERROR: arg var{v.idx} not allocated!"
+
+/-- Store an argument to the outgoing stack slot with type-aware width. -/
+def storeStackArg (arg : Arg) (paramTy : IRType) (offset : Int) (stackBytes : Nat) : SelectM Unit := do
+  let isFloat := paramTy == IRType.float || paramTy == IRType.float32
+  if isFloat then
+    let prec := typeToFloatPrec paramTy
+    let emitStore (r : PhysReg) : SelectM Unit := do
+      if paramTy == IRType.float32 then
+        emit (Instr.strs (.phys r) (.mem (.phys PhysReg.sp) offset))
+      else
+        emit (Instr.strd (.phys r) (.mem (.phys PhysReg.sp) offset))
+    match arg with
+    | .var v =>
+      let alloc ← getAllocResult
+      match alloc.allocation.get? v.idx with
+      | some phys =>
+        if phys.isFP then
+          emitStore phys
+        else
+          let tmp ← acquireFPScratch
+          emit (Instr.fmov prec (.phys tmp) (.phys phys))
+          emitStore tmp
+          releaseScratch tmp
+      | none =>
+        let tmp ← acquireFPScratch
+        loadArgToFP tmp (.var v) stackBytes paramTy
+        emitStore tmp
+        releaseScratch tmp
+    | .erased =>
+      let tmp ← acquireFPScratch
+      emit (Instr.mov (.phys PhysReg.x0) (.imm 0))
+      emit (Instr.fmov prec (.phys tmp) (.phys PhysReg.x0))
+      emitStore tmp
+      releaseScratch tmp
+  else
+    match arg with
+    | .var v =>
+      let alloc ← getAllocResult
+      match alloc.allocation.get? v.idx with
+      | some phys =>
+        emit (Instr.str (.phys phys) (.mem (.phys PhysReg.sp) offset))
+      | none =>
+        let tmp ← acquireScratch
+        loadArgToGP tmp (.var v) stackBytes
+        emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
+        releaseScratch tmp
+    | .erased =>
+      let tmp ← acquireScratch
+      emit (Instr.mov (.phys tmp) (.imm 1))
+      emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
+      releaseScratch tmp
 
 /-- Handle result from function call -/
 def handleCallResult (dstReg : Reg) (dstType : IRType) : SelectM Unit := do
@@ -271,25 +351,11 @@ def lowerSelfTailCall (f : FunId) (args : Array Arg) : SelectM Unit := do
       emitStackSub stackBytes
 
     if extra > 0 then
-      let alloc ← getAllocResult
       for j in [:extra] do
         let argIdx := j + 8
         let offset := Int.ofNat (j * 8)
-        match callArgs[argIdx]! with
-        | .var v =>
-          match alloc.allocation.get? v.idx with
-          | some phys =>
-            emit (Instr.str (.phys phys) (.mem (.phys PhysReg.sp) offset))
-          | none =>
-            let tmp ← acquireScratch
-            loadArgToGP tmp (.var v) stackBytes
-            emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
-            releaseScratch tmp
-        | .erased =>
-          let tmp ← acquireScratch
-          emit (Instr.mov (.phys tmp) (.imm 1))
-          emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
-          releaseScratch tmp
+        let paramTy := if argIdx < paramTypes.size then paramTypes[argIdx]! else IRType.object
+        storeStackArg callArgs[argIdx]! paramTy offset stackBytes
 
     emit (Instr.bl fnName)
 
@@ -358,25 +424,11 @@ def lowerTailCall (f : FunId) (args : Array Arg) : SelectM Unit := do
       emitStackSub stackBytes
 
     if extra > 0 then
-      let alloc ← getAllocResult
       for j in [:extra] do
         let argIdx := j + 8
         let offset := Int.ofNat (j * 8)
-        match callArgs[argIdx]! with
-        | .var v =>
-          match alloc.allocation.get? v.idx with
-          | some phys =>
-            emit (Instr.str (.phys phys) (.mem (.phys PhysReg.sp) offset))
-          | none =>
-            let tmp ← acquireScratch
-            loadArgToGP tmp (.var v) stackBytes
-            emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
-            releaseScratch tmp
-        | .erased =>
-          let tmp ← acquireScratch
-          emit (Instr.mov (.phys tmp) (.imm 1))
-          emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
-          releaseScratch tmp
+        let paramTy := if argIdx < paramTypes.size then paramTypes[argIdx]! else IRType.object
+        storeStackArg callArgs[argIdx]! paramTy offset stackBytes
 
     emit (Instr.bl fnName)
 
@@ -456,25 +508,11 @@ def lowerFap (dst : VarId) (dstType : IRType) (f : FunId) (args : Array Arg)
 
   -- Store extra arguments to stack
   if extra > 0 then
-    let alloc ← getAllocResult
     for j in [:extra] do
       let argIdx := j + 8
       let offset := Int.ofNat (j * 8)
-      match callArgs[argIdx]! with
-      | .var v =>
-        match alloc.allocation.get? v.idx with
-        | some phys =>
-          emit (Instr.str (.phys phys) (.mem (.phys PhysReg.sp) offset))
-        | none =>
-          let tmp ← acquireScratch
-          loadArgToGP tmp (.var v) stackBytes
-          emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
-          releaseScratch tmp
-      | .erased =>
-        let tmp ← acquireScratch
-        emit (Instr.mov (.phys tmp) (.imm 1))
-        emit (Instr.str (.phys tmp) (.mem (.phys PhysReg.sp) offset))
-        releaseScratch tmp
+      let paramTy := if argIdx < paramTypes.size then paramTypes[argIdx]! else IRType.object
+      storeStackArg callArgs[argIdx]! paramTy offset stackBytes
 
   emit (Instr.bl fnName)
 
@@ -647,12 +685,12 @@ def lowerBox (dst : VarId) (ty : IRType) (x : VarId) : SelectM Unit := do
     if dstReg != .phys PhysReg.x0 then
       emitMove dstReg (.reg (.phys PhysReg.x0))
   | .float =>
-    emitMove (.phys PhysReg.v0) (.reg xReg)
+    emit (Instr.fmov .double (.phys PhysReg.v0) xReg)
     emit (Instr.bl "_lean_box_float")
     if dstReg != .phys PhysReg.x0 then
       emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
   | .float32 =>
-    emitMove (.phys PhysReg.v0) (.reg xReg)
+    emit (Instr.fmov .single (.phys PhysReg.v0) xReg)
     emit (Instr.bl "_lean_box_float32")
     if dstReg != .phys PhysReg.x0 then
       emit (Instr.mov dstReg (.reg (.phys PhysReg.x0)))
@@ -689,12 +727,12 @@ def lowerUnbox (dst : VarId) (dstType : IRType) (x : VarId) : SelectM Unit := do
     emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
     emit (Instr.bl "_lean_unbox_float")
     if dstReg != .phys PhysReg.v0 then
-      emitMove dstReg (.reg (.phys PhysReg.v0))
+      emit (Instr.fmov .double dstReg (.phys PhysReg.v0))
   | .float32 =>
     emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
     emit (Instr.bl "_lean_unbox_float32")
     if dstReg != .phys PhysReg.v0 then
-      emitMove dstReg (.reg (.phys PhysReg.v0))
+      emit (Instr.fmov .single dstReg (.phys PhysReg.v0))
   | .usize =>
     emit (Instr.mov (.phys PhysReg.x0) (.reg xReg))
     emit (Instr.bl "_lean_unbox_usize")

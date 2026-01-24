@@ -63,6 +63,8 @@ def lowerSProj (dst : VarId) (n : Nat) (offset : Nat) (x : VarId) : SelectM Unit
     emit (Instr.ldrw dstReg (.mem xReg (Int.ofNat totalOffset)))
   | some .float32 =>
     emit (Instr.ldrs dstReg (.mem xReg (Int.ofNat totalOffset)))
+  | some .float =>
+    emit (Instr.ldrd dstReg (.mem xReg (Int.ofNat totalOffset)))
   | _ =>
     emit (Instr.ldr dstReg (.mem xReg (Int.ofNat totalOffset)))
   if isSpilled then

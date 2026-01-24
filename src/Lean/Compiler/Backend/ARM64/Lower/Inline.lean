@@ -174,7 +174,7 @@ def inlineUsizeBinOp (op : String) (args : Array Arg) (dstReg : Reg)
     return false
 
 /-- Inline floating-point binary operation -/
-def inlineFloatBinOp (op : String) (args : Array Arg) (dstReg : Reg)
+def inlineFloatBinOp (prec : FloatPrec) (op : String) (args : Array Arg) (dstReg : Reg)
     (emitOp : FloatPrec → Reg → Reg → Reg → SelectM Unit) : SelectM Bool := do
   if args.size == 2 then
     match args[0]!, args[1]! with
@@ -182,35 +182,35 @@ def inlineFloatBinOp (op : String) (args : Array Arg) (dstReg : Reg)
       let v1Reg ← varToReg v1
       let v2Reg ← varToReg v2
       emitComment s!"inline lean_float_{op}"
-      emitOp FloatPrec.double dstReg v1Reg v2Reg
+      emitOp prec dstReg v1Reg v2Reg
       return true
     | _, _ => return false
   else
     return false
 
 /-- Inline floating-point unary operation -/
-def inlineFloatUnaryOp (op : String) (args : Array Arg) (dstReg : Reg)
+def inlineFloatUnaryOp (prec : FloatPrec) (op : String) (args : Array Arg) (dstReg : Reg)
     (emitOp : FloatPrec → Reg → Reg → SelectM Unit) : SelectM Bool := do
   if args.size == 1 then
     match args[0]! with
     | .var v =>
       let vReg ← varToReg v
       emitComment s!"inline lean_float_{op}"
-      emitOp FloatPrec.double dstReg vReg
+      emitOp prec dstReg vReg
       return true
     | .erased => return false
   else
     return false
 
 /-- Inline floating-point comparison -/
-def inlineFloatCmp (cond : Cond) (args : Array Arg) (dstReg : Reg) : SelectM Bool := do
+def inlineFloatCmp (prec : FloatPrec) (cond : Cond) (args : Array Arg) (dstReg : Reg) : SelectM Bool := do
   if args.size == 2 then
     match args[0]!, args[1]! with
     | .var v1, .var v2 =>
       let v1Reg ← varToReg v1
       let v2Reg ← varToReg v2
       emitComment "inline float comparison"
-      emit (Instr.fcmp FloatPrec.double v1Reg v2Reg)
+      emit (Instr.fcmp prec v1Reg v2Reg)
       -- Returns decidable: isTrue (boxed 0) or isFalse (boxed 1)
       emit (Instr.cset dstReg cond)                 -- 1 if true, 0 otherwise
       emit (Instr.eor dstReg dstReg (.imm 1))       -- invert
@@ -222,14 +222,14 @@ def inlineFloatCmp (cond : Cond) (args : Array Arg) (dstReg : Reg) : SelectM Boo
     return false
 
 /-- Inline float equality -/
-def inlineFloatBeq (args : Array Arg) (dstReg : Reg) : SelectM Bool := do
+def inlineFloatBeq (prec : FloatPrec) (args : Array Arg) (dstReg : Reg) : SelectM Bool := do
   if args.size == 2 then
     match args[0]!, args[1]! with
     | .var v1, .var v2 =>
       let v1Reg ← varToReg v1
       let v2Reg ← varToReg v2
       emitComment "inline lean_float_beq"
-      emit (Instr.fcmp FloatPrec.double v1Reg v2Reg)
+      emit (Instr.fcmp prec v1Reg v2Reg)
       -- Set result to 1 if equal, 0 otherwise
       emit (Instr.mov dstReg (.imm 1))
       emit (Instr.csel dstReg dstReg (.phys PhysReg.xzr) Cond.eq)
@@ -315,23 +315,41 @@ def tryInlineExternCall (fnName : String) (args : Array Arg) (dstReg : Reg) : Se
 
   -- Float operations
   | "lean_float_add" =>
-    inlineFloatBinOp "add" args dstReg fun prec dst lhs rhs => do
+    inlineFloatBinOp .double "add" args dstReg fun prec dst lhs rhs => do
       emit (Instr.fadd prec dst lhs rhs)
   | "lean_float_sub" =>
-    inlineFloatBinOp "sub" args dstReg fun prec dst lhs rhs => do
+    inlineFloatBinOp .double "sub" args dstReg fun prec dst lhs rhs => do
       emit (Instr.fsub prec dst lhs rhs)
   | "lean_float_mul" =>
-    inlineFloatBinOp "mul" args dstReg fun prec dst lhs rhs => do
+    inlineFloatBinOp .double "mul" args dstReg fun prec dst lhs rhs => do
       emit (Instr.fmul prec dst lhs rhs)
   | "lean_float_div" =>
-    inlineFloatBinOp "div" args dstReg fun prec dst lhs rhs => do
+    inlineFloatBinOp .double "div" args dstReg fun prec dst lhs rhs => do
       emit (Instr.fdiv prec dst lhs rhs)
   | "lean_float_negate" =>
-    inlineFloatUnaryOp "negate" args dstReg fun prec dst src => do
+    inlineFloatUnaryOp .double "negate" args dstReg fun prec dst src => do
       emit (Instr.fneg prec dst src)
-  | "lean_float_beq" => inlineFloatBeq args dstReg
-  | "lean_float_decLt" => inlineFloatCmp Cond.lt args dstReg
-  | "lean_float_decLe" => inlineFloatCmp Cond.le args dstReg
+  | "lean_float_beq" => inlineFloatBeq .double args dstReg
+  | "lean_float_decLt" => inlineFloatCmp .double Cond.lt args dstReg
+  | "lean_float_decLe" => inlineFloatCmp .double Cond.le args dstReg
+  | "lean_float32_add" =>
+    inlineFloatBinOp .single "add" args dstReg fun prec dst lhs rhs => do
+      emit (Instr.fadd prec dst lhs rhs)
+  | "lean_float32_sub" =>
+    inlineFloatBinOp .single "sub" args dstReg fun prec dst lhs rhs => do
+      emit (Instr.fsub prec dst lhs rhs)
+  | "lean_float32_mul" =>
+    inlineFloatBinOp .single "mul" args dstReg fun prec dst lhs rhs => do
+      emit (Instr.fmul prec dst lhs rhs)
+  | "lean_float32_div" =>
+    inlineFloatBinOp .single "div" args dstReg fun prec dst lhs rhs => do
+      emit (Instr.fdiv prec dst lhs rhs)
+  | "lean_float32_negate" =>
+    inlineFloatUnaryOp .single "negate" args dstReg fun prec dst src => do
+      emit (Instr.fneg prec dst src)
+  | "lean_float32_beq" => inlineFloatBeq .single args dstReg
+  | "lean_float32_decLt" => inlineFloatCmp .single Cond.lt args dstReg
+  | "lean_float32_decLe" => inlineFloatCmp .single Cond.le args dstReg
 
   | _ => return false
 

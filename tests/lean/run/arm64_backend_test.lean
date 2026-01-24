@@ -1,5 +1,4 @@
 import Lean.Compiler.Backend.ARM64
-import Lean.Compiler.Backend.RegisterAlloc
 import Lean.Compiler.Backend.InstrSelect
 import Lean.Compiler.Backend.EmitARM64
 

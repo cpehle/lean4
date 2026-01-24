@@ -137,9 +137,10 @@ def expireOldIntervals (pos : Nat) : AllocM Unit := do
   let s ← get
   let (expiredSpilled, activeSpilled) := s.activeSpilled.partition (·.end_ < pos)
   for iv in expiredSpilled do
-    match s.stackSlots.get? iv.var.idx with
-    | some slot => modify fun s => { s with freeSpillSlots := s.freeSpillSlots.push slot }
-    | none => pure ()
+    if iv.ty.isScalar then
+      match s.stackSlots.get? iv.var.idx with
+      | some slot => modify fun s => { s with freeSpillSlots := s.freeSpillSlots.push slot }
+      | none => pure ()
 
   modify fun s => { s with activeGP, activeFP, activeSpilled }
 
@@ -206,6 +207,19 @@ def tryAllocateFree (iv : LiveInterval) : AllocM (Option PhysReg) := do
       }
       return some reg
 
+/-- Allocate a stack slot for a spill, reusing freed scalar slots when possible. -/
+def allocateSpillSlot (ty : IRType) : AllocM Nat := do
+  let s ← get
+  if ty.isScalar then
+    match s.freeSpillSlots.back? with
+    | some slot =>
+      modify fun s => { s with freeSpillSlots := s.freeSpillSlots.pop }
+      return slot
+    | none => pure ()
+  let slot := s.nextStackSlot
+  modify fun s => { s with nextStackSlot := s.nextStackSlot + 1 }
+  return slot
+
 /-- Spill the current interval -/
 def spillInterval (iv : LiveInterval) : AllocM Unit := do
   let s ← get
@@ -220,14 +234,12 @@ def spillInterval (iv : LiveInterval) : AllocM Unit := do
       activeSpilled := (s.activeSpilled.push iv).qsort (·.end_ < ·.end_)
     }
     return
-  -- Allocate a fresh stack slot (no reuse; conservatively avoids overlap bugs)
-  let slot := s.nextStackSlot
-  let nextSlot := s.nextStackSlot + 1
+  -- Allocate a stack slot (reuse a freed slot if possible)
+  let slot ← allocateSpillSlot iv.ty
   modify fun s => {
     s with
     spilled := s.spilled.push iv.var,
     stackSlots := s.stackSlots.insert iv.var.idx slot,
-    nextStackSlot := nextSlot,
     -- Track this interval as active spilled for slot reuse
     activeSpilled := (s.activeSpilled.push iv).qsort (·.end_ < ·.end_)
   }
@@ -281,15 +293,13 @@ def allocateBlocked (iv : LiveInterval) : AllocM Unit := do
           activeSpilled := (s.activeSpilled.push victim).qsort (·.end_ < ·.end_)
         }
       else
-        -- Free the register from victim, allocate a fresh slot (no reuse)
-        let slot := s.nextStackSlot
-        let nextSlot := s.nextStackSlot + 1
+        -- Free the register from victim, allocate a stack slot (reuse if possible)
+        let slot ← allocateSpillSlot victim.ty
         modify fun s => {
           s with
           allocation := s.allocation.erase victim.var.idx |>.insert iv.var.idx reg,
           spilled := s.spilled.push victim.var,
           stackSlots := s.stackSlots.insert victim.var.idx slot,
-          nextStackSlot := nextSlot,
           activeGP := if usesFP then s.activeGP else s.activeGP.filter (·.var.idx != victim.var.idx) |>.push iv |>.qsort (·.end_ < ·.end_),
           activeFP := if usesFP then s.activeFP.filter (·.var.idx != victim.var.idx) |>.push iv |>.qsort (·.end_ < ·.end_) else s.activeFP,
           activeSpilled := (s.activeSpilled.push victim).qsort (·.end_ < ·.end_)
@@ -305,7 +315,7 @@ def allocateBlocked (iv : LiveInterval) : AllocM Unit := do
 def allocateInterval (iv : LiveInterval) : AllocM Unit := do
   expireOldIntervals iv.start
   modify fun s => { s with currentPos := iv.start }
-
+ 
   -- Skip if already allocated (e.g., parameters pre-allocated by allocateParams)
   -- Add to active set so their registers are properly tracked for expiration
   let s ← get

@@ -19,9 +19,10 @@ Defines the ARM64 instruction set including:
 - **Instructions**: Data processing, logical, load/store, branch, floating point
 - **Calling Convention**: ARM64 ABI (arguments in x0-x7, return in x0)
 
-### 3. Register Allocation (`src/Lean/Compiler/Backend/RegisterAlloc.lean`)
-Linear scan register allocation algorithm:
-- Computes live intervals for each virtual register
+### 3. Liveness + Register Allocation
+**Liveness** (`src/Lean/Compiler/Backend/ARM64/Liveness.lean`) and
+**Register Allocation** (`src/Lean/Compiler/Backend/ARM64/RegAlloc/LinearScan.lean`):
+- Computes live intervals and call positions for each virtual register
 - Allocates physical registers using a greedy linear scan
 - Spills variables to stack when registers are exhausted
 - Respects ARM64 calling conventions (caller-saved vs callee-saved registers)
@@ -56,7 +57,8 @@ src/Lean/Compiler/
 │   └── SSA.lean                    # SSA conversion
 └── Backend/
     ├── ARM64.lean                  # ARM64 instruction set
-    ├── RegisterAlloc.lean          # Register allocation
+    ├── ARM64/Liveness.lean         # Liveness analysis
+    ├── ARM64/RegAlloc/LinearScan.lean # Register allocation
     ├── InstrSelect.lean            # Instruction selection
     ├── EmitARM64.lean             # Assembly emission
     └── Backend.lean               # Main module

@@ -111,7 +111,7 @@ The current implementation hardcodes physical registers throughout instruction s
 └─────────────────────────────────────────────────────────┘
                          ↓
 ┌─────────────────────────────────────────────────────────┐
-│ Register Allocation (RegisterAlloc.lean)               │
+│ Register Allocation (ARM64/RegAlloc/LinearScan.lean)               │
 │                                                         │
 │ • Assigns virtual registers to physical registers      │
 │ • May assign x9 (caller-saved) to long-lived values    │
@@ -144,7 +144,7 @@ Use virtual registers throughout instruction selection, with ABI constraints com
 └─────────────────────────────────────────────────────────┘
                          ↓
 ┌─────────────────────────────────────────────────────────┐
-│ Register Allocation (RegisterAlloc.lean)               │
+│ Register Allocation (ARM64/RegAlloc/LinearScan.lean)               │
 │                                                         │
 │ • Allocates virtual → physical registers               │
 │ • Respects ABI constraints from instruction selection  │

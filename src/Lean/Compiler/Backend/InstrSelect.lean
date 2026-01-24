@@ -277,7 +277,7 @@ def emitBoxedWrapper (f : Name) (params : Array Param) (spillBytes : Nat) : Sele
       | .float =>
         emit (Instr.mov (.phys PhysReg.x0) (.reg (.phys PhysReg.x8)))
         emit (Instr.bl "_lean_unbox_float")
-        emit (Instr.str (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) spillOffset))
+        emit (Instr.strd (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) spillOffset))
       | .float32 =>
         emit (Instr.mov (.phys PhysReg.x0) (.reg (.phys PhysReg.x8)))
         emit (Instr.bl "_lean_unbox_float32")
@@ -299,8 +299,8 @@ def emitBoxedWrapper (f : Name) (params : Array Param) (spillBytes : Nat) : Sele
       emit (Instr.ldrs (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) srcOffset))
       emit (Instr.strs (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) dstOffset))
     else if paramTy == IRType.float then
-      emit (Instr.ldr (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) srcOffset))
-      emit (Instr.str (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) dstOffset))
+      emit (Instr.ldrd (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) srcOffset))
+      emit (Instr.strd (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) dstOffset))
     else
       emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) srcOffset))
       emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) dstOffset))
@@ -315,7 +315,7 @@ def emitBoxedWrapper (f : Name) (params : Array Param) (spillBytes : Nat) : Sele
       emit (Instr.ldrs (.phys fpArgReg) (.mem (.phys PhysReg.sp) spillOffset))
     else if paramTy == IRType.float then
       let fpArgReg := getFPArgReg i
-      emit (Instr.ldr (.phys fpArgReg) (.mem (.phys PhysReg.sp) spillOffset))
+      emit (Instr.ldrd (.phys fpArgReg) (.mem (.phys PhysReg.sp) spillOffset))
     else
       emit (Instr.ldr (.phys argReg) (.mem (.phys PhysReg.sp) spillOffset))
 
@@ -336,15 +336,27 @@ def loadStackParams (params : Array Param) (allocState : AllocState) : SelectM U
       match allocState.allocation.get? param.x.idx with
       | some allocReg =>
         emit (Instr.comment s!"load stack param {idx}: [x29, #{callerOffset}] → {allocReg}")
-        emit (Instr.ldr (.phys allocReg) (.mem (.phys PhysReg.x29) callerOffset))
+        if param.ty == IRType.float32 then
+          emit (Instr.ldrs (.phys allocReg) (.mem (.phys PhysReg.x29) callerOffset))
+        else if param.ty == IRType.float then
+          emit (Instr.ldrd (.phys allocReg) (.mem (.phys PhysReg.x29) callerOffset))
+        else
+          emit (Instr.ldr (.phys allocReg) (.mem (.phys PhysReg.x29) callerOffset))
       | none =>
         -- Stack parameter is spilled - must copy from caller stack to local spill slot
         match allocState.stackSlots.get? param.x.idx with
         | some slot =>
           let localOffset := Int.ofNat (slot * 8)
           emit (Instr.comment s!"copy stack param {idx} from [x29, #{callerOffset}] to [sp, #{localOffset}]")
-          emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.x29) callerOffset))
-          emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) localOffset))
+          if param.ty == IRType.float32 then
+            emit (Instr.ldrs (.phys PhysReg.v0) (.mem (.phys PhysReg.x29) callerOffset))
+            emit (Instr.strs (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) localOffset))
+          else if param.ty == IRType.float then
+            emit (Instr.ldrd (.phys PhysReg.v0) (.mem (.phys PhysReg.x29) callerOffset))
+            emit (Instr.strd (.phys PhysReg.v0) (.mem (.phys PhysReg.sp) localOffset))
+          else
+            emit (Instr.ldr (.phys PhysReg.x8) (.mem (.phys PhysReg.x29) callerOffset))
+            emit (Instr.str (.phys PhysReg.x8) (.mem (.phys PhysReg.sp) localOffset))
         | none =>
           emit (Instr.comment s!"WARNING: stack param {idx} not allocated!")
 
@@ -373,7 +385,10 @@ def saveParamsFromRegs (params : Array Param) (allocState : AllocState) : Select
           let fpArgReg := getFPArgReg i
           let offset := Int.ofNat (slot * 8)
           emit (Instr.comment s!"store spilled float param {i} to stack slot {slot}")
-          emit (Instr.str (.phys fpArgReg) (.mem (.phys PhysReg.sp) offset))
+          if param.ty == IRType.float32 then
+            emit (Instr.strs (.phys fpArgReg) (.mem (.phys PhysReg.sp) offset))
+          else
+            emit (Instr.strd (.phys fpArgReg) (.mem (.phys PhysReg.sp) offset))
         else
           let argReg := getArgReg i
           let offset := Int.ofNat (slot * 8)

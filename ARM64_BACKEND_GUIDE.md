@@ -128,7 +128,8 @@ The `runtime_bridge.c` file provides exported wrappers for Lean runtime function
 ```
 src/Lean/Compiler/Backend/
 ├── ARM64.lean              # ARM64 instruction definitions
-├── RegisterAlloc.lean      # Linear scan register allocation
+├── ARM64/Liveness.lean     # Liveness analysis + intervals
+├── ARM64/RegAlloc/LinearScan.lean      # Linear scan register allocation
 ├── InstrSelect.lean        # IR → ARM64 instruction selection
 └── EmitARM64.lean          # Assembly code emission
 ```
@@ -136,13 +137,14 @@ src/Lean/Compiler/Backend/
 ### Compilation Pipeline
 
 ```
-Lean IR → SSA Form → Instruction Selection → Register Allocation → Assembly Emission
+Lean IR → SSA Form → Instruction Selection → Liveness → Register Allocation → Assembly Emission
 ```
 
 1. **SSA Form** (`IR.SSA`): Convert IR to static single assignment
 2. **Instruction Selection** (`InstrSelect`): Map IR operations to ARM64 instructions
-3. **Register Allocation** (`RegisterAlloc`): Assign virtual registers to physical registers
-4. **Emission** (`EmitARM64`): Generate final assembly code
+3. **Liveness** (`ARM64/Liveness`): Compute live intervals and call positions
+4. **Register Allocation** (`ARM64/RegAlloc/LinearScan`): Assign virtual registers to physical registers
+5. **Emission** (`EmitARM64`): Generate final assembly code
 
 ### ARM64 Calling Convention
 
@@ -513,7 +515,7 @@ Types: `feat`, `fix`, `refactor`, `test`, `docs`, `perf`
 
 - **Add new instruction**: `src/Lean/Compiler/Backend/ARM64.lean`
 - **Change instruction selection**: `src/Lean/Compiler/Backend/InstrSelect.lean`
-- **Modify register allocation**: `src/Lean/Compiler/Backend/RegisterAlloc.lean`
+- **Modify register allocation**: `src/Lean/Compiler/Backend/ARM64/RegAlloc/LinearScan.lean`
 - **Update assembly emission**: `src/Lean/Compiler/Backend/EmitARM64.lean`
 - **Add runtime wrapper**: `tests/compiler/runtime_bridge.c`
 

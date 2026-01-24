@@ -11,9 +11,8 @@ _l_testAdd:
   mov x29, sp
   stp x19, x20, [sp, #-16]!
   stp x21, x22, [sp, #-16]!
-  stp x23, x24, [sp, #-16]!
-  stp x25, x26, [sp, #-16]!
-  stp x27, x28, [sp, #-16]!
+  sub sp, sp, #16
+  // Stack frame: 16 spill + 32 saved regs (gp 2/5, fp 0/4)
 .Lfn_start_testAdd:
   mov x19, x0
   mov x20, x1
@@ -21,12 +20,10 @@ _l_testAdd:
   mov x0, x19
   mov x1, x20
   bl _l_Nat_add
-  mov x27, x0
+  mov x21, x0
   // return
-  mov x0, x27
-  ldp x27, x28, [sp], #16
-  ldp x25, x26, [sp], #16
-  ldp x23, x24, [sp], #16
+  mov x0, x21
+  add sp, sp, #16
   ldp x21, x22, [sp], #16
   ldp x19, x20, [sp], #16
   ldp x29, x30, [sp], #16
@@ -42,18 +39,13 @@ _l_testId:
   stp x29, x30, [sp, #-16]!
   mov x29, sp
   stp x19, x20, [sp, #-16]!
-  stp x21, x22, [sp, #-16]!
-  stp x23, x24, [sp, #-16]!
-  stp x25, x26, [sp, #-16]!
-  stp x27, x28, [sp, #-16]!
+  sub sp, sp, #16
+  // Stack frame: 16 spill + 16 saved regs (gp 1/5, fp 0/4)
 .Lfn_start_testId:
   mov x19, x0
   // return
   mov x0, x19
-  ldp x27, x28, [sp], #16
-  ldp x25, x26, [sp], #16
-  ldp x23, x24, [sp], #16
-  ldp x21, x22, [sp], #16
+  add sp, sp, #16
   ldp x19, x20, [sp], #16
   ldp x29, x30, [sp], #16
   ret
@@ -69,31 +61,22 @@ _l_mkPair:
   mov x29, sp
   stp x19, x20, [sp, #-16]!
   stp x21, x22, [sp, #-16]!
-  stp x23, x24, [sp, #-16]!
-  stp x25, x26, [sp, #-16]!
-  stp x27, x28, [sp, #-16]!
+  sub sp, sp, #16
+  // Stack frame: 16 spill + 32 saved regs (gp 2/5, fp 0/4)
 .Lfn_start_mkPair:
   mov x19, x0
   mov x20, x1
-  // ctor Pair (tag=0, objs=2, scalar=0)
+  // ctor Pair (tag=0, objs=2, usize=0, scalar=0)
   mov x0, #0
   mov x1, #2
   mov x2, #0
   bl _lean_alloc_ctor
-  mov x27, x0
-  mov x0, x27
-  mov x1, #0
-  mov x2, x19
-  bl _lean_ctor_set
-  mov x0, x27
-  mov x1, #1
-  mov x2, x20
-  bl _lean_ctor_set
+  mov x21, x0
+  str x19, [x21, #8]
+  str x20, [x21, #16]
   // return
-  mov x0, x27
-  ldp x27, x28, [sp], #16
-  ldp x25, x26, [sp], #16
-  ldp x23, x24, [sp], #16
+  mov x0, x21
+  add sp, sp, #16
   ldp x21, x22, [sp], #16
   ldp x19, x20, [sp], #16
   ldp x29, x30, [sp], #16
@@ -109,20 +92,15 @@ _l_fst:
   stp x29, x30, [sp, #-16]!
   mov x29, sp
   stp x19, x20, [sp, #-16]!
-  stp x21, x22, [sp, #-16]!
-  stp x23, x24, [sp, #-16]!
-  stp x25, x26, [sp, #-16]!
-  stp x27, x28, [sp, #-16]!
+  sub sp, sp, #16
+  // Stack frame: 16 spill + 16 saved regs (gp 1/5, fp 0/4)
 .Lfn_start_fst:
   mov x19, x0
   // proj field 0
-  ldr x27, [x19, #8]
+  ldr x11, [x19, #8]
   // return
-  mov x0, x27
-  ldp x27, x28, [sp], #16
-  ldp x25, x26, [sp], #16
-  ldp x23, x24, [sp], #16
-  ldp x21, x22, [sp], #16
+  mov x0, x11
+  add sp, sp, #16
   ldp x19, x20, [sp], #16
   ldp x29, x30, [sp], #16
   ret
@@ -137,73 +115,63 @@ _l_notBool:
   stp x29, x30, [sp, #-16]!
   mov x29, sp
   stp x19, x20, [sp, #-16]!
-  stp x21, x22, [sp, #-16]!
-  stp x23, x24, [sp, #-16]!
-  stp x25, x26, [sp, #-16]!
-  stp x27, x28, [sp, #-16]!
+  sub sp, sp, #16
+  // Stack frame: 16 spill + 16 saved regs (gp 1/5, fp 0/4)
 .Lfn_start_notBool:
   mov x19, x0
   // case
   // runtime scalar check
   tst x19, #1
-  b.ne .Lscalar_tag0_fn15397140181275010763
+  b.ne .scalar_tag_notBool_0
   ldrb w8, [x19, #7]
-  b .Lcompare_tag1_fn15397140181275010763
-.Lscalar_tag0_fn15397140181275010763:
+  b .compare_tag_notBool_1
+.scalar_tag_notBool_0:
   lsr x8, x19, #1
-.Lcompare_tag1_fn15397140181275010763:
+.compare_tag_notBool_1:
   cmp x8, #0
-  b.eq .Lcase_ctor3_fn15397140181275010763
+  b.eq .case_ctor_notBool_3
   cmp x8, #1
-  b.eq .Lcase_ctor4_fn15397140181275010763
-  b .Lcase_end2_fn15397140181275010763
-.Lcase_ctor3_fn15397140181275010763:
+  b.eq .case_ctor_notBool_4
+  b .case_end_notBool_2
+.case_ctor_notBool_3:
   // return
   mov x0, x19
-  ldp x27, x28, [sp], #16
-  ldp x25, x26, [sp], #16
-  ldp x23, x24, [sp], #16
-  ldp x21, x22, [sp], #16
+  add sp, sp, #16
   ldp x19, x20, [sp], #16
   ldp x29, x30, [sp], #16
   ret
-  b .Lcase_end2_fn15397140181275010763
-.Lcase_ctor4_fn15397140181275010763:
+  b .case_end_notBool_2
+.case_ctor_notBool_4:
   // return
   mov x0, x19
-  ldp x27, x28, [sp], #16
-  ldp x25, x26, [sp], #16
-  ldp x23, x24, [sp], #16
-  ldp x21, x22, [sp], #16
+  add sp, sp, #16
   ldp x19, x20, [sp], #16
   ldp x29, x30, [sp], #16
   ret
-  b .Lcase_end2_fn15397140181275010763
-.Lcase_end2_fn15397140181275010763:
+  b .case_end_notBool_2
+.case_end_notBool_2:
+  add sp, sp, #16
+  ldp x19, x20, [sp], #16
+  ldp x29, x30, [sp], #16
+  bl _lean_internal_panic_unreachable
+  ret
 
 
 === Test Literal ===
 
-  .globl _l_const42
+  .globl __init_l_const42
   .align 2
-_l_const42:
+__init_l_const42:
   // Function: const42
   stp x29, x30, [sp, #-16]!
   mov x29, sp
-  stp x19, x20, [sp, #-16]!
-  stp x21, x22, [sp, #-16]!
-  stp x23, x24, [sp, #-16]!
-  stp x25, x26, [sp, #-16]!
-  stp x27, x28, [sp, #-16]!
+  sub sp, sp, #16
+  // Stack frame: 16 spill + 0 saved regs (gp 0/5, fp 0/4)
 .Lfn_start_const42:
-  mov x27, #42
+  movz x11, #42, lsl #0
   // return
-  mov x0, x27
-  ldp x27, x28, [sp], #16
-  ldp x25, x26, [sp], #16
-  ldp x23, x24, [sp], #16
-  ldp x21, x22, [sp], #16
-  ldp x19, x20, [sp], #16
+  mov x0, x11
+  add sp, sp, #16
   ldp x29, x30, [sp], #16
   ret
 
@@ -217,21 +185,17 @@ _l_boxNat:
   stp x29, x30, [sp, #-16]!
   mov x29, sp
   stp x19, x20, [sp, #-16]!
-  stp x21, x22, [sp, #-16]!
-  stp x23, x24, [sp, #-16]!
-  stp x25, x26, [sp, #-16]!
-  stp x27, x28, [sp, #-16]!
+  sub sp, sp, #16
+  // Stack frame: 16 spill + 16 saved regs (gp 1/5, fp 0/4)
 .Lfn_start_boxNat:
   mov x19, x0
   // box
-  lsl x27, x19, #1
-  orr x27, x27, #1
+  mov x0, x19
+  bl _lean_box_usize
+  mov x20, x0
   // return
-  mov x0, x27
-  ldp x27, x28, [sp], #16
-  ldp x25, x26, [sp], #16
-  ldp x23, x24, [sp], #16
-  ldp x21, x22, [sp], #16
+  mov x0, x20
+  add sp, sp, #16
   ldp x19, x20, [sp], #16
   ldp x29, x30, [sp], #16
   ret

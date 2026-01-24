@@ -243,6 +243,11 @@ private def emitMemInstr (instr : Instr) : EmitM Unit := do
       | .phys r => if isFPReg r then fpReg FloatPrec.single dst else toString dst
       | _ => toString dst
     emitLn s!"  ldr {dstStr}, {emitOperand src}"
+  | .ldrd dst src =>
+    let dstStr := match dst with
+      | .phys r => if isFPReg r then fpReg FloatPrec.double dst else toString dst
+      | _ => toString dst
+    emitLn s!"  ldr {dstStr}, {emitOperand src}"
   | .ldrb dst src => emitLn s!"  ldrb {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
   | .ldrh dst src => emitLn s!"  ldrh {ARM64.Reg.toGPR32String dst}, {emitOperand src}"
   | .str src dst =>
@@ -256,6 +261,11 @@ private def emitMemInstr (instr : Instr) : EmitM Unit := do
   | .strs src dst =>
     let srcStr := match src with
       | .phys r => if isFPReg r then fpReg FloatPrec.single src else toString src
+      | _ => toString src
+    emitLn s!"  str {srcStr}, {emitOperand dst}"
+  | .strd src dst =>
+    let srcStr := match src with
+      | .phys r => if isFPReg r then fpReg FloatPrec.double src else toString src
       | _ => toString src
     emitLn s!"  str {srcStr}, {emitOperand dst}"
   | .ldp dst1 dst2 base offset =>
@@ -330,9 +340,11 @@ private def emitFPInstr (instr : Instr) : EmitM Unit := do
       if isFPReg dstP && isFPReg srcP then
         emitLn s!"  fmov {fpReg prec dst}, {fpReg prec src}"
       else if isFPReg dstP && !isFPReg srcP then
-        emitLn s!"  fmov {fpReg FloatPrec.double dst}, {src}"
+        let gpSrc := if prec == .single then ARM64.Reg.toGPR32String src else toString src
+        emitLn s!"  fmov {fpReg prec dst}, {gpSrc}"
       else if !isFPReg dstP && isFPReg srcP then
-        emitLn s!"  fmov {dst}, {fpReg FloatPrec.double src}"
+        let gpDst := if prec == .single then ARM64.Reg.toGPR32String dst else toString dst
+        emitLn s!"  fmov {gpDst}, {fpReg prec src}"
       else
         panic! s!"fmov between two GP registers: {dst}, {src}"
     | _, _ => panic! s!"fmov with virtual registers at emission time: {dst}, {src}"

@@ -121,10 +121,10 @@ def emitFieldSet (fieldIdx : Nat) (arg : Arg) (conflict : Option (VarId × PhysR
         emit (Instr.lsl (.phys .x0) (.phys .x0) (.imm 1))
         emit (Instr.orr (.phys .x0) (.phys .x0) (.imm 1))
       | .float =>
-        emitMove (.phys .v0) (.reg actualReg)
+        emit (Instr.fmov .double (.phys .v0) actualReg)
         emit (Instr.bl "_lean_box_float")
       | .float32 =>
-        emitMove (.phys .v0) (.reg actualReg)
+        emit (Instr.fmov .single (.phys .v0) actualReg)
         emit (Instr.bl "_lean_box_float32")
       | _ =>
         emit (Instr.lsl (.phys .x0) (.phys .x0) (.imm 1))

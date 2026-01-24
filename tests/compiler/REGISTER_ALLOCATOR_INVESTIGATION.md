@@ -1,5 +1,9 @@
 # ARM64 Register Allocator Investigation
 
+Note (Jan 2026): the legacy register allocator module was removed. References below are
+historical; the current allocator lives in `src/Lean/Compiler/Backend/ARM64/Liveness.lean`
+and `src/Lean/Compiler/Backend/ARM64/RegAlloc/LinearScan.lean`.
+
 ## Current Status
 
 The ARM64 backend currently uses a **conservative register allocator** that assumes all variables are live throughout the entire function (live interval: 0-1000). This causes excessive stack usage and failures on complex programs.
@@ -53,19 +57,19 @@ An accurate register allocator was systematically implemented to solve the stack
 
 ### What Was Implemented
 
-1. **Helper Functions** (RegisterAlloc.lean:181-206)
+1. **Helper Functions** (ARM64/RegAlloc/LinearScan.lean:181-206)
    - `usesFromArg`: Extract variables from single Arg
    - `usesFromArgs`: Extract variables from array of Args
    - `usesFromExpr`: Extract variables from IR expressions
 
-2. **Liveness Analysis** (RegisterAlloc.lean:208-313)
+2. **Liveness Analysis** (ARM64/RegAlloc/LinearScan.lean:208-313)
    - `analyzeBody`: Recursive traversal computing def/use positions
    - Handles all IR constructs: vdecl, set, uset, sset, setTag, inc, dec, del, jmp, jdecl, case, ret, unreachable
    - Returns tuple: `(finalPos, defs, uses)` where:
      - `defs`: TreeMap Index → Nat (definition position)
      - `uses`: TreeMap Index → Array Nat (use positions)
 
-3. **Live Interval Computation** (RegisterAlloc.lean:315-326)
+3. **Live Interval Computation** (ARM64/RegAlloc/LinearScan.lean:315-326)
    - `computeLiveIntervals`: Builds accurate intervals from def/use info
    - Variables live from def position to last use position
    - Eliminates dead variables (defined but never used)
@@ -95,7 +99,7 @@ The accurate allocator crashes with segfaults on complex IR. Investigation revea
 
 1. **Symptom**: Segfault (exit code 139) when compiling files that import complex standard library modules
 2. **Location**: During compilation phase, not at runtime of generated code
-3. **Suspected Root Cause**: Bug in `.case` branch handling (RegisterAlloc.lean:295-313)
+3. **Suspected Root Cause**: Bug in `.case` branch handling (ARM64/RegAlloc/LinearScan.lean:295-313)
    - Original implementation threaded state incorrectly through alternatives
    - Each alternative should start with same `defs`/`uses` state
    - Results should be merged (union), not sequentially threaded
@@ -304,7 +308,8 @@ diff phashmap.lean.expected.out phashmap.lean.produced.out
 
 ## Related Files
 
-- `/Users/pehle/dev/lean4/src/Lean/Compiler/Backend/RegisterAlloc.lean` - Register allocator implementation
+- `/Users/pehle/dev/lean4/src/Lean/Compiler/Backend/ARM64/RegAlloc/LinearScan.lean` - Register allocator implementation
+- `/Users/pehle/dev/lean4/src/Lean/Compiler/Backend/ARM64/Liveness.lean` - Liveness analysis and intervals
 - `/Users/pehle/dev/lean4/src/Lean/Compiler/Backend/InstrSelect.lean` - Instruction selection (uses allocation map)
 - `/Users/pehle/dev/lean4/src/Lean/Compiler/Backend/EmitARM64.lean` - ARM64 code emission
 - `/Users/pehle/dev/lean4/src/Lean/Compiler/IR/Basic.lean` - IR definitions (FnBody, Expr, Alt)

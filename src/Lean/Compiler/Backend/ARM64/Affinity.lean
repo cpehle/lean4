@@ -173,7 +173,7 @@ partial def processFnBodyAffinity (body : FnBody) : StateM AffinityBuildState Un
   | .ret _ | .jmp _ _ | .unreachable => pure ()
 
 /-- Build affinity information from function parameters and body -/
-def buildAffinity (params : Array Param) (_body : FnBody) : Affinity := Id.run do
+def buildAffinity (params : Array Param) (body : FnBody) : Affinity := Id.run do
   let mut aff : Affinity := Affinity.empty
 
   -- Set preferences for function parameters
@@ -194,9 +194,8 @@ def buildAffinity (params : Array Param) (_body : FnBody) : Affinity := Id.run d
         gpIdx := gpIdx + 1
 
   -- Process body for move relationships
-  -- let (_, state) := processFnBodyAffinity body |>.run { aff }
-  -- return state.aff
-  return aff
+  let (_, state) := processFnBodyAffinity body |>.run { aff }
+  return state.aff
 
 end Lean.Compiler.Backend.ARM64
 

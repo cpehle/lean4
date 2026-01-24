@@ -270,6 +270,8 @@ def loadSpilledVar (v : VarId) : SelectM Reg := do
         emit (Instr.ldrw (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
       else if ty == .float32 then
         emit (Instr.ldrs (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
+      else if ty == .float then
+        emit (Instr.ldrd (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
       else
         emit (Instr.ldr (.phys scratch) (.mem (.phys .sp) (Int.ofNat offset)))
       return .phys scratch
@@ -300,6 +302,8 @@ def storeToStackSlot (src : Reg) (slot : Nat) (ty : IRType) : SelectM Unit := do
     emit (Instr.strw src (.mem (.phys .sp) offset))
   else if ty == .float32 then
     emit (Instr.strs src (.mem (.phys .sp) offset))
+  else if ty == .float then
+    emit (Instr.strd src (.mem (.phys .sp) offset))
   else
     emit (Instr.str src (.mem (.phys .sp) offset))
 
