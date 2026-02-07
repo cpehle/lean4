@@ -59,24 +59,33 @@ def triggerSymbols (ci : ConstantInfo) (maxTolerance : Float := 3.0) : MetaM (Ar
   return frequencies.filterMap
     (fun (n, f) => if f ≤ minFrequency * maxTolerance then some (n, f / minFrequency) else none)
 
-def _root_.List.orderedInsert (r : α → α → Bool := by exact (· ≤ ·)) (a : α) : List α → List α
-  | [] => [a]
-  | b :: l => if r a b then a :: b :: l else b :: orderedInsert r a l
+private def mergeDeclsByTolerance : List (Name × Float) → List (Name × Float) → List (Name × Float)
+  | [], ys => ys
+  | xs, [] => xs
+  | x :: xs, y :: ys =>
+    if x.2 ≤ y.2 then
+      x :: mergeDeclsByTolerance xs (y :: ys)
+    else
+      y :: mergeDeclsByTolerance (x :: xs) ys
 
 def insertTrigger (map : NameMap (List (Name × Float))) (trigger decl : Name) (tolerance : Float) :
     NameMap (List (Name × Float)) :=
-  map.insert trigger (map.getD trigger [] |>.orderedInsert (fun x y => x.2 ≤ y.2) (decl, tolerance))
+  map.insert trigger ((decl, tolerance) :: map.getD trigger [])
 
-def prepareTriggers (names : Array Name) (maxTolerance : Float := 3.0) : MetaM (NameMap (List (Name × Float))) := do
+def prepareTriggers (maxTolerance : Float := 3.0) : MetaM (NameMap (List (Name × Float))) := do
   let mut map := {}
   let env ← getEnv
-  let names := names.filter fun n =>
-    !isDeniedPremise env n && wasOriginallyTheorem env n
-  for name in names do
-    let triggers ← triggerSymbols (← getConstInfo name) maxTolerance
+  for (name, ci) in env.constants.map₂ do
+    if isDeniedPremise env name || !wasOriginallyTheorem env name then
+      continue
+    let triggers ← triggerSymbols ci maxTolerance
     for (trigger, tolerance) in triggers do
       map := insertTrigger map trigger name tolerance
-  return map
+  let mut sortedMap := {}
+  for (trigger, decls) in map do
+    sortedMap := sortedMap.insert trigger <|
+      (decls.toArray.qsort (fun x y => x.2 < y.2)).toList
+  return sortedMap
 
 /--
 Combine two trigger maps, taking the sorted union of the triggered theorems for each symbol.
@@ -85,10 +94,27 @@ If one map is much larger than the other, it should be the first argument.
 def combineTriggers (map₁ map₂ : NameMap (List (Name × Float))) : NameMap (List (Name × Float)) := Id.run do
   let mut map := map₁
   for (trigger, decls₂) in map₂ do
-    map := match map₁.find? trigger with
+    map := match map.find? trigger with
     | none => map.insert trigger decls₂
-    | some decls₁ => map.insert trigger (decls₂.foldl (init := decls₁) (fun acc (decl, tolerance) => acc.orderedInsert (fun x y => x.2 ≤ y.2) (decl, tolerance)))
+    | some decls₁ => map.insert trigger (mergeDeclsByTolerance decls₁ decls₂)
   return map
+
+/-- A global `IO.Ref` containing the local "sine qua non" triggers. This is initialized on first use. -/
+builtin_initialize localSineQuaNonTriggerMapRef : IO.Ref (Option (NameMap (List (Name × Float)))) ← IO.mkRef none
+
+/--
+A cached version of the local "sine qua non" trigger map.
+
+The intended use case is that it is only called by environment extension export functions,
+i.e. after all declarations have been elaborated.
+-/
+def cachedLocalSineQuaNonTriggerMap : MetaM (NameMap (List (Name × Float))) := do
+  match ← localSineQuaNonTriggerMapRef.get with
+  | some map => return map
+  | none =>
+    let map ← prepareTriggers
+    localSineQuaNonTriggerMapRef.set (some map)
+    return map
 
 /--
 The state is just an array of array of maps.
@@ -104,8 +130,7 @@ builtin_initialize sineQuaNonExt : PersistentEnvExtension (NameMap (List (Name �
     mkInitial       := pure ∅
     addImportedFn   := fun mapss _ => pure mapss
     addEntryFn      := nofun
-    -- TODO: it would be nice to avoid the `toArray` here, e.g. via iterators.
-    exportEntriesFnEx := fun env _ _ => unsafe env.unsafeRunMetaM do return #[← prepareTriggers (env.constants.map₂.toArray.map (·.1))]
+    exportEntriesFnEx := fun env _ _ => unsafe env.unsafeRunMetaM do return #[← cachedLocalSineQuaNonTriggerMap]
     statsFn         := fun _ => "sine qua non premise selection extension"
   }
 

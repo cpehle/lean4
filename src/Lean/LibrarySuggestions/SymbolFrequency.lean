@@ -66,7 +66,18 @@ Helper function for running `MetaM` code during module export, when there is not
 Panics on errors.
 -/
 unsafe def _root_.Lean.Environment.unsafeRunMetaM [Inhabited α] (env : Environment) (x : MetaM α) : α :=
-   match unsafeEIO ((((withoutExporting x).run' {} {}).run' { fileName := "symbolFrequency", fileMap := default } { env })) with
+   let opts := maxHeartbeats.set ({} : Options) 0
+   let initHeartbeats := match unsafeIO IO.getNumHeartbeats with
+     | Except.ok n => n
+     | Except.error _ => 0
+   let coreCtx : Core.Context := {
+     fileName := "librarySuggestions"
+     fileMap := default
+     options := opts
+     initHeartbeats
+     maxHeartbeats := Core.getMaxHeartbeats opts
+   }
+   match unsafeEIO ((((withoutExporting x).run' {} {}).run' coreCtx { env })) with
    | Except.ok a => a
    | Except.error ex => panic! match unsafeIO ex.toMessageData.toString with
      | Except.ok s => s
