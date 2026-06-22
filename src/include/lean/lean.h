@@ -117,6 +117,9 @@ static inline bool lean_is_big_object_tag(uint8_t tag) {
     typedef char LEAN_impl_PASTE(assertion_failed_##file##_, line)[2*!!(predicate)-1];
 
 LEAN_CASSERT(sizeof(size_t) == sizeof(void*));
+#ifdef LEAN_MIMALLOC
+LEAN_CASSERT(MI_SMALL_SIZE_MAX >= LEAN_MAX_SMALL_OBJECT_SIZE);
+#endif
 
 /*
 Lean object header.

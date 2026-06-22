@@ -121,6 +121,13 @@ if(NOT CMAKE_SYSTEM_NAME MATCHES "Emscripten")
 endif()
 
 if(USE_MIMALLOC)
+  # Lean calls `mi_malloc_small` for objects up to `LEAN_MAX_SMALL_OBJECT_SIZE`
+  # (4096 bytes), so configure mimalloc's direct-small table to cover that range.
+  if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    set(LEAN_MIMALLOC_SMALL_WSIZE_MAX 1024)
+  else()
+    set(LEAN_MIMALLOC_SMALL_WSIZE_MAX 512)
+  endif()
   FetchContent_Declare(
     mimalloc
     GIT_REPOSITORY https://github.com/microsoft/mimalloc
@@ -133,6 +140,14 @@ if(USE_MIMALLOC)
     EXCLUDE_FROM_ALL
   )
   FetchContent_MakeAvailable(mimalloc)
+  execute_process(
+    COMMAND
+      ${CMAKE_COMMAND}
+        -DMIMALLOC_SOURCE_DIR=${mimalloc_SOURCE_DIR}
+        -DMI_SMALL_WSIZE_MAX=${LEAN_MIMALLOC_SMALL_WSIZE_MAX}
+        -P ${CMAKE_SOURCE_DIR}/script/patch-mimalloc-small-wsize.cmake
+    COMMAND_ERROR_IS_FATAL ANY
+  )
 endif()
 
 if(NOT STAGE1_PREV_STAGE)
